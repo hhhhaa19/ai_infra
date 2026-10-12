@@ -1,0 +1,13 @@
+build*/
+data/
+reports/
+*.bak
+*.before-*
+__pycache__/
+*.pyc
+.env
+.env.*
+*.engine
+*.onnx
+*.bin
+*.nsys-rep
