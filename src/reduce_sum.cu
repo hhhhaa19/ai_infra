@@ -27,6 +27,38 @@ struct DeviceBuffer {
         }
     }
 };
+__global__ void reduceSumBlock(const float* input, float* output,int n){
+    extern __shared__ float partial[];
+    const int nid = blockIdx.x * blockDim.x + threadIdx.x;
+    partial[threadIdx.x] = (nid < n) ? input[nid] : 0.0f;
+    __syncthreads();
+       for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        output[blockIdx.x] = partial[0];
+    }
+}
+
+
+__global__ void reduceSumN(const float* input, float* output,int n) {
+    extern __shared__ float partial[];
+    const int tid = threadIdx.x;
+    partial[tid] = (tid < n) ? input[tid] : 0.0f;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        output[0] = partial[0];
+    }
+}
 
 // 教学版本：必须用 <<<1, 8>>> 启动，输入必须包含 8 个数。
 __global__ void reduceSum8(const float* input, float* output) {
@@ -60,7 +92,16 @@ __global__ void reduceSum8(const float* input, float* output) {
 
 int main() {
     // 1. 准备 CPU 输入和参考结果。
-    const float hostInput[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    constexpr int n = 1000;
+    constexpr int threadsPerBlock = 256;
+    constexpr int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+    // 本例第一轮得到 4 个部分和，第二轮使用 4 个线程。
+    static_assert(blocks == 4, "This example expects four partial sums");
+
+    float hostInput[n];
+    for (float& value : hostInput) {
+        value = 1.0f;
+    }
     float hostOutput = 0.0f;
 
     float reference = 0.0f;
@@ -70,10 +111,12 @@ int main() {
 
     // 2. 分配 GPU 输入和输出空间。
     DeviceBuffer deviceInput;
-    DeviceBuffer deviceOutput;
+    DeviceBuffer deviceOutput1;
+    DeviceBuffer deviceOutput2;
 
     CHECK_CUDA(cudaMalloc(&deviceInput.ptr, sizeof(hostInput)));
-    CHECK_CUDA(cudaMalloc(&deviceOutput.ptr, sizeof(hostOutput)));
+    CHECK_CUDA(cudaMalloc(&deviceOutput1.ptr, sizeof(float) * blocks));
+    CHECK_CUDA(cudaMalloc(&deviceOutput2.ptr, sizeof(hostOutput)));
 
     // 3. 输入从 CPU 复制到 GPU。
     CHECK_CUDA(cudaMemcpy(
@@ -83,20 +126,28 @@ int main() {
         cudaMemcpyHostToDevice
     ));
 
-    // 4. 启动一个 block，包含 8 个线程。
-    reduceSum8<<<1, 8>>>(
+    // 4. 第一轮：1000 个数 -> 4 个部分和。
+    // 每个 block 使用 256 个线程和 256 个 float 的共享内存。
+    reduceSumBlock<<<blocks, threadsPerBlock, threadsPerBlock * sizeof(float)>>>(
         static_cast<const float*>(deviceInput.ptr),
-        static_cast<float*>(deviceOutput.ptr)
+        static_cast<float*>(deviceOutput1.ptr),
+        n
     );
-
-    // 检查启动错误，再等待执行完成并检查执行错误。
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
+
+    // 第二轮：4 个部分和 -> 1 个总和。
+    reduceSumN<<<1, blocks, blocks * sizeof(float)>>>(
+        static_cast<const float*>(deviceOutput1.ptr),
+        static_cast<float*>(deviceOutput2.ptr),
+        blocks
+    );
+    CHECK_CUDA(cudaGetLastError());
 
     // 5. 把一个 float 的结果复制回 CPU。
     CHECK_CUDA(cudaMemcpy(
         &hostOutput,
-        deviceOutput.ptr,
+        deviceOutput2.ptr,
         sizeof(hostOutput),
         cudaMemcpyDeviceToHost
     ));
@@ -110,6 +161,6 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    std::cout << "PASS: sum of 1..8 equals 36\n";
+    std::cout << "PASS: sum of 1000 ones equals 1000\n";
     return EXIT_SUCCESS;
 }
