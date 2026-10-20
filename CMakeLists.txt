@@ -32,8 +32,8 @@ add_cuda_example(vector_add src/vector_add/vector_add.cu)
 foreach(target reduce_sum warp reduction_bench)
     add_cuda_example(${target} src/reduction/${target}.cu)
 endforeach()
-foreach(target rmsnorm_test rmsnorm_compare rmsnorm_variable_test rmsnorm_n_bench)
+foreach(target rmsnorm_n_bench rmsnorm_cub rmsnorm_cub_bench rmsnorm_profile)
     add_cuda_example(${target} src/rmsnorm/${target}.cu)
 endforeach()
-# rmsNorm.cu, rmsNormWarp.cu and rmsnorm_variants.cuh are included by tests.
+# rmsNormWarp.cu and rmsnorm_cub.cuh are included by tests.
 # The old vector_bench and check_trt sources are absent; do not invent targets.

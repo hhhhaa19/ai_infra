@@ -21,8 +21,6 @@
 | `reports/reduction/` | shared/warp 求和对照 |
 | `reports/vector_add/` | 向量加法与预热对照 |
 | `reports/tensorrt/nsight/` | TensorRT 拷贝与执行时间轴 |
-| `archive/source_backups/` | 修改前的源码备份 |
-| `archive/organize-*.json` | 本次移动清单与 SHA-256，可按清单恢复路径 |
 
 ## 源码导航
 
@@ -30,9 +28,9 @@
 |---|---|
 | `src/rmsnorm/rmsNormWarp.cu` | 当前手写 RMSNorm 主线 |
 | `src/rmsnorm/rmsnorm_n_bench.cu` | 当前多行、可变 n 验证与性能测试 |
-| `src/rmsnorm/rmsNorm.cu` + `src/rmsnorm/rmsnorm_test.cu` | 早期固定 256 维 shared-memory 版本与测试 |
-| `src/rmsnorm/rmsnorm_variants.cuh` + `src/rmsnorm/rmsnorm_compare.cu` | 独立固定 256 维 shared/warp 对照，不等于当前 kernel |
-| `src/rmsnorm/rmsnorm_variable_test.cu` | 助手独立单行示例，保留作参考；不替代用户源码测试 |
+| `src/rmsnorm/rmsnorm_cub.cuh` + `src/rmsnorm/rmsnorm_cub.cu` | CUB BlockReduce 版 kernel 与单形状示例 |
+| `src/rmsnorm/rmsnorm_cub_bench.cu` | `rmsNormN` 与 CUB 版对照，方法同 `rmsnorm_n_bench`；尚未运行 |
+| `src/rmsnorm/rmsnorm_profile.cu` | Nsight Compute 采集：`[4096,256]`、`[4096,4096]` × 128/256/512 线程 × own/CUB；尚未运行 |
 | `src/vector_add/vector_add.cu` | 向量加法练习 |
 | `src/reduction/reduce_sum.cu`、`src/reduction/warp.cu` | 规约练习 |
 | `src/reduction/reduction_bench.cu` | shared/warp 多阶段规约基准 |
