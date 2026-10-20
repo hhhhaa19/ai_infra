@@ -1,4 +1,4 @@
-// 手写 rmsNormN 与 CUB BlockReduce 版对照。
+// 手写 rmsNormN 与 CUB BlockReduce 版对照；own_t 是 rmsNormN 的模板版（线程数编译期常量）。
 // 形状、数据、校验、计时方法与 rmsnorm_n_bench.cu 一致，只多了 method 维度。
 #include "rmsNormWarp.cu"
 #include "rmsnorm_cub.cuh"
@@ -23,8 +23,8 @@ struct Buffer {
     Buffer(const Buffer&)=delete;
     Buffer& operator=(const Buffer&)=delete;
 };
-enum Method { OWN, CUB };
-const char* name(Method m){ return m==OWN?"own":"cub"; }
+enum Method { OWN, OWN_T, CUB };
+const char* name(Method m){ return m==OWN?"own":m==OWN_T?"own_t":"cub"; }
 
 struct Data {
     int rows,n;
@@ -52,6 +52,16 @@ struct Data {
     void launch(Method m,int threads) {
         if(m==OWN){
             rmsNormN<<<rows,threads,(threads/32)*sizeof(float)>>>(dx.p,dw.p,dy.p,n,1e-5f);
+            return;
+        }
+        const size_t shm=(threads/32)*sizeof(float);
+        if(m==OWN_T){
+            switch(threads){
+                case 128: rmsNormNT<128><<<rows,128,shm>>>(dx.p,dw.p,dy.p,n,1e-5f); break;
+                case 256: rmsNormNT<256><<<rows,256,shm>>>(dx.p,dw.p,dy.p,n,1e-5f); break;
+                case 512: rmsNormNT<512><<<rows,512,shm>>>(dx.p,dw.p,dy.p,n,1e-5f); break;
+                default: throw std::runtime_error("Unsupported own_t thread count");
+            }
             return;
         }
         // CUB 的线程数是模板参数：运行时值映射到编译期实例。
@@ -91,19 +101,19 @@ int main(int argc,char** argv) try {
     double worst=0;
     for(int rows:{1,3,17}) for(int n:{17,256,1003,4096}) for(bool zero:{false,true}) {
         Data d(rows,n,zero);
-        for(Method m:{OWN,CUB}) for(int threads:threadList) { worst=std::max(worst,d.verify(m,threads)); ++checks; }
+        for(Method m:{OWN,OWN_T,CUB}) for(int threads:threadList) { worst=std::max(worst,d.verify(m,threads)); ++checks; }
     }
     std::cout<<"ALL "<<checks<<" CORRECTNESS CASES PASS; max_abs="<<worst<<std::endl;
 
-    // 每轮 6 个配置，own/cub 交错，起点逐轮后移，避免固定顺序偏差。
+    // 每轮 9 个配置，三种实现交错，起点逐轮后移，避免固定顺序偏差。
     std::vector<std::pair<Method,int>> configs;
-    for(int t:threadList){ configs.push_back({OWN,t}); configs.push_back({CUB,t}); }
+    for(int t:threadList){ configs.push_back({OWN,t}); configs.push_back({OWN_T,t}); configs.push_back({CUB,t}); }
     std::map<std::tuple<int,int,int,int>,std::vector<float>> roundMedians; // rows,n,method,threads
     cudaEvent_t start,stop; CHECK(cudaEventCreate(&start)); CHECK(cudaEventCreate(&stop));
     int cases=0;
     for(int rows:{1,128,4096}) for(int n:{256,1003,4096}) {
         Data d(rows,n);
-        // 每种形状至少预热 1 秒，两种实现、三种线程数交替。
+        // 每种形状至少预热 1 秒，三种实现、三种线程数交替。
         auto until=std::chrono::steady_clock::now()+std::chrono::seconds(1);
         do {
             for(auto [m,t]:configs) for(int i=0;i<20;++i) d.launch(m,t);
@@ -140,14 +150,14 @@ int main(int argc,char** argv) try {
     CHECK(cudaEventDestroy(start)); CHECK(cudaEventDestroy(stop));
     std::cout<<"ALL "<<cases<<" BENCHMARK CASES PASS\n\n";
 
-    // 三轮中位数的中位数；ratio = cub / own，>1 表示 CUB 更慢。
+    // 三轮中位数的中位数；比值以 own 为分母，<1 表示比 own 快。
     auto mid=[&](int r,int n,Method m,int t){
         auto v=roundMedians.at({r,n,int(m),t}); std::sort(v.begin(),v.end()); return v[1];
     };
-    std::cout<<"rows,n,threads,own_us,cub_us,cub_over_own\n"<<std::fixed<<std::setprecision(3);
+    std::cout<<"rows,n,threads,own_us,own_t_us,cub_us,own_t_over_own,cub_over_own\n"<<std::fixed<<std::setprecision(3);
     for(int rows:{1,128,4096}) for(int n:{256,1003,4096}) for(int t:threadList){
-        float o=mid(rows,n,OWN,t),c=mid(rows,n,CUB,t);
-        std::cout<<rows<<','<<n<<','<<t<<','<<o<<','<<c<<','<<c/o<<'\n';
+        float o=mid(rows,n,OWN,t),ot=mid(rows,n,OWN_T,t),c=mid(rows,n,CUB,t);
+        std::cout<<rows<<','<<n<<','<<t<<','<<o<<','<<ot<<','<<c<<','<<ot/o<<','<<c/o<<'\n';
     }
     return 0;
 } catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
