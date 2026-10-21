@@ -1,4 +1,5 @@
-// 手写 rmsNormN 与 CUB BlockReduce 版对照；own_t 是 rmsNormN 的模板版（线程数编译期常量）。
+// 手写 rmsNormN 与 CUB BlockReduce 版对照；own_t 是 rmsNormN 的模板版（线程数编译期常量）；
+// own_reg 是 x 只读一遍、存在寄存器里的版本（rmsNormReg）。
 // 形状、数据、校验、计时方法与 rmsnorm_n_bench.cu 一致，只多了 method 维度。
 #include "rmsNormWarp.cu"
 #include "rmsnorm_cub.cuh"
@@ -24,8 +25,19 @@ struct Buffer {
     Buffer(const Buffer&)=delete;
     Buffer& operator=(const Buffer&)=delete;
 };
-enum Method { OWN, OWN_T, CUB };
-const char* name(Method m){ return m==OWN?"own":m==OWN_T?"own_t":"cub"; }
+enum Method { OWN, OWN_T, CUB, OWN_REG };
+const char* name(Method m){ return m==OWN?"own":m==OWN_T?"own_t":m==CUB?"cub":"own_reg"; }
+
+// 每线程元素数取能覆盖 n 的最小档位；档位覆盖本基准用到的所有 n（≤ 33 × 线程数）。
+template<int BLOCK>
+void launchReg(int rows,int n,const float* x,const float* w,float* y){
+    const int need=(n+BLOCK-1)/BLOCK;
+    const size_t shm=(BLOCK/32)*sizeof(float);
+#define REG_CASE(P) if(need<=P){ rmsNormReg<BLOCK,P><<<rows,BLOCK,shm>>>(x,w,y,n,1e-5f); return; }
+    REG_CASE(1) REG_CASE(2) REG_CASE(4) REG_CASE(8) REG_CASE(9) REG_CASE(16) REG_CASE(17) REG_CASE(32) REG_CASE(33)
+#undef REG_CASE
+    throw std::runtime_error("own_reg: n too large for "+std::to_string(BLOCK)+" threads");
+}
 
 struct Data {
     int rows,n;
@@ -53,6 +65,15 @@ struct Data {
     void launch(Method m,int threads) {
         if(m==OWN){
             rmsNormN<<<rows,threads,(threads/32)*sizeof(float)>>>(dx.p,dw.p,dy.p,n,1e-5f);
+            return;
+        }
+        if(m==OWN_REG){
+            switch(threads){
+                case 128: launchReg<128>(rows,n,dx.p,dw.p,dy.p); break;
+                case 256: launchReg<256>(rows,n,dx.p,dw.p,dy.p); break;
+                case 512: launchReg<512>(rows,n,dx.p,dw.p,dy.p); break;
+                default: throw std::runtime_error("Unsupported own_reg thread count");
+            }
             return;
         }
         const size_t shm=(threads/32)*sizeof(float);
@@ -114,24 +135,24 @@ int main(int argc,char** argv) try {
     double worst=0;
     for(int rows:{1,3,17}) for(int n:{17,256,1003,4096}) for(bool zero:{false,true}) {
         Data d(rows,n,zero);
-        for(Method m:{OWN,OWN_T,CUB}) for(int threads:threadList) { worst=std::max(worst,d.verify(m,threads)); ++checks; }
+        for(Method m:{OWN,OWN_T,CUB,OWN_REG}) for(int threads:threadList) { worst=std::max(worst,d.verify(m,threads)); ++checks; }
     }
     // 自定义 n 也单独校验（3 行，含全零输入）。
     if(argc>3) for(int n:nList) for(bool zero:{false,true}) {
         Data d(3,n,zero);
-        for(Method m:{OWN,OWN_T,CUB}) for(int threads:threadList) { worst=std::max(worst,d.verify(m,threads)); ++checks; }
+        for(Method m:{OWN,OWN_T,CUB,OWN_REG}) for(int threads:threadList) { worst=std::max(worst,d.verify(m,threads)); ++checks; }
     }
     std::cout<<"ALL "<<checks<<" CORRECTNESS CASES PASS; max_abs="<<worst<<std::endl;
 
-    // 每轮 9 个配置，三种实现交错，起点逐轮后移，避免固定顺序偏差。
+    // 每轮 12 个配置，四种实现交错，起点逐轮后移，避免固定顺序偏差。
     std::vector<std::pair<Method,int>> configs;
-    for(int t:threadList){ configs.push_back({OWN,t}); configs.push_back({OWN_T,t}); configs.push_back({CUB,t}); }
+    for(int t:threadList){ configs.push_back({OWN,t}); configs.push_back({OWN_T,t}); configs.push_back({CUB,t}); configs.push_back({OWN_REG,t}); }
     std::map<std::tuple<int,int,int,int>,std::vector<float>> roundMedians; // rows,n,method,threads
     cudaEvent_t start,stop; CHECK(cudaEventCreate(&start)); CHECK(cudaEventCreate(&stop));
     int cases=0;
     for(int rows:rowsList) for(int n:nList) {
         Data d(rows,n);
-        // 每种形状至少预热 1 秒，三种实现、三种线程数交替。
+        // 每种形状至少预热 1 秒，四种实现、三种线程数交替。
         auto until=std::chrono::steady_clock::now()+std::chrono::seconds(1);
         do {
             for(auto [m,t]:configs) for(int i=0;i<20;++i) d.launch(m,t);
@@ -172,10 +193,10 @@ int main(int argc,char** argv) try {
     auto mid=[&](int r,int n,Method m,int t){
         auto v=roundMedians.at({r,n,int(m),t}); std::sort(v.begin(),v.end()); return v[1];
     };
-    std::cout<<"rows,n,threads,own_us,own_t_us,cub_us,own_t_over_own,cub_over_own\n"<<std::fixed<<std::setprecision(3);
+    std::cout<<"rows,n,threads,own_us,own_t_us,cub_us,own_reg_us,own_t_over_own,cub_over_own,own_reg_over_own\n"<<std::fixed<<std::setprecision(3);
     for(int rows:rowsList) for(int n:nList) for(int t:threadList){
-        float o=mid(rows,n,OWN,t),ot=mid(rows,n,OWN_T,t),c=mid(rows,n,CUB,t);
-        std::cout<<rows<<','<<n<<','<<t<<','<<o<<','<<ot<<','<<c<<','<<ot/o<<','<<c/o<<'\n';
+        float o=mid(rows,n,OWN,t),ot=mid(rows,n,OWN_T,t),c=mid(rows,n,CUB,t),r=mid(rows,n,OWN_REG,t);
+        std::cout<<rows<<','<<n<<','<<t<<','<<o<<','<<ot<<','<<c<<','<<r<<','<<ot/o<<','<<c/o<<','<<r/o<<'\n';
     }
     return 0;
 } catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
