@@ -2,7 +2,8 @@
 // 比较 rmsNormN（own）、rmsNormNT<BLOCK>（own_t，线程数编译期常量）与 rmsNormCub
 // 在 [4096,256]、[4096,4096]、[128,1003] 上的 128/256/512 线程配置。
 // [128,1003] 用来看 own_t/cub 为何在不整除、每线程迭代少时比 own 慢。
-// 每个配置预热后只在 cudaProfilerStart/Stop 之间 launch 1 次，共 27 次；配合 ncu --profile-from-start off。
+// 每个配置预热后只在 cudaProfilerStart/Stop 之间 launch 1 次；配合 ncu --profile-from-start off。
+// 用法：rmsnorm_profile [rows 列表] [n 列表]，列表逗号分隔，取笛卡尔积；不给参数时用上面三个默认形状。
 // 数据生成与 rmsnorm_n_bench.cu 一致；kernel 实现未改动。
 #include "rmsNormWarp.cu"
 #include "rmsnorm_cub.cuh"
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -72,13 +74,27 @@ int blocksPerSM(Method m, int threads) {
     return blocks;
 }
 
-int main() try {
+// "128,256" -> {128,256}
+std::vector<int> parseList(const std::string& text) {
+    std::vector<int> values;
+    std::stringstream in(text);
+    for (std::string item; std::getline(in, item, ',');) values.push_back(std::stoi(item));
+    if (values.empty()) throw std::runtime_error("Empty list: " + text);
+    return values;
+}
+
+int main(int argc, char** argv) try {
     cudaDeviceProp prop{};
     check(cudaGetDeviceProperties(&prop, 0));
     constexpr float eps = 1e-5f;
-    const std::pair<int, int> shapes[] = {{4096, 256}, {4096, 4096}, {128, 1003}};  // {rows, n}
-    std::cout << "GPU: " << prop.name << " SMs=" << prop.multiProcessorCount
-              << "\nshapes=[4096,256],[4096,4096],[128,1003]; eps=1e-5; 27 captured launches\n";
+    std::vector<std::pair<int, int>> shapes = {{4096, 256}, {4096, 4096}, {128, 1003}};  // {rows, n}
+    if (argc > 2) {
+        shapes.clear();
+        for (int rows : parseList(argv[1])) for (int n : parseList(argv[2])) shapes.push_back({rows, n});
+    }
+    std::cout << "GPU: " << prop.name << " SMs=" << prop.multiProcessorCount << "\nshapes=";
+    for (auto [rows, n] : shapes) std::cout << '[' << rows << ',' << n << ']';
+    std::cout << "; eps=1e-5; " << shapes.size() * 9 << " captured launches\n";
 
     std::cout << "OCCUPANCY method,threads,blocks_per_sm,warps_per_sm\n";
     for (Method m : {OWN, OWN_T, CUB}) for (int threads : {128, 256, 512}) {
