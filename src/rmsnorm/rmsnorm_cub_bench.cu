@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -88,8 +89,20 @@ struct Data {
         return maxError;
     }
 };
+// "128,256" -> {128,256}
+std::vector<int> parseList(const std::string& text) {
+    std::vector<int> values;
+    std::stringstream in(text);
+    for(std::string item; std::getline(in,item,',');) values.push_back(std::stoi(item));
+    if(values.empty()) throw std::runtime_error("Empty list: "+text);
+    return values;
+}
+// 用法：rmsnorm_cub_bench [输出前缀] [rows 列表] [n 列表]，列表用逗号分隔。
+// 不给 rows/n 时使用默认形状 rows=1,128,4096 × n=256,1003,4096。
 int main(int argc,char** argv) try {
     std::string prefix=argc>1?argv[1]:"reports/rmsnorm_cub_vs_own";
+    const std::vector<int> rowsList=argc>2?parseList(argv[2]):std::vector<int>{1,128,4096};
+    const std::vector<int> nList=argc>3?parseList(argv[3]):std::vector<int>{256,1003,4096};
     std::ofstream summary(prefix+".csv"),raw(prefix+"_samples.csv");
     if(!summary || !raw) throw std::runtime_error("Cannot create CSV");
     summary<<"rows,n,method,threads,round,mean_us,median_us,p95_us,max_abs\n";
@@ -103,6 +116,11 @@ int main(int argc,char** argv) try {
         Data d(rows,n,zero);
         for(Method m:{OWN,OWN_T,CUB}) for(int threads:threadList) { worst=std::max(worst,d.verify(m,threads)); ++checks; }
     }
+    // 自定义 n 也单独校验（3 行，含全零输入）。
+    if(argc>3) for(int n:nList) for(bool zero:{false,true}) {
+        Data d(3,n,zero);
+        for(Method m:{OWN,OWN_T,CUB}) for(int threads:threadList) { worst=std::max(worst,d.verify(m,threads)); ++checks; }
+    }
     std::cout<<"ALL "<<checks<<" CORRECTNESS CASES PASS; max_abs="<<worst<<std::endl;
 
     // 每轮 9 个配置，三种实现交错，起点逐轮后移，避免固定顺序偏差。
@@ -111,7 +129,7 @@ int main(int argc,char** argv) try {
     std::map<std::tuple<int,int,int,int>,std::vector<float>> roundMedians; // rows,n,method,threads
     cudaEvent_t start,stop; CHECK(cudaEventCreate(&start)); CHECK(cudaEventCreate(&stop));
     int cases=0;
-    for(int rows:{1,128,4096}) for(int n:{256,1003,4096}) {
+    for(int rows:rowsList) for(int n:nList) {
         Data d(rows,n);
         // 每种形状至少预热 1 秒，三种实现、三种线程数交替。
         auto until=std::chrono::steady_clock::now()+std::chrono::seconds(1);
@@ -155,7 +173,7 @@ int main(int argc,char** argv) try {
         auto v=roundMedians.at({r,n,int(m),t}); std::sort(v.begin(),v.end()); return v[1];
     };
     std::cout<<"rows,n,threads,own_us,own_t_us,cub_us,own_t_over_own,cub_over_own\n"<<std::fixed<<std::setprecision(3);
-    for(int rows:{1,128,4096}) for(int n:{256,1003,4096}) for(int t:threadList){
+    for(int rows:rowsList) for(int n:nList) for(int t:threadList){
         float o=mid(rows,n,OWN,t),ot=mid(rows,n,OWN_T,t),c=mid(rows,n,CUB,t);
         std::cout<<rows<<','<<n<<','<<t<<','<<o<<','<<ot<<','<<c<<','<<ot/o<<','<<c/o<<'\n';
     }

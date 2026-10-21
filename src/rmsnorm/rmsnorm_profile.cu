@@ -1,6 +1,8 @@
 // Nsight Compute 采集：reports/rmsnorm/20261017_multiline 的下一步 1。
-// 比较 rmsNormN（rmsNormWarp.cu）与 rmsNormCub 在 [4096,256]、[4096,4096] 上的 128/256/512 线程配置。
-// 每个配置预热后只在 cudaProfilerStart/Stop 之间 launch 1 次，共 12 次；配合 ncu --profile-from-start off。
+// 比较 rmsNormN（own）、rmsNormNT<BLOCK>（own_t，线程数编译期常量）与 rmsNormCub
+// 在 [4096,256]、[4096,4096]、[128,1003] 上的 128/256/512 线程配置。
+// [128,1003] 用来看 own_t/cub 为何在不整除、每线程迭代少时比 own 慢。
+// 每个配置预热后只在 cudaProfilerStart/Stop 之间 launch 1 次，共 27 次；配合 ncu --profile-from-start off。
 // 数据生成与 rmsnorm_n_bench.cu 一致；kernel 实现未改动。
 #include "rmsNormWarp.cu"
 #include "rmsnorm_cub.cuh"
@@ -24,12 +26,22 @@ struct Buffer {
     Buffer& operator=(const Buffer&) = delete;
 };
 
-enum Method { OWN, CUB };
-const char* name(Method m) { return m == OWN ? "own" : "cub"; }
+enum Method { OWN, OWN_T, CUB };
+const char* name(Method m) { return m == OWN ? "own" : m == OWN_T ? "own_t" : "cub"; }
 
 void launch(Method m, int threads, int rows, const float* x, const float* w, float* y, int n, float eps) {
     if (m == OWN) {
         rmsNormN<<<rows, threads, (threads / 32) * sizeof(float)>>>(x, w, y, n, eps);
+        return;
+    }
+    const size_t shm = (threads / 32) * sizeof(float);
+    if (m == OWN_T) {
+        switch (threads) {
+            case 128: rmsNormNT<128><<<rows, 128, shm>>>(x, w, y, n, eps); break;
+            case 256: rmsNormNT<256><<<rows, 256, shm>>>(x, w, y, n, eps); break;
+            case 512: rmsNormNT<512><<<rows, 512, shm>>>(x, w, y, n, eps); break;
+            default: throw std::runtime_error("Unsupported own_t thread count");
+        }
         return;
     }
     switch (threads) {
@@ -45,6 +57,11 @@ int blocksPerSM(Method m, int threads) {
     int blocks = 0;
     if (m == OWN) {
         check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, rmsNormN, threads, (threads / 32) * sizeof(float)));
+    } else if (m == OWN_T) {
+        const size_t shm = (threads / 32) * sizeof(float);
+        if (threads == 128) check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, rmsNormNT<128>, 128, shm));
+        else if (threads == 256) check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, rmsNormNT<256>, 256, shm));
+        else check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, rmsNormNT<512>, 512, shm));
     } else if (threads == 128) {
         check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, rmsNormCub<128>, 128, 0));
     } else if (threads == 256) {
@@ -59,18 +76,18 @@ int main() try {
     cudaDeviceProp prop{};
     check(cudaGetDeviceProperties(&prop, 0));
     constexpr float eps = 1e-5f;
-    constexpr int rows = 4096;
+    const std::pair<int, int> shapes[] = {{4096, 256}, {4096, 4096}, {128, 1003}};  // {rows, n}
     std::cout << "GPU: " << prop.name << " SMs=" << prop.multiProcessorCount
-              << "\nrows=" << rows << "; eps=1e-5; 12 captured launches\n";
+              << "\nshapes=[4096,256],[4096,4096],[128,1003]; eps=1e-5; 27 captured launches\n";
 
     std::cout << "OCCUPANCY method,threads,blocks_per_sm,warps_per_sm\n";
-    for (Method m : {OWN, CUB}) for (int threads : {128, 256, 512}) {
+    for (Method m : {OWN, OWN_T, CUB}) for (int threads : {128, 256, 512}) {
         int b = blocksPerSM(m, threads);
         std::cout << "OCCUPANCY " << name(m) << ',' << threads << ',' << b << ',' << b * threads / 32 << '\n';
     }
 
     int captured = 0;
-    for (int n : {256, 4096}) {
+    for (auto [rows, n] : shapes) {
         const size_t count = size_t(rows) * n;
         std::vector<float> x(count), w(n), actual(count);
         std::vector<double> reference(count);
@@ -91,7 +108,7 @@ int main() try {
         Buffer dx(count), dw(n), dy(count);
         check(cudaMemcpy(dx.data, x.data(), count * sizeof(float), cudaMemcpyHostToDevice));
         check(cudaMemcpy(dw.data, w.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-        for (Method m : {OWN, CUB}) for (int threads : {128, 256, 512}) {
+        for (Method m : {OWN, OWN_T, CUB}) for (int threads : {128, 256, 512}) {
             // 该形状/实现/线程数单独预热至少 1 秒。
             auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             do {
