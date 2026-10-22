@@ -119,21 +119,25 @@ std::vector<int> parseList(const std::string& text) {
     if(values.empty()) throw std::runtime_error("Empty list: "+text);
     return values;
 }
-// 用法：rmsnorm_cub_bench [输出前缀] [rows 列表] [n 列表] [行对齐]，列表用逗号分隔。
+// 用法：rmsnorm_cub_bench [输出前缀] [rows 列表] [n 列表] [行对齐] [额外填充]，列表用逗号分隔。
 // 行对齐 A>0 时，每行在内存里占 ceil(n/A)*A 个元素（补齐填充）；不给或为 0 时紧密存放。
+// 额外填充 E>0 时，行间距再加 E 个元素（例如 n=4096、A=32、E=32 得到 4128，对齐但不是 2 的幂）。
 // 不给 rows/n 时使用默认形状 rows=1,128,4096 × n=256,1003,4096。
 int main(int argc,char** argv) try {
     std::string prefix=argc>1?argv[1]:"reports/rmsnorm_cub_vs_own";
     const std::vector<int> rowsList=argc>2?parseList(argv[2]):std::vector<int>{1,128,4096};
     const std::vector<int> nList=argc>3?parseList(argv[3]):std::vector<int>{256,1003,4096};
     const int align=argc>4?std::stoi(argv[4]):0;
-    auto strideOf=[&](int n){ return align>0?(n+align-1)/align*align:n; };
+    const int extra=argc>5?std::stoi(argv[5]):0;
+    auto strideOf=[&](int n){ return (align>0?(n+align-1)/align*align:n)+extra; };
     std::ofstream summary(prefix+".csv"),raw(prefix+"_samples.csv");
     if(!summary || !raw) throw std::runtime_error("Cannot create CSV");
     summary<<"rows,n,method,threads,round,mean_us,median_us,p95_us,max_abs\n";
     raw<<"rows,n,method,threads,round,sample,us_per_launch\n";
     cudaDeviceProp prop{}; CHECK(cudaGetDeviceProperties(&prop,0));
-    std::cout<<"GPU: "<<prop.name<<"\nRow alignment: "<<(align>0?std::to_string(align)+" elements":std::string("none (stride = n)"))<<"\nTiming: 50 launches per event pair, 50 samples; excludes copies/allocation\n";
+    std::cout<<"GPU: "<<prop.name<<"\nRow alignment: "<<(align>0?std::to_string(align)+" elements":std::string("none"))<<", extra padding: "<<extra<<" elements\nRow stride:";
+    for(int n:nList) std::cout<<" n="<<n<<"->"<<strideOf(n);
+    std::cout<<"\nTiming: 50 launches per event pair, 50 samples; excludes copies/allocation\n";
     const int threadList[]={128,256,512};
     int checks=0;
     double worst=0;
