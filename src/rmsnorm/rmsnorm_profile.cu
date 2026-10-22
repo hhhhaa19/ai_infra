@@ -1,5 +1,6 @@
 // Nsight Compute 采集：reports/rmsnorm/20261017_multiline 的下一步 1。
-// 比较 rmsNormN（own）、rmsNormNT<BLOCK>（own_t，线程数编译期常量）与 rmsNormCub
+// 比较 rmsNormN（own）、rmsNormNT<BLOCK>（own_t，线程数编译期常量）、rmsNormCub（cub）
+// 与 rmsNormReg<BLOCK,PER_THREAD>（own_reg，x 只读一遍存在寄存器里）
 // 在 [4096,256]、[4096,4096]、[128,1003] 上的 128/256/512 线程配置。
 // [128,1003] 用来看 own_t/cub 为何在不整除、每线程迭代少时比 own 慢。
 // 每个配置预热后只在 cudaProfilerStart/Stop 之间 launch 1 次；配合 ncu --profile-from-start off。
@@ -28,12 +29,32 @@ struct Buffer {
     Buffer& operator=(const Buffer&) = delete;
 };
 
-enum Method { OWN, OWN_T, CUB };
-const char* name(Method m) { return m == OWN ? "own" : m == OWN_T ? "own_t" : "cub"; }
+enum Method { OWN, OWN_T, CUB, OWN_REG };
+const char* name(Method m) { return m == OWN ? "own" : m == OWN_T ? "own_t" : m == CUB ? "cub" : "own_reg"; }
+
+// 与 rmsnorm_cub_bench 相同：每线程元素数取能覆盖 n 的最小档位。
+template <int BLOCK>
+void launchReg(int rows, int n, const float* x, const float* w, float* y, float eps) {
+    const int need = (n + BLOCK - 1) / BLOCK;
+    const size_t shm = (BLOCK / 32) * sizeof(float);
+#define REG_CASE(P) if (need <= P) { rmsNormReg<BLOCK, P><<<rows, BLOCK, shm>>>(x, w, y, n, eps); return; }
+    REG_CASE(1) REG_CASE(2) REG_CASE(4) REG_CASE(8) REG_CASE(9) REG_CASE(16) REG_CASE(17) REG_CASE(32) REG_CASE(33)
+#undef REG_CASE
+    throw std::runtime_error("own_reg: n too large for " + std::to_string(BLOCK) + " threads");
+}
 
 void launch(Method m, int threads, int rows, const float* x, const float* w, float* y, int n, float eps) {
     if (m == OWN) {
         rmsNormN<<<rows, threads, (threads / 32) * sizeof(float)>>>(x, w, y, n, eps);
+        return;
+    }
+    if (m == OWN_REG) {
+        switch (threads) {
+            case 128: launchReg<128>(rows, n, x, w, y, eps); break;
+            case 256: launchReg<256>(rows, n, x, w, y, eps); break;
+            case 512: launchReg<512>(rows, n, x, w, y, eps); break;
+            default: throw std::runtime_error("Unsupported own_reg thread count");
+        }
         return;
     }
     const size_t shm = (threads / 32) * sizeof(float);
@@ -94,7 +115,7 @@ int main(int argc, char** argv) try {
     }
     std::cout << "GPU: " << prop.name << " SMs=" << prop.multiProcessorCount << "\nshapes=";
     for (auto [rows, n] : shapes) std::cout << '[' << rows << ',' << n << ']';
-    std::cout << "; eps=1e-5; " << shapes.size() * 9 << " captured launches\n";
+    std::cout << "; eps=1e-5; " << shapes.size() * 12 << " captured launches\n";
 
     std::cout << "OCCUPANCY method,threads,blocks_per_sm,warps_per_sm\n";
     for (Method m : {OWN, OWN_T, CUB}) for (int threads : {128, 256, 512}) {
@@ -124,7 +145,7 @@ int main(int argc, char** argv) try {
         Buffer dx(count), dw(n), dy(count);
         check(cudaMemcpy(dx.data, x.data(), count * sizeof(float), cudaMemcpyHostToDevice));
         check(cudaMemcpy(dw.data, w.data(), n * sizeof(float), cudaMemcpyHostToDevice));
-        for (Method m : {OWN, OWN_T, CUB}) for (int threads : {128, 256, 512}) {
+        for (Method m : {OWN, OWN_T, CUB, OWN_REG}) for (int threads : {128, 256, 512}) {
             // 该形状/实现/线程数单独预热至少 1 秒。
             auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             do {
