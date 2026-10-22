@@ -58,7 +58,8 @@ __global__ void rmsNormN(
     const float* w,
     float* y,
     int n,
-    float eps
+    float eps,
+    int stride = 0   // 行间距（元素个数）；0 表示紧密存放，等于 n
 ){
     extern __shared__ float p[];
     __shared__ float scale;
@@ -68,7 +69,7 @@ __global__ void rmsNormN(
     int warpCount = blockDim.x/32;
     float sum = 0.0f;
     const std::size_t rowOffset =
-    static_cast<std::size_t>(blockIdx.x) * n;
+    static_cast<std::size_t>(blockIdx.x) * (stride > 0 ? stride : n);
     for (int col = xid ; col < n; col += blockDim.x){
         float curValue = x[rowOffset + col];
         curValue *= curValue;
@@ -114,7 +115,8 @@ __global__ void rmsNormNT(
     const float* w,
     float* y,
     int n,
-    float eps
+    float eps,
+    int stride = 0   // 行间距（元素个数）；0 表示紧密存放，等于 n
 ){
     extern __shared__ float p[];
     __shared__ float scale;
@@ -124,7 +126,7 @@ __global__ void rmsNormNT(
     constexpr int warpCount = BLOCK/32;
     float sum = 0.0f;
     const std::size_t rowOffset =
-    static_cast<std::size_t>(blockIdx.x) * n;
+    static_cast<std::size_t>(blockIdx.x) * (stride > 0 ? stride : n);
     for (int col = xid ; col < n; col += BLOCK){
         float curValue = x[rowOffset + col];
         curValue *= curValue;
@@ -171,7 +173,8 @@ __global__ void rmsNormReg(
     const float* w,
     float* y,
     int n,
-    float eps
+    float eps,
+    int stride = 0   // 行间距（元素个数）；0 表示紧密存放，等于 n
 ){
     extern __shared__ float p[];
     __shared__ float scale;
@@ -180,7 +183,7 @@ __global__ void rmsNormReg(
     int lane = xid%32;
     constexpr int warpCount = BLOCK/32;
     const std::size_t rowOffset =
-    static_cast<std::size_t>(blockIdx.x) * n;
+    static_cast<std::size_t>(blockIdx.x) * (stride > 0 ? stride : n);
     float v[PER_THREAD];
     float sum = 0.0f;
     #pragma unroll

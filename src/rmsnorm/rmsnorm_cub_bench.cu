@@ -30,48 +30,48 @@ const char* name(Method m){ return m==OWN?"own":m==OWN_T?"own_t":m==CUB?"cub":"o
 
 // 每线程元素数取能覆盖 n 的最小档位；档位覆盖本基准用到的所有 n（≤ 33 × 线程数）。
 template<int BLOCK>
-void launchReg(int rows,int n,const float* x,const float* w,float* y){
+void launchReg(int rows,int n,int ld,const float* x,const float* w,float* y){
     const int need=(n+BLOCK-1)/BLOCK;
     const size_t shm=(BLOCK/32)*sizeof(float);
-#define REG_CASE(P) if(need<=P){ rmsNormReg<BLOCK,P><<<rows,BLOCK,shm>>>(x,w,y,n,1e-5f); return; }
+#define REG_CASE(P) if(need<=P){ rmsNormReg<BLOCK,P><<<rows,BLOCK,shm>>>(x,w,y,n,1e-5f,ld); return; }
     REG_CASE(1) REG_CASE(2) REG_CASE(4) REG_CASE(8) REG_CASE(9) REG_CASE(16) REG_CASE(17) REG_CASE(32) REG_CASE(33)
 #undef REG_CASE
     throw std::runtime_error("own_reg: n too large for "+std::to_string(BLOCK)+" threads");
 }
 
 struct Data {
-    int rows,n;
+    int rows,n,ld;   // ld：行间距（元素个数），>= n；多出来的位置是填充，初始化为 0
     size_t bytes;
     std::vector<float> x,w,y;
     std::vector<double> ref;
     Buffer dx,dw,dy;
-    Data(int r,int width,bool zero=false): rows(r),n(width),
-        bytes(size_t(r)*width*sizeof(float)),x(size_t(r)*width),w(width),y(x.size()),ref(x.size()),
+    Data(int r,int width,bool zero=false,int stride=0): rows(r),n(width),ld(stride>0?stride:width),
+        bytes(size_t(r)*ld*sizeof(float)),x(size_t(r)*ld,0.0f),w(width),y(x.size()),ref(x.size()),
         dx(bytes),dw(size_t(width)*sizeof(float)),dy(bytes) {
         for(int c=0;c<n;++c) w[c]=float(c%19-9)/7;
         for(int row=0;row<rows;++row){
             double sum=0;
             for(int c=0;c<n;++c){
-                size_t i=size_t(row)*n+c;
+                size_t i=size_t(row)*ld+c;
                 x[i]=zero?0.0f:float((c*7+row*13)%97-48)/13;
                 sum+=double(x[i])*x[i];
             }
             double scale=1/std::sqrt(sum/n+double(1e-5f));
-            for(int c=0;c<n;++c){ size_t i=size_t(row)*n+c; ref[i]=double(x[i])*w[c]*scale; }
+            for(int c=0;c<n;++c){ size_t i=size_t(row)*ld+c; ref[i]=double(x[i])*w[c]*scale; }
         }
         CHECK(cudaMemcpy(dx.p,x.data(),bytes,cudaMemcpyHostToDevice));
         CHECK(cudaMemcpy(dw.p,w.data(),size_t(n)*sizeof(float),cudaMemcpyHostToDevice));
     }
     void launch(Method m,int threads) {
         if(m==OWN){
-            rmsNormN<<<rows,threads,(threads/32)*sizeof(float)>>>(dx.p,dw.p,dy.p,n,1e-5f);
+            rmsNormN<<<rows,threads,(threads/32)*sizeof(float)>>>(dx.p,dw.p,dy.p,n,1e-5f,ld);
             return;
         }
         if(m==OWN_REG){
             switch(threads){
-                case 128: launchReg<128>(rows,n,dx.p,dw.p,dy.p); break;
-                case 256: launchReg<256>(rows,n,dx.p,dw.p,dy.p); break;
-                case 512: launchReg<512>(rows,n,dx.p,dw.p,dy.p); break;
+                case 128: launchReg<128>(rows,n,ld,dx.p,dw.p,dy.p); break;
+                case 256: launchReg<256>(rows,n,ld,dx.p,dw.p,dy.p); break;
+                case 512: launchReg<512>(rows,n,ld,dx.p,dw.p,dy.p); break;
                 default: throw std::runtime_error("Unsupported own_reg thread count");
             }
             return;
@@ -79,18 +79,18 @@ struct Data {
         const size_t shm=(threads/32)*sizeof(float);
         if(m==OWN_T){
             switch(threads){
-                case 128: rmsNormNT<128><<<rows,128,shm>>>(dx.p,dw.p,dy.p,n,1e-5f); break;
-                case 256: rmsNormNT<256><<<rows,256,shm>>>(dx.p,dw.p,dy.p,n,1e-5f); break;
-                case 512: rmsNormNT<512><<<rows,512,shm>>>(dx.p,dw.p,dy.p,n,1e-5f); break;
+                case 128: rmsNormNT<128><<<rows,128,shm>>>(dx.p,dw.p,dy.p,n,1e-5f,ld); break;
+                case 256: rmsNormNT<256><<<rows,256,shm>>>(dx.p,dw.p,dy.p,n,1e-5f,ld); break;
+                case 512: rmsNormNT<512><<<rows,512,shm>>>(dx.p,dw.p,dy.p,n,1e-5f,ld); break;
                 default: throw std::runtime_error("Unsupported own_t thread count");
             }
             return;
         }
         // CUB 的线程数是模板参数：运行时值映射到编译期实例。
         switch(threads){
-            case 128: rmsNormCub<128><<<rows,128>>>(dx.p,dw.p,dy.p,n,1e-5f); break;
-            case 256: rmsNormCub<256><<<rows,256>>>(dx.p,dw.p,dy.p,n,1e-5f); break;
-            case 512: rmsNormCub<512><<<rows,512>>>(dx.p,dw.p,dy.p,n,1e-5f); break;
+            case 128: rmsNormCub<128><<<rows,128>>>(dx.p,dw.p,dy.p,n,1e-5f,ld); break;
+            case 256: rmsNormCub<256><<<rows,256>>>(dx.p,dw.p,dy.p,n,1e-5f,ld); break;
+            case 512: rmsNormCub<512><<<rows,512>>>(dx.p,dw.p,dy.p,n,1e-5f,ld); break;
             default: throw std::runtime_error("Unsupported CUB thread count");
         }
     }
@@ -101,7 +101,8 @@ struct Data {
         CHECK(cudaDeviceSynchronize());
         CHECK(cudaMemcpy(y.data(),dy.p,bytes,cudaMemcpyDeviceToHost));
         double maxError=0;
-        for(size_t i=0;i<y.size();++i){
+        for(int row=0;row<rows;++row) for(int c=0;c<n;++c){   // 只检查有效元素，不检查填充
+            size_t i=size_t(row)*ld+c;
             double err=std::abs(double(y[i])-ref[i]);
             if(!std::isfinite(y[i]) || err>2e-6+2e-5*std::abs(ref[i]))
                 throw std::runtime_error(std::string(name(m))+" mismatch at element "+std::to_string(i));
@@ -118,18 +119,21 @@ std::vector<int> parseList(const std::string& text) {
     if(values.empty()) throw std::runtime_error("Empty list: "+text);
     return values;
 }
-// 用法：rmsnorm_cub_bench [输出前缀] [rows 列表] [n 列表]，列表用逗号分隔。
+// 用法：rmsnorm_cub_bench [输出前缀] [rows 列表] [n 列表] [行对齐]，列表用逗号分隔。
+// 行对齐 A>0 时，每行在内存里占 ceil(n/A)*A 个元素（补齐填充）；不给或为 0 时紧密存放。
 // 不给 rows/n 时使用默认形状 rows=1,128,4096 × n=256,1003,4096。
 int main(int argc,char** argv) try {
     std::string prefix=argc>1?argv[1]:"reports/rmsnorm_cub_vs_own";
     const std::vector<int> rowsList=argc>2?parseList(argv[2]):std::vector<int>{1,128,4096};
     const std::vector<int> nList=argc>3?parseList(argv[3]):std::vector<int>{256,1003,4096};
+    const int align=argc>4?std::stoi(argv[4]):0;
+    auto strideOf=[&](int n){ return align>0?(n+align-1)/align*align:n; };
     std::ofstream summary(prefix+".csv"),raw(prefix+"_samples.csv");
     if(!summary || !raw) throw std::runtime_error("Cannot create CSV");
     summary<<"rows,n,method,threads,round,mean_us,median_us,p95_us,max_abs\n";
     raw<<"rows,n,method,threads,round,sample,us_per_launch\n";
     cudaDeviceProp prop{}; CHECK(cudaGetDeviceProperties(&prop,0));
-    std::cout<<"GPU: "<<prop.name<<"\nTiming: 50 launches per event pair, 50 samples; excludes copies/allocation\n";
+    std::cout<<"GPU: "<<prop.name<<"\nRow alignment: "<<(align>0?std::to_string(align)+" elements":std::string("none (stride = n)"))<<"\nTiming: 50 launches per event pair, 50 samples; excludes copies/allocation\n";
     const int threadList[]={128,256,512};
     int checks=0;
     double worst=0;
@@ -139,7 +143,7 @@ int main(int argc,char** argv) try {
     }
     // 自定义 n 也单独校验（3 行，含全零输入）。
     if(argc>3) for(int n:nList) for(bool zero:{false,true}) {
-        Data d(3,n,zero);
+        Data d(3,n,zero,strideOf(n));
         for(Method m:{OWN,OWN_T,CUB,OWN_REG}) for(int threads:threadList) { worst=std::max(worst,d.verify(m,threads)); ++checks; }
     }
     std::cout<<"ALL "<<checks<<" CORRECTNESS CASES PASS; max_abs="<<worst<<std::endl;
@@ -151,7 +155,7 @@ int main(int argc,char** argv) try {
     cudaEvent_t start,stop; CHECK(cudaEventCreate(&start)); CHECK(cudaEventCreate(&stop));
     int cases=0;
     for(int rows:rowsList) for(int n:nList) {
-        Data d(rows,n);
+        Data d(rows,n,false,strideOf(n));
         // 每种形状至少预热 1 秒，四种实现、三种线程数交替。
         auto until=std::chrono::steady_clock::now()+std::chrono::seconds(1);
         do {

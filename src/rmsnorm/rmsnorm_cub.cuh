@@ -9,10 +9,11 @@
 // n 可以小于、等于、大于 BLOCK_THREADS，也可以不是其整数倍。
 template<int BLOCK_THREADS>
 __global__ void rmsNormCub(
-    const float* x, const float* weight, float* y, int n, float eps
+    const float* x, const float* weight, float* y, int n, float eps,
+    int stride = 0   // 行间距（元素个数）；0 表示紧密存放，等于 n
 ) {
     const int tid = threadIdx.x;
-    const std::size_t rowOffset = std::size_t(blockIdx.x) * n;
+    const std::size_t rowOffset = std::size_t(blockIdx.x) * (stride > 0 ? stride : n);
 
     // 1. 与手写版相同：每个线程在自己的寄存器里累加平方和。
     float sum = 0.0f;
