@@ -54,7 +54,7 @@ for rows in rows_list:
         spread = max((max(v) - min(v)) / min(v) for v in rounds.values()) * 100
         results.append((rows, n, med, spread))
         print(f"rows={rows:5d} n={n:5d} " + " ".join(f"{k}={v:8.2f}us" for k, v in med.items())
-              + f"  ours/eager={med[ours]/med[eager]:.2f}  spread={spread:.1f}%", flush=True)
+              + f"  ours/eager={med['ours']/med['eager']:.2f}  spread={spread:.1f}%", flush=True)
 
 out = sys.argv[1] if len(sys.argv) > 1 else "bench_ext.csv"
 with open(out, "w", newline="") as fh:
