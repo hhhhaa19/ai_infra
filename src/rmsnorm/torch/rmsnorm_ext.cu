@@ -1,0 +1,62 @@
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include "../rmsNormWarp.cu"
+
+static int chooseBlock(int n) {
+    int b =128;
+    while (b<1024 && b* 16 <n) b*=2;
+    return b;
+}
+template <int BLOCK>
+static bool launchReg (int rows, int n, const float* x, const float* w, float* y, 
+    float eps,cudaStream_t stream) {
+    const int need = (n+BLOCK -1)/BLOCK;
+    const size_t shm = (BLOCK/32) * sizeof(float);
+#define REG_CASE(P) if (need <= P) {rmsNormReg<BLOCK,P><<<rows,BLOCK,shm,stream>>>(x,w,y,n,eps);return true;}
+    REG_CASE(1) REG_CASE(2) REG_CASE(4) REG_CASE(8) REG_CASE(9)
+    REG_CASE(16) REG_CASE(17) REG_CASE(32) REG_CASE(33)
+#undef REG_CASE
+    return false;
+}
+
+static void launchRMSNorm(int rows, int n, const float* x, const float* w, float* y,
+                          float eps, cudaStream_t s){
+    if (rows == 0 || n == 0) return;
+    bool ok = false;
+    switch (chooseBlock(n)) {
+        case 128:  ok = launchReg<128>(rows, n, x, w, y, eps, s);  break;
+        case 256:  ok = launchReg<256>(rows, n, x, w, y, eps, s);  break;
+        case 512:  ok = launchReg<512>(rows, n, x, w, y, eps, s);  break;
+        case 1024: ok = launchReg<1024>(rows, n, x, w, y, eps, s); break;
+    }
+    if (!ok)
+        rmsNormNT<512><<<rows,512,(512/32)* sizeof(float),s>>>(x,w,y,n,eps);
+}
+torch::Tensor forward(torch::Tensor x, torch::Tensor weight, double eps) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    // 数据类型：kernel 目前只支持 float32
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be float32");
+    // 形状：x 至少一维；weight 是一维，长度等于 x 的最后一维
+    TORCH_CHECK(x.dim() >= 1, "x must have at least 1 dimension");
+    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == x.size(-1),
+                "weight must have shape [n], where n = x.size(-1)");
+    // 内存布局：先只支持连续存放
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    if (x.numel() == 0) return torch::empty_like(x);   // 空张量：避免下面除以 0
+    const int n = x.size(-1);
+    const int rows = x.numel() / n;               // 前面的维度全部展平成行
+    auto y = torch::empty_like(x);                // 在 GPU 上分配输出，形状和 x 一样
+    launchRMSNorm(rows, n,
+                  x.data_ptr<float>(), weight.data_ptr<float>(), y.data_ptr<float>(),
+                  static_cast<float>(eps), at::cuda::getCurrentCUDAStream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK(); 
+    
+    return y;
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward", &forward, "RMSNorm forward (CUDA)");
+}
