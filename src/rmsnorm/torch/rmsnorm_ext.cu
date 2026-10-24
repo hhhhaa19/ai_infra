@@ -41,7 +41,8 @@ static void launchRMSNorm(int rows, int n, const float* x, const float* w, float
         TORCH_CHECK(launchWarpRow<4>(rows, n, x, w, y, eps, s), "warp version supports n <= 1024");
         return;
     }
-    if (impl == 0 && n <= 1024 && launchWarpRow<4>(rows, n, x, w, y, eps, s)) return;
+    // Orin 实测（20261024_orin_bench_ext）：n <= 224 warp 版更快，256 打平，>= 320 own_reg 更快
+    if (impl == 0 && n <= 256 && launchWarpRow<4>(rows, n, x, w, y, eps, s)) return;
     bool ok = false;
     if (impl != 3) switch (chooseBlock(n)) {
         case 128:  ok = launchReg<128>(rows, n, x, w, y, eps, s);  break;
