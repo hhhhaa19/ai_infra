@@ -226,3 +226,43 @@ __global__ void rmsNormReg(
     }
 
 }
+// 一个 warp 处理一行：没有 shared memory，也没有 __syncthreads()。
+// 每个线程固定处理 PER_LANE 个元素（编译期常量，完全展开，数组留在寄存器里）。
+// 要求 n <= 32 * PER_LANE；一个 block 放 WARPS 个 warp，同时处理 WARPS 行。
+template <int PER_LANE, int WARPS>
+__global__ void rmsNormWarpRow(const float* x, const float* w, float* y,
+                            int rows, int n, float eps, int stride = 0) {
+    const int  lane = threadIdx.x %32;
+    const int warp = threadIdx.x/32;
+    const int row = blockIdx.x *WARPS+warp; //我们在处理第几行
+    if (row >= rows) return;
+    float v[PER_LANE]; //寄存器每个线程独立 warp可以直接计算
+    // float p[WARPS];
+    float sum = 0.0f;
+    const std::size_t rowOffset = static_cast<std::size_t>(row)* (stride >0 ? stride : n);
+    #pragma unroll
+    for (int i =0 ;i< PER_LANE ;i++){
+        int index = i*32+lane;
+        float cur = index < n ? x[index+rowOffset] : 0;
+        v[i] = cur;
+        sum += cur *cur;
+    }
+    for (int offset=16;offset >0 ;offset /=2 ){
+        // xor：两两交换后相加，结束后 32 个线程都是这一行的总和
+        sum += __shfl_xor_sync(
+            0xffffffff,
+            sum,
+            offset
+        );
+    }
+
+    const float scale = rsqrtf(sum / n + eps); // 每个线程都有总和，直接算
+    #pragma unroll
+    for (int i = 0; i < PER_LANE; ++i){
+        int index = i*32+lane;
+        if (index < n){
+            y[index+rowOffset] = v[i] * scale * w[index];
+        }
+    }
+
+}

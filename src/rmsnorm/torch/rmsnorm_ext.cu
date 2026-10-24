@@ -20,20 +20,40 @@ static bool launchReg (int rows, int n, const float* x, const float* w, float* y
     return false;
 }
 
+
+template <int WARPS>
+static bool launchWarpRow(int rows, int n, const float* x, const float* w, float* y,
+                          float eps, cudaStream_t stream) {
+    const int need = (n + 31) / 32;                    // 每个线程至少要处理几个
+    const int blocks = (rows + WARPS - 1) / WARPS;     // 每个 block 处理 WARPS 行
+#define WARP_CASE(P) if (need <= P) { rmsNormWarpRow<P, WARPS><<<blocks, WARPS * 32, 0, stream>>>(x, w, y, rows, n, eps); return true; }
+    WARP_CASE(1) WARP_CASE(2) WARP_CASE(4) WARP_CASE(8) WARP_CASE(9)
+    WARP_CASE(16) WARP_CASE(17) WARP_CASE(32)
+#undef WARP_CASE
+    return false;
+}
+
+// impl：0 自动分档；1 强制 warp 版；2 强制 own_reg；3 强制循环版（后三种只用于测试和对比）
 static void launchRMSNorm(int rows, int n, const float* x, const float* w, float* y,
-                          float eps, cudaStream_t s){
+                          float eps, cudaStream_t s, int impl = 0){
     if (rows == 0 || n == 0) return;
+    if (impl == 1) {
+        TORCH_CHECK(launchWarpRow<4>(rows, n, x, w, y, eps, s), "warp version supports n <= 1024");
+        return;
+    }
+    if (impl == 0 && n <= 1024 && launchWarpRow<4>(rows, n, x, w, y, eps, s)) return;
     bool ok = false;
-    switch (chooseBlock(n)) {
+    if (impl != 3) switch (chooseBlock(n)) {
         case 128:  ok = launchReg<128>(rows, n, x, w, y, eps, s);  break;
         case 256:  ok = launchReg<256>(rows, n, x, w, y, eps, s);  break;
         case 512:  ok = launchReg<512>(rows, n, x, w, y, eps, s);  break;
         case 1024: ok = launchReg<1024>(rows, n, x, w, y, eps, s); break;
     }
+    TORCH_CHECK(ok || impl != 2, "own_reg supports n <= 33792");
     if (!ok)
         rmsNormNT<512><<<rows,512,(512/32)* sizeof(float),s>>>(x,w,y,n,eps);
 }
-torch::Tensor forward(torch::Tensor x, torch::Tensor weight, double eps) {
+torch::Tensor forward_impl(torch::Tensor x, torch::Tensor weight, double eps, int64_t impl) {
     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
     TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
     // 数据类型：kernel 目前只支持 float32
@@ -52,11 +72,15 @@ torch::Tensor forward(torch::Tensor x, torch::Tensor weight, double eps) {
     auto y = torch::empty_like(x);                // 在 GPU 上分配输出，形状和 x 一样
     launchRMSNorm(rows, n,
                   x.data_ptr<float>(), weight.data_ptr<float>(), y.data_ptr<float>(),
-                  static_cast<float>(eps), at::cuda::getCurrentCUDAStream());
+                  static_cast<float>(eps), at::cuda::getCurrentCUDAStream(), static_cast<int>(impl));
     C10_CUDA_KERNEL_LAUNCH_CHECK(); 
     
     return y;
 }
+torch::Tensor forward(torch::Tensor x, torch::Tensor weight, double eps) {
+    return forward_impl(x, weight, eps, 0);
+}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &forward, "RMSNorm forward (CUDA)");
+    m.def("forward_impl", &forward_impl, "RMSNorm forward with a forced implementation (testing only)");
 }
