@@ -16,9 +16,9 @@ def eager(x, w):
 def impls_for(n):
     fs = {"ours": lambda x, w: m.forward(x, w, eps), "eager": eager}
     if n <= 1024:
-        fs["warp"] = lambda x, w: m.forward_impl(x, w, eps, 1)
+        fs["warp"] = lambda x, w: m.forward(x, w, eps, 1)
     if n <= 33792:
-        fs["own_reg"] = lambda x, w: m.forward_impl(x, w, eps, 2)
+        fs["own_reg"] = lambda x, w: m.forward(x, w, eps, 2)
     return fs
 
 def time_us(f, x, w, iters=50, samples=30):

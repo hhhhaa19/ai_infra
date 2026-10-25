@@ -54,7 +54,8 @@ static void launchRMSNorm(int rows, int n, const float* x, const float* w, float
     if (!ok)
         rmsNormNT<512><<<rows,512,(512/32)* sizeof(float),s>>>(x,w,y,n,eps);
 }
-torch::Tensor forward_impl(torch::Tensor x, torch::Tensor weight, double eps, int64_t impl) {
+// impl：0 自动分档（默认）；1/2/3 强制 warp 版 / own_reg / 循环版，只给测试和对比用
+torch::Tensor forward(torch::Tensor x, torch::Tensor weight, double eps, int64_t impl) {
     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
     TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
     // 数据类型：kernel 目前只支持 float32
@@ -78,10 +79,7 @@ torch::Tensor forward_impl(torch::Tensor x, torch::Tensor weight, double eps, in
     
     return y;
 }
-torch::Tensor forward(torch::Tensor x, torch::Tensor weight, double eps) {
-    return forward_impl(x, weight, eps, 0);
-}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &forward, "RMSNorm forward (CUDA)");
-    m.def("forward_impl", &forward_impl, "RMSNorm forward with a forced implementation (testing only)");
+    m.def("forward", &forward, "RMSNorm forward (CUDA); impl: 0 auto, 1 warp, 2 own_reg, 3 loop",
+          py::arg("x"), py::arg("weight"), py::arg("eps"), py::arg("impl") = 0);
 }

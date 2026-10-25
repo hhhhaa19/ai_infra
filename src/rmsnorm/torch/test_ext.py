@@ -16,7 +16,7 @@ torch.manual_seed(0)
 eps = 1e-5
 IMPL = {0: "auto", 1: "warp", 2: "own_reg", 3: "loop"}
 
-# 1. 自动分档：覆盖 warp 版（n<=1024，rows 不是 4 的倍数）、各档 own_reg、循环版、多维、空张量
+# 1. 自动分档：覆盖 warp 版（n<=256，rows 不是 4 的倍数）、各档 own_reg、循环版、多维、空张量
 shapes = [(1, 1), (5, 17), (7, 256), (6, 1003), (3, 1024), (9, 1025),
           (1, 17), (3, 256), (5, 1003), (7, 2048), (2, 4095), (3, 4096), (2, 4097),
           (4, 8192), (2, 16384), (2, 30000), (2, 33792), (1, 33793), (1, 40000),
@@ -32,12 +32,12 @@ for rows in (1, 3, 4, 5, 64):
     for n in (1, 17, 32, 33, 255, 256, 257, 1000, 1023, 1024):
         x = torch.randn(rows, n, device="cuda"); w = torch.randn(n, device="cuda")
         for impl in (1, 2, 3):
-            check(rmsnorm_cuda.forward_impl(x, w, eps, impl), x, w, eps, f"{IMPL[impl]} ({rows},{n})")
+            check(rmsnorm_cuda.forward(x, w, eps, impl), x, w, eps, f"{IMPL[impl]} ({rows},{n})")
             count += 1
 for n in (1025, 4095, 4096, 4097, 33792):
     x = torch.randn(3, n, device="cuda"); w = torch.randn(n, device="cuda")
     for impl in (2, 3):
-        check(rmsnorm_cuda.forward_impl(x, w, eps, impl), x, w, eps, f"{IMPL[impl]} (3,{n})"); count += 1
+        check(rmsnorm_cuda.forward(x, w, eps, impl), x, w, eps, f"{IMPL[impl]} (3,{n})"); count += 1
 print(f"forced paths: {count} cases PASS")
 
 # 3. 输入检查：每个都应该报 RuntimeError
@@ -46,7 +46,7 @@ bad = [("CPU x", lambda: rmsnorm_cuda.forward(x.cpu(), w, eps)),
        ("float16 x", lambda: rmsnorm_cuda.forward(x.half(), w, eps)),
        ("wrong weight length", lambda: rmsnorm_cuda.forward(x, w[:4], eps)),
        ("non-contiguous x", lambda: rmsnorm_cuda.forward(x.t(), w[:4], eps)),
-       ("warp forced, n>1024", lambda: rmsnorm_cuda.forward_impl(torch.randn(2, 2048, device="cuda"), torch.ones(2048, device="cuda"), eps, 1))]
+       ("warp forced, n>1024", lambda: rmsnorm_cuda.forward(torch.randn(2, 2048, device="cuda"), torch.ones(2048, device="cuda"), eps, 1))]
 for name, f in bad:
     try:
         f(); raise SystemExit(f"{name}: expected an error")
