@@ -83,3 +83,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &forward, "RMSNorm forward (CUDA); impl: 0 auto, 1 warp, 2 own_reg, 3 loop",
           py::arg("x"), py::arg("weight"), py::arg("eps"), py::arg("impl") = 0);
 }
+// 注册成 PyTorch 正式算子：torch.ops.ai_infra.rms_norm(x, weight, eps, impl=0)
+// ③ Meta 实现：只根据输入推出输出形状，不计算（torch.compile 推形状时用）
+torch::Tensor forward_meta(torch::Tensor x, torch::Tensor weight, double eps, int64_t impl) {
+    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == x.size(-1),
+                "weight must have shape [n], where n = x.size(-1)");
+    return torch::empty_like(x);
+}
+
+// ① 声明：在 ai_infra 命名空间下登记 rms_norm 的签名
+TORCH_LIBRARY(ai_infra, m) {
+    m.def("rms_norm(Tensor x, Tensor weight, float eps, int impl=0) -> Tensor");
+}
+
+// ② 输入在 GPU 上时，dispatcher 调用 forward
+TORCH_LIBRARY_IMPL(ai_infra, CUDA, m) {
+    m.impl("rms_norm", &forward);
+}
+
+// ③ 输入是 Meta 张量时，dispatcher 调用 forward_meta
+TORCH_LIBRARY_IMPL(ai_infra, Meta, m) {
+    m.impl("rms_norm", &forward_meta);
+}
