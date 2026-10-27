@@ -10,13 +10,13 @@ import torch.nn.functional as F
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "rmsnorm" / "torch"))
 from build_ext import load_rmsnorm
 
-_ext = None
-def ext():
-    # 第一次用到时才编译/加载扩展；只用 eager 时不需要它
-    global _ext
-    if _ext is None:
-        _ext = load_rmsnorm()
-    return _ext
+_op = None
+def rms_norm_op():
+    # 第一次用到时才编译/加载扩展，返回 torch.ops.ai_infra.rms_norm；只用 eager 时不需要它
+    global _op
+    if _op is None:
+        _op = load_rmsnorm()
+    return _op
 
 
 class RMSNorm(nn.Module):
@@ -30,9 +30,9 @@ class RMSNorm(nn.Module):
         # TODO 3: impl == "eager" 时，用 PyTorch 运算写 RMSNorm
         if self.impl == "eager":
             return x * torch.rsqrt(x.pow(2).mean(-1,keepdim =True)+self.eps) * self.weight
-        # TODO 4: impl == "ours" 时，调用 ext().forward(x, 权重, eps)
+        # impl == "ours"：调用注册好的算子 torch.ops.ai_infra.rms_norm
         if self.impl == "ours":
-            return ext().forward(x,self.weight,self.eps)
+            return rms_norm_op()(x, self.weight, self.eps)
         raise ValueError(f"unknown impl: {self.impl}")
         
 

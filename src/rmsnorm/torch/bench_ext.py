@@ -7,18 +7,18 @@ import csv, statistics, sys, time
 import torch
 from build_ext import load_rmsnorm
 
-m = load_rmsnorm()
+rms_norm = load_rmsnorm()
 eps = 1e-5
 
 def eager(x, w):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
 
 def impls_for(n):
-    fs = {"ours": lambda x, w: m.forward(x, w, eps), "eager": eager}
+    fs = {"ours": lambda x, w: rms_norm(x, w, eps), "eager": eager}
     if n <= 1024:
-        fs["warp"] = lambda x, w: m.forward(x, w, eps, 1)
+        fs["warp"] = lambda x, w: rms_norm(x, w, eps, 1)
     if n <= 33792:
-        fs["own_reg"] = lambda x, w: m.forward(x, w, eps, 2)
+        fs["own_reg"] = lambda x, w: rms_norm(x, w, eps, 2)
     return fs
 
 def time_us(f, x, w, iters=50, samples=30):

@@ -79,10 +79,6 @@ torch::Tensor forward(torch::Tensor x, torch::Tensor weight, double eps, int64_t
     
     return y;
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &forward, "RMSNorm forward (CUDA); impl: 0 auto, 1 warp, 2 own_reg, 3 loop",
-          py::arg("x"), py::arg("weight"), py::arg("eps"), py::arg("impl") = 0);
-}
 // 注册成 PyTorch 正式算子：torch.ops.ai_infra.rms_norm(x, weight, eps, impl=0)
 // ③ Meta 实现：只根据输入推出输出形状，不计算（torch.compile 推形状时用）
 torch::Tensor forward_meta(torch::Tensor x, torch::Tensor weight, double eps, int64_t impl) {

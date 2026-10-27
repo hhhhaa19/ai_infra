@@ -3,7 +3,7 @@
 import torch
 from build_ext import load_rmsnorm
 
-rmsnorm_cuda = load_rmsnorm()
+rms_norm = load_rmsnorm()
 
 def ref(x, w, eps):
     x64, w64 = x.double(), w.double()
@@ -23,7 +23,7 @@ shapes = [(1, 1), (5, 17), (7, 256), (6, 1003), (3, 1024), (9, 1025),
           (2, 3, 4096), (4, 5, 300), (0, 4096), (3, 0)]
 for shape in shapes:
     x = torch.randn(*shape, device="cuda"); w = torch.randn(shape[-1], device="cuda")
-    check(rmsnorm_cuda.forward(x, w, eps), x, w, eps, f"auto {shape}")
+    check(rms_norm(x, w, eps), x, w, eps, f"auto {shape}")
 print(f"auto: {len(shapes)} shapes PASS")
 
 # 2. 强制每条路径：同一个 n 三种写法都要对
@@ -32,21 +32,21 @@ for rows in (1, 3, 4, 5, 64):
     for n in (1, 17, 32, 33, 255, 256, 257, 1000, 1023, 1024):
         x = torch.randn(rows, n, device="cuda"); w = torch.randn(n, device="cuda")
         for impl in (1, 2, 3):
-            check(rmsnorm_cuda.forward(x, w, eps, impl), x, w, eps, f"{IMPL[impl]} ({rows},{n})")
+            check(rms_norm(x, w, eps, impl), x, w, eps, f"{IMPL[impl]} ({rows},{n})")
             count += 1
 for n in (1025, 4095, 4096, 4097, 33792):
     x = torch.randn(3, n, device="cuda"); w = torch.randn(n, device="cuda")
     for impl in (2, 3):
-        check(rmsnorm_cuda.forward(x, w, eps, impl), x, w, eps, f"{IMPL[impl]} (3,{n})"); count += 1
+        check(rms_norm(x, w, eps, impl), x, w, eps, f"{IMPL[impl]} (3,{n})"); count += 1
 print(f"forced paths: {count} cases PASS")
 
 # 3. 输入检查：每个都应该报 RuntimeError
 x = torch.randn(4, 8, device="cuda"); w = torch.ones(8, device="cuda")
-bad = [("CPU x", lambda: rmsnorm_cuda.forward(x.cpu(), w, eps)),
-       ("float16 x", lambda: rmsnorm_cuda.forward(x.half(), w, eps)),
-       ("wrong weight length", lambda: rmsnorm_cuda.forward(x, w[:4], eps)),
-       ("non-contiguous x", lambda: rmsnorm_cuda.forward(x.t(), w[:4], eps)),
-       ("warp forced, n>1024", lambda: rmsnorm_cuda.forward(torch.randn(2, 2048, device="cuda"), torch.ones(2048, device="cuda"), eps, 1))]
+bad = [("CPU x", lambda: rms_norm(x.cpu(), w, eps)),
+       ("float16 x", lambda: rms_norm(x.half(), w, eps)),
+       ("wrong weight length", lambda: rms_norm(x, w[:4], eps)),
+       ("non-contiguous x", lambda: rms_norm(x.t(), w[:4], eps)),
+       ("warp forced, n>1024", lambda: rms_norm(torch.randn(2, 2048, device="cuda"), torch.ones(2048, device="cuda"), eps, 1))]
 for name, f in bad:
     try:
         f(); raise SystemExit(f"{name}: expected an error")

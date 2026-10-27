@@ -3,7 +3,7 @@
 import statistics, sys, time, torch
 sys.path.insert(0, "src/rmsnorm/torch")
 from build_ext import load_rmsnorm
-m = load_rmsnorm(); eps = 1e-5
+rms_norm = load_rmsnorm(); eps = 1e-5
 def t(f, x, w, iters=50, samples=30):
     a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True); out = []
     for _ in range(samples):
@@ -11,7 +11,7 @@ def t(f, x, w, iters=50, samples=30):
         for _ in range(iters): f(x, w)
         b.record(); b.synchronize(); out.append(a.elapsed_time(b) * 1000 / iters)
     return statistics.median(out)
-fs = {"warp": lambda x, w: m.forward(x, w, eps, 1), "own_reg": lambda x, w: m.forward(x, w, eps, 2)}
+fs = {"warp": lambda x, w: rms_norm(x, w, eps, 1), "own_reg": lambda x, w: rms_norm(x, w, eps, 2)}
 print("rows    n   warp_us  own_reg_us  warp/own_reg")
 for rows in (4096, 16384):
     for n in (32, 64, 96, 128, 160, 192, 224, 256, 320, 384):

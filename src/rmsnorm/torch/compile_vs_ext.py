@@ -10,7 +10,7 @@ from build_ext import load_rmsnorm
 out_dir = sys.argv[1] if len(sys.argv) > 1 else "."
 os.makedirs(out_dir, exist_ok=True)
 torch._dynamo.config.cache_size_limit = 64   # 每个形状单独编译（dynamic=False），避免超过默认重编译上限
-m = load_rmsnorm()
+rms_norm = load_rmsnorm()
 eps = 1e-5
 
 def eager(x, w):
@@ -20,7 +20,7 @@ impls = {
     "eager": eager,
     "compile": torch.compile(eager, dynamic=False),
     "compile_cg": torch.compile(eager, dynamic=False, mode="reduce-overhead"),   # 再加 CUDA Graphs
-    "ours": lambda x, w: m.forward(x, w, eps),
+    "ours": lambda x, w: rms_norm(x, w, eps),
 }
 
 def time_us(f, x, w, iters=50, samples=30):
