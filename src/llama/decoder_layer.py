@@ -25,6 +25,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden)) # TODO 1: 用 nn.Parameter 创建 weight，形状 [hidden]，初始值全 1（torch.ones）
         self.eps= eps
         self.impl = impl# TODO 2: 把 eps 和 impl 存到 self 上
+        if impl == "ours":
+            rms_norm_op()
 
     def forward(self, x):
         # TODO 3: impl == "eager" 时，用 PyTorch 运算写 RMSNorm
