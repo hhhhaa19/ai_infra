@@ -87,17 +87,82 @@ torch::Tensor forward_meta(torch::Tensor x, torch::Tensor weight, double eps, in
     return torch::empty_like(x);
 }
 
+// ===== fused add + RMSNorm：h = x + residual；y = rmsnorm(h) * weight =====
+// 只有 own_reg 一种实现（n <= 33792）；h 只写一次，归一化直接用寄存器里的值。
+
+// 和 launchReg 一样按每个线程要处理几个元素（need）选模板参数，只是换成融合版 kernel
+template <int BLOCK>
+static bool launchFusedReg(int rows, int n, const float* x, const float* r, const float* w,
+                           float* h, float* y, float eps, cudaStream_t stream) {
+    const int need = (n + BLOCK - 1) / BLOCK;
+    const size_t shm = (BLOCK / 32) * sizeof(float);
+#define FUSED_CASE(P) if (need <= P) { fusedAddRmsNormReg<BLOCK, P><<<rows, BLOCK, shm, stream>>>(x, r, w, h, y, n, eps); return true; }
+    FUSED_CASE(1) FUSED_CASE(2) FUSED_CASE(4) FUSED_CASE(8) FUSED_CASE(9)
+    FUSED_CASE(16) FUSED_CASE(17) FUSED_CASE(32) FUSED_CASE(33)
+#undef FUSED_CASE
+    return false;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_forward(
+        torch::Tensor x, torch::Tensor residual, torch::Tensor weight, double eps) {
+    TORCH_CHECK(x.is_cuda() && residual.is_cuda() && weight.is_cuda(), "x, residual, weight must be CUDA tensors");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 && residual.scalar_type() == torch::kFloat32 &&
+                weight.scalar_type() == torch::kFloat32, "x, residual, weight must be float32");
+    TORCH_CHECK(x.dim() >= 1, "x must have at least 1 dimension");
+    TORCH_CHECK(residual.sizes() == x.sizes(), "residual must have the same shape as x");
+    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == x.size(-1),
+                "weight must have shape [n], where n = x.size(-1)");
+    TORCH_CHECK(x.is_contiguous() && residual.is_contiguous() && weight.is_contiguous(),
+                "x, residual, weight must be contiguous");
+
+    auto h = torch::empty_like(x);
+    auto y = torch::empty_like(x);
+    if (x.numel() == 0) return {h, y};
+    const int n = x.size(-1);
+    const int rows = x.numel() / n;
+    cudaStream_t s = at::cuda::getCurrentCUDAStream();
+    const float* xp = x.data_ptr<float>();
+    const float* rp = residual.data_ptr<float>();
+    const float* wp = weight.data_ptr<float>();
+    float* hp = h.data_ptr<float>();
+    float* yp = y.data_ptr<float>();
+    const float e = static_cast<float>(eps);
+
+    bool ok = false;
+    switch (chooseBlock(n)) {
+        case 128:  ok = launchFusedReg<128>(rows, n, xp, rp, wp, hp, yp, e, s);  break;
+        case 256:  ok = launchFusedReg<256>(rows, n, xp, rp, wp, hp, yp, e, s);  break;
+        case 512:  ok = launchFusedReg<512>(rows, n, xp, rp, wp, hp, yp, e, s);  break;
+        case 1024: ok = launchFusedReg<1024>(rows, n, xp, rp, wp, hp, yp, e, s); break;
+    }
+    TORCH_CHECK(ok, "fused_add_rms_norm supports n <= 33792");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {h, y};
+}
+
+// Meta 实现：两个输出都和 x 同形状
+std::tuple<torch::Tensor, torch::Tensor> fused_forward_meta(
+        torch::Tensor x, torch::Tensor residual, torch::Tensor weight, double eps) {
+    TORCH_CHECK(residual.sizes() == x.sizes(), "residual must have the same shape as x");
+    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == x.size(-1),
+                "weight must have shape [n], where n = x.size(-1)");
+    return {torch::empty_like(x), torch::empty_like(x)};
+}
+
 // ① 声明：在 ai_infra 命名空间下登记 rms_norm 的签名
 TORCH_LIBRARY(ai_infra, m) {
     m.def("rms_norm(Tensor x, Tensor weight, float eps, int impl=0) -> Tensor");
+    m.def("fused_add_rms_norm(Tensor x, Tensor residual, Tensor weight, float eps) -> (Tensor, Tensor)");
 }
 
 // ② 输入在 GPU 上时，dispatcher 调用 forward
 TORCH_LIBRARY_IMPL(ai_infra, CUDA, m) {
     m.impl("rms_norm", &forward);
+    m.impl("fused_add_rms_norm", &fused_forward);
 }
 
 // ③ 输入是 Meta 张量时，dispatcher 调用 forward_meta
 TORCH_LIBRARY_IMPL(ai_infra, Meta, m) {
     m.impl("rms_norm", &forward_meta);
+    m.impl("fused_add_rms_norm", &fused_forward_meta);
 }

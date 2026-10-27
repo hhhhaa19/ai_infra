@@ -266,3 +266,69 @@ __global__ void rmsNormWarpRow(const float* x, const float* w, float* y,
     }
 
 }
+
+// 融合版：h = x + r；y = rmsnorm(h) * w。h 只写一次，归一化直接用寄存器里的值。
+// 要求和 rmsNormReg 一样：n <= BLOCK * PER_THREAD；BLOCK 等于实际每 block 线程数。
+template<int BLOCK, int PER_THREAD>
+__global__ void fusedAddRmsNormReg(
+    const float* x,
+    const float* r,      // residual
+    const float* w,
+    float* h,            // 输出：x + r
+    float* y,            // 输出：rmsnorm(h) * w
+    int n,
+    float eps
+){
+    extern __shared__ float p[];
+    __shared__ float scale;
+    int xid = threadIdx.x;
+    int warpid = xid/32;
+    int lane = xid%32;
+    constexpr int warpCount = BLOCK/32;
+    const std::size_t rowOffset = static_cast<std::size_t>(blockIdx.x) * n;
+    float v[PER_THREAD];
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < PER_THREAD; ++i){
+        int col = xid + i * BLOCK;
+        // TODO 1: col < n 时 v[i] = x + r（都要加 rowOffset），否则为 0
+        v[i] = col < n ? x[rowOffset + col] +r[rowOffset + col]: 0.0f;
+        // TODO 2: col < n 时把 v[i] 写到 h
+        if (col < n) h[rowOffset + col] = v[i];
+        sum += v[i] * v[i];
+    }
+
+    // TODO 3: 从这里往下和 rmsNormReg 完全一样：warp 内规约 → shared 规约 → 算 scale → 写 y
+        for ( int offset = 16; offset > 0; offset/=2){
+        float other = __shfl_down_sync(
+            0xffffffff,
+            sum,
+            offset
+        );
+        if (lane < offset){
+            sum += other;
+        }
+    }
+    if (lane == 0 ){
+        p[warpid] = sum;
+    }
+    __syncthreads();
+
+    for (int stride =warpCount/2 ;stride > 0; stride /= 2){
+        if (lane == 0 && warpid < stride){
+            p[warpid] += p[warpid+stride];
+        }
+        __syncthreads();
+    }
+    if (xid == 0){
+        scale = rsqrtf(p[0] / n + eps);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < PER_THREAD; ++i){
+        int col = xid + i * BLOCK;
+        if (col < n){
+            y[col+rowOffset] = v[i] * scale* w[col];
+        }
+    }
+}

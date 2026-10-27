@@ -1,5 +1,6 @@
 # 最小的 LLaMA 风格 decoder layer（只做推理前向）。
-# RMSNorm 可以切换实现：impl="eager" 用 PyTorch 运算，impl="ours" 用我们的 CUDA 扩展。
+# RMSNorm 可以切换实现：impl="eager" 用 PyTorch 运算，impl="ours" 用我们的 CUDA 扩展，
+# impl="fused" 在 ours 基础上把注意力后的残差相加和 norm2 合成一个 kernel（fused_add_rms_norm）。
 # 暂不包含 RoPE 和 KV cache。
 import sys, pathlib
 import torch
@@ -25,15 +26,15 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden)) # TODO 1: 用 nn.Parameter 创建 weight，形状 [hidden]，初始值全 1（torch.ones）
         self.eps= eps
         self.impl = impl# TODO 2: 把 eps 和 impl 存到 self 上
-        if impl == "ours":
-            rms_norm_op()
+        if impl in ("ours", "fused"):
+            rms_norm_op()   # 建模型时就加载扩展，forward 里不触发加载，Dynamo 不会断开
 
     def forward(self, x):
         # TODO 3: impl == "eager" 时，用 PyTorch 运算写 RMSNorm
         if self.impl == "eager":
             return x * torch.rsqrt(x.pow(2).mean(-1,keepdim =True)+self.eps) * self.weight
         # impl == "ours"：调用注册好的算子 torch.ops.ai_infra.rms_norm
-        if self.impl == "ours":
+        if self.impl in ("ours", "fused"):
             return rms_norm_op()(x, self.weight, self.eps)
         raise ValueError(f"unknown impl: {self.impl}")
         
@@ -88,12 +89,18 @@ class DecoderLayer(nn.Module):
     # norm1、norm2 是两个位置不同的 RMSNorm（各有自己的 weight），impl 对两者相同
     def __init__(self, hidden=2048, heads=16, intermediate=5632, impl="eager"):
         super().__init__()
+        self.impl = impl
         self.norm1 = RMSNorm(hidden, impl=impl)     # attention 前
         self.attn = Attention(hidden, heads)
         self.norm2 = RMSNorm(hidden, impl=impl)     # MLP 前
         self.mlp = MLP(hidden, intermediate)
 
     def forward(self, x):
+        if self.impl == "fused":
+            # h = x + attn(...) 和 norm2(h) 在同一个 kernel 里：h 只写一次，归一化直接用寄存器里的值
+            a = self.attn(self.norm1(x))
+            h, n = torch.ops.ai_infra.fused_add_rms_norm(a, x, self.norm2.weight, self.norm2.eps)
+            return h + self.mlp(n)
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x

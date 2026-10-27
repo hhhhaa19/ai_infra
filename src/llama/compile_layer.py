@@ -29,6 +29,9 @@ variants = {
     "compile+ours":    torch.compile(make("ours"), dynamic=False),
     "compile_cg":      torch.compile(make("eager"), dynamic=False, mode="reduce-overhead"),
     "compile_cg+ours": torch.compile(make("ours"), dynamic=False, mode="reduce-overhead"),
+    "eager+fused":     make("fused"),
+    "compile+fused":   torch.compile(make("fused"), dynamic=False),
+    "compile_cg+fused": torch.compile(make("fused"), dynamic=False, mode="reduce-overhead"),
 }
 
 def time_us(f, x, iters, samples=30):
@@ -57,7 +60,7 @@ print(prop.name, "| SMs", prop.multi_processor_count, "| torch", torch.__version
 
 # 1. 计算图是否被切断：只看 RMSNorm 两种写法在 prefill 形状下
 with open(os.path.join(out_dir, "graph_breaks.txt"), "w") as fh:
-    for impl in ("eager", "ours"):
+    for impl in ("eager", "ours", "fused"):
         exp = torch._dynamo.explain(make(impl))(torch.randn(1, 512, 2048, device="cuda"))
         line = f"impl={impl}: graphs={exp.graph_count} graph_breaks={exp.graph_break_count} ops={exp.op_count}"
         print(line, flush=True); fh.write(line + "\n")
@@ -88,7 +91,7 @@ with torch.inference_mode():
         names = list(variants)
         rounds = {k: [] for k in names}
         for r in range(3):
-            order = names[2 * r:] + names[:2 * r]     # 每轮换起点
+            order = names[3 * r:] + names[:3 * r]     # 每轮换起点（9 个变体，每轮挪 3 个）
             for k in order:
                 rounds[k].append(time_us(variants[k], x, iters))
         med = {k: statistics.median(v) for k, v in rounds.items()}
@@ -99,7 +102,7 @@ with torch.inference_mode():
         print(f"== {tag} (spread {spread:.1f}%)", flush=True)
         for k in names:
             nk = next(r[2] for r in kernel_rows if r[0] == tag and r[1] == k)
-            print(f"   {k:16s} {med[k]:9.1f} us  vs eager {(med[k] / med['eager'] - 1) * 100:+6.1f}%  kernels={nk}", flush=True)
+            print(f"   {k:17s} {med[k]:9.1f} us  vs eager {(med[k] / med['eager'] - 1) * 100:+6.1f}%  kernels={nk}", flush=True)
 
 with open(os.path.join(out_dir, "bench.csv"), "w", newline="") as fh:
     wr = csv.writer(fh); wr.writerow(["shape", "variant", "us", "vs_eager_pct", "kernels_per_forward"]); wr.writerows(bench)
