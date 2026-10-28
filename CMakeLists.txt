@@ -37,3 +37,9 @@ foreach(target rmsnorm_n_bench rmsnorm_cub rmsnorm_cub_bench rmsnorm_profile)
 endforeach()
 # rmsNormWarp.cu and rmsnorm_cub.cuh are included by tests.
 # The old vector_bench and check_trt sources are absent; do not invent targets.
+
+# TensorRT plugin：ONNX 里的 RmsNorm 节点用我们的 kernel（trtexec --plugins=build-orin/librmsnorm_trt_plugin.so）
+add_library(rmsnorm_trt_plugin SHARED src/rmsnorm/trt/rmsnorm_plugin.cu)
+target_include_directories(rmsnorm_trt_plugin PRIVATE "${TENSORRT_INCLUDE_DIR}")
+target_link_libraries(rmsnorm_trt_plugin PRIVATE CUDA::cudart "${TENSORRT_LIBRARY}")
+target_compile_options(rmsnorm_trt_plugin PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O2> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
