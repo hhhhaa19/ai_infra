@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
-#include "../rmsnorm_launch.cuh"   // 选档和启动（不依赖 PyTorch，TensorRT plugin 也用它）
+#include "../launch.cuh"   // 选档和启动（不依赖 PyTorch，TensorRT plugin 也用它）
 
 // impl：0 自动分档（默认）；1/2/3/4 强制 warp 版 / own_reg / 循环版 / float4 版，只给测试和对比用
 torch::Tensor forward(torch::Tensor x, torch::Tensor weight, double eps, int64_t impl) {

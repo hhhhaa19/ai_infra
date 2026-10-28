@@ -1,6 +1,6 @@
 # 用 TensorRT Python 接口加载 engine：① 和 PyTorch 输出逐元素比对；② 用和 bench_layer.py 相同的方法计时
 #   （CUDA event 包住 N 次 execute_async_v3 ÷ N，30 样本 × 3 轮取中位数），也测一遍录成 CUDA Graph 的版本。
-# 用法（在仓库根目录）：python src/llama/trt_check.py <engine 前缀，如 build-onnx/layer/eager> [数据目录]
+# 用法（在仓库根目录）：python src/llama/trt_check.py <engine 前缀，如 build-onnx/layer_eager/eager> [数据目录]
 #   会依次加载 <前缀>_<形状>_fp32.engine，参考数据来自 export_onnx.py 保存的 io_<形状>.pt。
 #   engine 里有 plugin 时，用 TRT_PLUGINS=a.so[:b.so] 指定 plugin 库，反序列化前先加载（加载时自动登记到注册表）。
 import ctypes, os, statistics, sys, time

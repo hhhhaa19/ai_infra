@@ -5,9 +5,9 @@
 // [128,1003] 用来看 own_t/cub 为何在不整除、每线程迭代少时比 own 慢。
 // 每个配置预热后只在 cudaProfilerStart/Stop 之间 launch 1 次；配合 ncu --profile-from-start off。
 // 用法：rmsnorm_profile [rows 列表] [n 列表]，列表逗号分隔，取笛卡尔积；不给参数时用上面三个默认形状。
-// 数据生成与 rmsnorm_n_bench.cu 一致；kernel 实现未改动。
-#include "rmsNormWarp.cu"
-#include "rmsnorm_cub.cuh"
+// 数据生成与 n_bench.cu 一致；kernel 实现未改动。
+#include "../kernels.cu"
+#include "cub_kernel.cuh"
 #include <cuda_profiler_api.h>
 #include <algorithm>
 #include <chrono>

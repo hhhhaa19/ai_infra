@@ -2,7 +2,7 @@
 # 用法：TORCHINDUCTOR_CACHE_DIR=<报告目录>/inductor_cache python src/rmsnorm/torch/compile_vs_ext.py <报告目录>
 # 输出：kernels.csv（每种实现启动了哪些 kernel、grid/block/寄存器，来自 torch.profiler）、
 #       bench.csv（耗时与有效带宽）；Inductor 生成的 Triton 源码留在 inductor_cache 里。
-# 计时方法与 bench_ext.py 相同：CUDA event 包住 50 次调用，30 个样本 × 3 轮交替，取中位数。
+# 计时方法与 bench.py 相同：CUDA event 包住 50 次调用，30 个样本 × 3 轮交替，取中位数。
 import csv, json, os, statistics, sys, time
 import torch
 from build_ext import load_rmsnorm

@@ -1,8 +1,8 @@
 // 手写 rmsNormN 与 CUB BlockReduce 版对照；own_t 是 rmsNormN 的模板版（线程数编译期常量）；
 // own_reg 是 x 只读一遍、存在寄存器里的版本（rmsNormReg）。
-// 形状、数据、校验、计时方法与 rmsnorm_n_bench.cu 一致，只多了 method 维度。
-#include "rmsNormWarp.cu"
-#include "rmsnorm_cub.cuh"
+// 形状、数据、校验、计时方法与 n_bench.cu 一致，只多了 method 维度。
+#include "../kernels.cu"
+#include "cub_kernel.cuh"
 #include <algorithm>
 #include <chrono>
 #include <cmath>

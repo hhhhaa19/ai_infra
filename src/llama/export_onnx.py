@@ -1,6 +1,6 @@
 # 把 decoder layer 导出成 ONNX，给 TensorRT 用（Orin，torch 2.1 的 TorchScript 追踪导出）。
 # 用法（在仓库根目录）：python src/llama/export_onnx.py [impl] [输出目录]（需要 onnx 包：torch 2.1 写文件时要用）
-#   impl 默认 eager；输出默认 build-onnx/layer/，每种形状一个固定形状的 .onnx，
+#   impl 默认 eager；输出默认 build-onnx/layer_<impl>/（之后用 scripts/build_trt_engines.sh 建 engine），每种形状一个固定形状的 .onnx，
 #   同时保存输入和 PyTorch 输出（.pt）作为 TensorRT 正确性检查的参考。
 # 权重和 bench_layer.py / compile_layer.py 一样：seed 0，两个 norm 的 weight 用 normal_()。
 import collections, os, sys
@@ -11,7 +11,7 @@ from torch.onnx import register_custom_op_symbolic
 from torch.onnx.symbolic_helper import parse_args
 
 impl = sys.argv[1] if len(sys.argv) > 1 else "eager"
-out_dir = sys.argv[2] if len(sys.argv) > 2 else "build-onnx/layer"
+out_dir = sys.argv[2] if len(sys.argv) > 2 else f"build-onnx/layer_{impl}"
 os.makedirs(out_dir, exist_ok=True)
 SHAPES = {"decode_b1": (1, 1), "decode_b8": (8, 1), "prefill_s512": (1, 512)}
 OPSET = 17   # TensorRT 8.5 的 ONNX 解析器比较保守，不用 torch 允许的最高版本 18

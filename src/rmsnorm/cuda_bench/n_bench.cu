@@ -1,4 +1,4 @@
-#include "rmsNormWarp.cu"
+#include "../kernels.cu"
 #include <algorithm>
 #include <chrono>
 #include <cmath>

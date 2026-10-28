@@ -9,7 +9,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
-#include "../rmsnorm_launch.cuh"
+#include "../launch.cuh"
 
 using namespace nvinfer1;
 

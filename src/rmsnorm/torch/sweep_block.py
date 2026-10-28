@@ -9,7 +9,7 @@ from torch.utils.cpp_extension import load_inline
 
 out_dir = sys.argv[1] if len(sys.argv) > 1 else "."
 os.makedirs(out_dir, exist_ok=True)
-kernel_file = pathlib.Path(__file__).resolve().parents[1] / "rmsNormWarp.cu"
+kernel_file = pathlib.Path(__file__).resolve().parents[1] / "kernels.cu"
 
 cuda_src = f'#include "{kernel_file}"\n' + r"""
 #include <ATen/cuda/CUDAContext.h>

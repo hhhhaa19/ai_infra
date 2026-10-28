@@ -1,5 +1,5 @@
 # 正确性测试：自动分档 + 强制每条路径，和 float64 的 PyTorch 参考对比；再测输入检查。
-# 用法（在仓库根目录）：python src/rmsnorm/torch/test_ext.py
+# 用法（在仓库根目录）：python src/rmsnorm/torch/test.py
 import torch
 from build_ext import load_rmsnorm
 

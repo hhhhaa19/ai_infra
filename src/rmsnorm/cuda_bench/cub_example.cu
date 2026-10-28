@@ -1,7 +1,7 @@
 // 阅读示例：单个 block 处理一行；FP32 输入/输出，所有行共享 weight。
-// kernel 在 rmsnorm_cub.cuh；先读 kernel，再读 main 中的数据与校验流程。
+// kernel 在 cub_kernel.cuh；先读 kernel，再读 main 中的数据与校验流程。
 #include <cuda_runtime.h>
-#include "rmsnorm_cub.cuh"
+#include "cub_kernel.cuh"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>

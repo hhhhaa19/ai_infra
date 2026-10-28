@@ -1,12 +1,12 @@
 #pragma once
 // RMSNorm 的选档和启动：只依赖 CUDA Runtime，不依赖 PyTorch。
-// PyTorch 扩展（torch/rmsnorm_ext.cu）和 TensorRT plugin 共用这一份：
+// PyTorch 扩展（torch/ext.cu）和 TensorRT plugin 共用这一份：
 // 它们各自负责把自己的张量拆成指针 + 形状，再调这里的 launchRMSNorm / launchFusedAddRMSNorm。
-// 注意：这里 include 了 rmsNormWarp.cu（里面有非模板 kernel），每个 .so 只能有一个 .cu 包含本文件。
+// 注意：这里 include 了 kernels.cu（里面有非模板 kernel），每个 .so 只能有一个 .cu 包含本文件。
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <type_traits>
-#include "rmsNormWarp.cu"
+#include "kernels.cu"
 
 // own_reg 的线程数：按每个线程处理几个元素（per）来定，per 看行数。
 // Quest A100 实测（20261027_quest_sweep_block，n=2048）：

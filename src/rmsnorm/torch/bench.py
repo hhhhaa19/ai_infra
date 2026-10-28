@@ -1,5 +1,5 @@
 # 单算子性能：我们的扩展（自动分档 / 强制各写法）vs PyTorch eager 写法。
-# 用法：python src/rmsnorm/torch/bench_ext.py [输出 csv]
+# 用法：python src/rmsnorm/torch/bench.py [输出 csv]
 # 计时：每种形状先预热；每个样本用 CUDA event 包住 50 次连续调用再除以 50；
 # 每个配置 30 个样本 × 3 轮，各实现在每轮内交替执行，取三轮中位数的中位数。
 # 计时包含 Python 调用和 kernel 启动的开销（这也是在 PyTorch 里实际用到的成本）。

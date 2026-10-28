@@ -1,6 +1,6 @@
 #pragma once
 // CUB BlockReduce 版 RMSNorm：单个 block 处理一行；FP32 输入/输出，所有行共享 weight。
-// 被 rmsnorm_cub.cu（单形状示例）和 rmsnorm_cub_bench.cu（与 rmsNormN 对照）共同包含。
+// 被 cub_example.cu（单形状示例）和 cub_bench.cu（与 rmsNormN 对照）共同包含。
 #include <cuda_runtime.h>
 #include <cub/block/block_reduce.cuh>
 #include <cstddef>
