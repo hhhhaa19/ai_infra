@@ -332,3 +332,143 @@ __global__ void fusedAddRmsNormReg(
         }
     }
 }
+
+// ===== float4 版：一条指令读 / 写 4 个 float（16 字节） =====
+// 一行看成 n/4 个 float4，线程 t 处理第 t、t+BLOCK、…… 个 float4：一个 warp 一次读连续的 32 个 float4（512 字节）。
+// 每个线程处理 VPT 个 float4，存在寄存器里给第二遍用。要求 n % 4 == 0、所有指针 16 字节对齐（调用方检查）。
+template<int BLOCK, int VPT>
+__global__ void rmsNormVec4(
+    const float* x,
+    const float* w,
+    float* y,
+    int n,
+    float eps
+){
+    extern __shared__ float p[];
+    __shared__ float scale;
+    int xid = threadIdx.x;
+    int warpid = xid/32;
+    int lane = xid%32;
+    constexpr int warpCount = BLOCK/32;
+    const int n4 = n / 4;                                   // 这一行有几个 float4
+    const std::size_t row4 = static_cast<std::size_t>(blockIdx.x) * n4;
+    const float4* x4 = reinterpret_cast<const float4*>(x) + row4;
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    float4* y4 = reinterpret_cast<float4*>(y) + row4;
+    float4 v[VPT];
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < VPT; ++i){
+        int c = xid + i * BLOCK;                            // 第几个 float4
+        v[i] = c < n4 ? x4[c] : make_float4(0.f, 0.f, 0.f, 0.f);
+        sum += v[i].x * v[i].x + v[i].y * v[i].y + v[i].z * v[i].z + v[i].w * v[i].w;
+    }
+    for ( int offset = 16; offset > 0; offset/=2){
+        float other = __shfl_down_sync(
+            0xffffffff,
+            sum,
+            offset
+        );
+        if (lane < offset){
+            sum += other;
+        }
+    }
+    if (lane == 0 ){
+        p[warpid] = sum;
+    }
+    __syncthreads();
+
+    for (int stride =warpCount/2 ;stride > 0; stride /= 2){
+        if (lane == 0 && warpid < stride){
+            p[warpid] += p[warpid+stride];
+        }
+        __syncthreads();
+    }
+    if (xid == 0){
+        scale = rsqrtf(p[0] / n + eps);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < VPT; ++i){
+        int c = xid + i * BLOCK;
+        if (c < n4){
+            float4 ww = w4[c];
+            y4[c] = make_float4(v[i].x * scale * ww.x, v[i].y * scale * ww.y,
+                                v[i].z * scale * ww.z, v[i].w * scale * ww.w);
+        }
+    }
+}
+
+// 融合 + float4：h = x + r；y = rmsnorm(h) * w。要求同 rmsNormVec4。
+template<int BLOCK, int VPT>
+__global__ void fusedAddRmsNormVec4(
+    const float* x,
+    const float* r,      // residual
+    const float* w,
+    float* h,            // 输出：x + r
+    float* y,            // 输出：rmsnorm(h) * w
+    int n,
+    float eps
+){
+    extern __shared__ float p[];
+    __shared__ float scale;
+    int xid = threadIdx.x;
+    int warpid = xid/32;
+    int lane = xid%32;
+    constexpr int warpCount = BLOCK/32;
+    const int n4 = n / 4;
+    const std::size_t row4 = static_cast<std::size_t>(blockIdx.x) * n4;
+    const float4* x4 = reinterpret_cast<const float4*>(x) + row4;
+    const float4* r4 = reinterpret_cast<const float4*>(r) + row4;
+    const float4* w4 = reinterpret_cast<const float4*>(w);
+    float4* h4 = reinterpret_cast<float4*>(h) + row4;
+    float4* y4 = reinterpret_cast<float4*>(y) + row4;
+    float4 v[VPT];
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < VPT; ++i){
+        int c = xid + i * BLOCK;
+        if (c < n4){
+            float4 a = x4[c], b = r4[c];                    // 各 1 条 128 位读取
+            v[i] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+            h4[c] = v[i];                                   // 1 条 128 位写入
+        } else {
+            v[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+        sum += v[i].x * v[i].x + v[i].y * v[i].y + v[i].z * v[i].z + v[i].w * v[i].w;
+    }
+    for ( int offset = 16; offset > 0; offset/=2){
+        float other = __shfl_down_sync(
+            0xffffffff,
+            sum,
+            offset
+        );
+        if (lane < offset){
+            sum += other;
+        }
+    }
+    if (lane == 0 ){
+        p[warpid] = sum;
+    }
+    __syncthreads();
+
+    for (int stride =warpCount/2 ;stride > 0; stride /= 2){
+        if (lane == 0 && warpid < stride){
+            p[warpid] += p[warpid+stride];
+        }
+        __syncthreads();
+    }
+    if (xid == 0){
+        scale = rsqrtf(p[0] / n + eps);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < VPT; ++i){
+        int c = xid + i * BLOCK;
+        if (c < n4){
+            float4 ww = w4[c];
+            y4[c] = make_float4(v[i].x * scale * ww.x, v[i].y * scale * ww.y,
+                                v[i].z * scale * ww.z, v[i].w * scale * ww.w);
+        }
+    }
+}

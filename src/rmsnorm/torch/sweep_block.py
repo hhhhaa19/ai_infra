@@ -1,4 +1,5 @@
-# n = 2048 时，rmsNormReg / fusedAddRmsNormReg 换不同的 BLOCK × PER_THREAD 切法，和 Triton（torch.compile）比单个 kernel 的 GPU 时间。
+# n = 2048 时，rmsNormReg / fusedAddRmsNormReg（每次读 1 个 float）和 float4 版 rmsNormVec4 / fusedAddRmsNormVec4
+# 换不同的 BLOCK × PER_THREAD 切法，和 Triton（torch.compile）比单个 kernel 的 GPU 时间。
 # 用法（Quest，有 Triton）：python src/rmsnorm/torch/sweep_block.py <输出目录>
 # 计时：同一个 kernel 连续 100 次录进一个 CUDA Graph，重放 20 次取中位数 ÷ 100，不含 CPU 发射开销。
 # 注意：连续重复读同一块数据，数据在 L2 里；我们和 Triton 条件相同。
@@ -14,7 +15,7 @@ cuda_src = f'#include "{kernel_file}"\n' + r"""
 #include <ATen/cuda/CUDAContext.h>
 // 只给 n = 2048 用：BLOCK × P = 2048
 void run(torch::Tensor x, torch::Tensor r, torch::Tensor w, torch::Tensor h, torch::Tensor y,
-         int64_t block, bool fused, double eps) {
+         int64_t block, bool fused, bool vec4, double eps) {
     TORCH_CHECK(x.size(-1) == 2048, "sweep only supports n = 2048");
     const int n = 2048, rows = x.numel() / n;
     const float e = static_cast<float>(eps);
@@ -25,12 +26,19 @@ void run(torch::Tensor x, torch::Tensor r, torch::Tensor w, torch::Tensor h, tor
         if (fused) fusedAddRmsNormReg<B, P><<<rows, B, (B / 32) * sizeof(float), s>>>(xp, rp, wp, hp, yp, n, e); \
         else       rmsNormReg<B, P><<<rows, B, (B / 32) * sizeof(float), s>>>(xp, wp, yp, n, e); \
         break;
-    switch (block) { CASE(128, 16) CASE(256, 8) CASE(512, 4) CASE(1024, 2) default: TORCH_CHECK(false, "bad block"); }
+// float4 版：V = P / 4 个 float4
+#define VCASE(B, V) case B: \
+        if (fused) fusedAddRmsNormVec4<B, V><<<rows, B, (B / 32) * sizeof(float), s>>>(xp, rp, wp, hp, yp, n, e); \
+        else       rmsNormVec4<B, V><<<rows, B, (B / 32) * sizeof(float), s>>>(xp, wp, yp, n, e); \
+        break;
+    if (vec4) switch (block) { VCASE(128, 4) VCASE(256, 2) VCASE(512, 1) default: TORCH_CHECK(false, "bad block"); }
+    else      switch (block) { CASE(128, 16) CASE(256, 8) CASE(512, 4) CASE(1024, 2) default: TORCH_CHECK(false, "bad block"); }
 #undef CASE
+#undef VCASE
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 """
-ext = load_inline(name="sweep_block_ext", cpp_sources="void run(torch::Tensor x, torch::Tensor r, torch::Tensor w, torch::Tensor h, torch::Tensor y, int64_t block, bool fused, double eps);",
+ext = load_inline(name="sweep_block_ext", cpp_sources="void run(torch::Tensor x, torch::Tensor r, torch::Tensor w, torch::Tensor h, torch::Tensor y, int64_t block, bool fused, bool vec4, double eps);",
                   cuda_sources=cuda_src, functions=["run"], extra_cuda_cflags=["-O2"], verbose=False)
 
 def clocks():
@@ -64,11 +72,16 @@ def add_norm_ref(x, r, w, eps=1e-5):
 prop = torch.cuda.get_device_properties(0)
 print(prop.name, "| SMs", prop.multi_processor_count, "| torch", torch.__version__, flush=True)
 print("clocks at start (sm, max sm, mem, temp, power):", clocks(), flush=True)
+_a = torch.randn(4096, 4096, device="cuda")
+for _ in range(200): _a @ _a                       # 先让 GPU 忙一会儿，把频率拉满再计时
+torch.cuda.synchronize(); del _a
+print("clocks after warm-up:", clocks(), flush=True)
 
 torch.manual_seed(0)
 n, eps = 2048, 1e-5
 rows_list = [1, 8, 64, 512]
 blocks = [128, 256, 512, 1024]
+vec4_blocks = [128, 256, 512]          # n=2048 是 512 个 float4，1024 线程会有一半空闲，不测
 results = []
 for rows in rows_list:
     x = torch.randn(rows, n, device="cuda"); r = torch.randn_like(x); w = torch.randn(n, device="cuda")
@@ -77,23 +90,25 @@ for rows in rows_list:
     row = {}
     for fused in (False, True):
         kind = "add+norm" if fused else "norm"
-        for b in blocks:
-            ext.run(x, r, w, h, y, b, fused, eps); torch.cuda.synchronize()
-            ref = y_ref if fused else norm_ref(x, w, eps)
-            assert (y - ref).abs().max().item() < 1e-4, (kind, rows, b)
-            if fused: assert torch.equal(h, h_ref)
-            t = time_graph(lambda: ext.run(x, r, w, h, y, b, fused, eps))
-            results.append([kind, rows, f"ours {b}x{n // b}", f"{t:.2f}"]); row[(kind, b)] = t
+        for vec4, bs in ((False, blocks), (True, vec4_blocks)):
+            for b in bs:
+                ext.run(x, r, w, h, y, b, fused, vec4, eps); torch.cuda.synchronize()
+                ref = y_ref if fused else norm_ref(x, w, eps)
+                assert (y - ref).abs().max().item() < 1e-4, (kind, rows, b, vec4)
+                if fused: assert torch.equal(h, h_ref)
+                t = time_graph(lambda: ext.run(x, r, w, h, y, b, fused, vec4, eps))
+                name = f"{'vec4' if vec4 else 'ours'} {b}x{n // b}"
+                results.append([kind, rows, name, f"{t:.2f}"]); row[(kind, vec4, b)] = t
         tri = torch.compile(add_norm_ref if fused else norm_ref, dynamic=False)
         args = (x, r, w, eps) if fused else (x, w, eps)
         got = tri(*args)
         assert ((got[1] if fused else got) - (y_ref if fused else norm_ref(x, w, eps))).abs().max().item() < 1e-4
         t = time_graph(lambda: tri(*args))
         results.append([kind, rows, "triton", f"{t:.2f}"]); row[(kind, "triton")] = t
-    print(f"rows={rows:4d} | norm: " + "  ".join(f"{b}x{n // b}={row[('norm', b)]:6.2f}" for b in blocks) +
-          f"  triton={row[('norm', 'triton')]:6.2f}  us", flush=True)
-    print(f"          | add+norm: " + "  ".join(f"{b}x{n // b}={row[('add+norm', b)]:6.2f}" for b in blocks) +
-          f"  triton={row[('add+norm', 'triton')]:6.2f}  us", flush=True)
+    for kind in ("norm", "add+norm"):
+        print(f"rows={rows:4d} {kind:8s} | scalar: " + " ".join(f"{b}x{n // b}={row[(kind, False, b)]:6.2f}" for b in blocks) +
+              " | float4: " + " ".join(f"{b}x{n // b}={row[(kind, True, b)]:6.2f}" for b in vec4_blocks) +
+              f" | triton={row[(kind, 'triton')]:6.2f} us", flush=True)
 
 print("clocks at end   (sm, max sm, mem, temp, power):", clocks(), flush=True)
 with open(os.path.join(out_dir, "sweep_block.csv"), "w", newline="") as fh:
