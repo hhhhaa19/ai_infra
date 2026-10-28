@@ -3,9 +3,15 @@
 #include <c10/cuda/CUDAException.h>
 #include "../rmsNormWarp.cu"
 
-static int chooseBlock(int n) {
-    int b =128;
-    while (b<1024 && b* 16 <n) b*=2;
+// own_reg 的线程数：按每个线程处理几个元素（per）来定，per 看行数。
+// Quest A100 实测（20261027_quest_sweep_block，n=2048）：
+//   行少（1~64 行）只有几个 block，GPU 吃不满，速度由延迟决定 → 每行多线程（512x4）最快；
+//   行多（512 行）→ block 小一点、一个 SM 同时放几个更好（256x8）。原来固定 per=16（128x16）在两种情况都最慢。
+static int chooseBlock(int n, int rows) {
+    static const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;  // 只看第一次用到的 GPU
+    const int per = rows < 2 * sms ? 4 : 8;
+    int b = 128;
+    while (b < 1024 && b * per < n) b *= 2;
     return b;
 }
 template <int BLOCK>
@@ -44,7 +50,7 @@ static void launchRMSNorm(int rows, int n, const float* x, const float* w, float
     // Orin 实测（20261024_orin_bench_ext）：n <= 224 warp 版更快，256 打平，>= 320 own_reg 更快
     if (impl == 0 && n <= 256 && launchWarpRow<4>(rows, n, x, w, y, eps, s)) return;
     bool ok = false;
-    if (impl != 3) switch (chooseBlock(n)) {
+    if (impl != 3) switch (chooseBlock(n, rows)) {
         case 128:  ok = launchReg<128>(rows, n, x, w, y, eps, s);  break;
         case 256:  ok = launchReg<256>(rows, n, x, w, y, eps, s);  break;
         case 512:  ok = launchReg<512>(rows, n, x, w, y, eps, s);  break;
@@ -129,7 +135,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_forward(
     const float e = static_cast<float>(eps);
 
     bool ok = false;
-    switch (chooseBlock(n)) {
+    switch (chooseBlock(n, rows)) {
         case 128:  ok = launchFusedReg<128>(rows, n, xp, rp, wp, hp, yp, e, s);  break;
         case 256:  ok = launchFusedReg<256>(rows, n, xp, rp, wp, hp, yp, e, s);  break;
         case 512:  ok = launchFusedReg<512>(rows, n, xp, rp, wp, hp, yp, e, s);  break;
