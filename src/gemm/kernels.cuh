@@ -9,12 +9,22 @@
 // ───────────── 第 1 版：朴素版 ─────────────
 // 一个线程算一个 C[i][j]：i 用 y 方向，j 用 x 方向；循环 K 次累加 A[i][k] * B[k][j]。
 __global__ void gemm_naive(const float* A, const float* B, float* C, int M, int N, int K) {
-    // TODO
+    int j = blockDim.x* blockIdx.x + threadIdx.x;
+    int i = blockDim.y* blockIdx.y + threadIdx.y;
+    if (i>=M ||j>= N) return ;
+    float sum = 0.0f;
+    for (int s = 0 ;s < K;s++){
+        sum += A[i*K+s]* B[s*N+j];
+    }
+    C [i*N+j] = sum;
 }
 
 inline bool launch_naive(const float* A, const float* B, float* C, int M, int N, int K, cudaStream_t s) {
     // TODO：定 block（比如 16×16）和 grid（向上取整盖住 N 列、M 行），启动 gemm_naive<<<grid, block, 0, s>>>
-    return false;
+    dim3 block (16,16);
+    dim3 grid ((N+15)/16,(M+15)/16);
+    gemm_naive<<<grid, block, 0, s>>>(A, B, C, M, N, K);
+    return true;
 }
 
 // ───────────── 第 2 版：shared memory 分块 ─────────────
@@ -23,11 +33,34 @@ inline bool launch_naive(const float* A, const float* B, float* C, int M, int N,
 template <int TILE>
 __global__ void gemm_tiled(const float* A, const float* B, float* C, int M, int N, int K) {
     // TODO：__shared__ float As[TILE][TILE], Bs[TILE][TILE];
+    __shared__  float As[TILE][TILE];
+    __shared__  float Bs[TILE][TILE];
+    int bj= blockIdx.x;
+    int bi = blockIdx.y; 
+    int j = threadIdx.x;
+    int i = threadIdx.y;
+    int row = bi*TILE + i;
+    int col = bj*TILE + j;
+    float sum = 0.0f;  
+    for (int k =0;k<(K+TILE-1)/TILE;++k){
+        As[i][j] = (row < M && k*TILE+j < K) ? A[row*K+k*TILE+j]:0;
+        Bs[i][j] = (k*TILE+i < K && col < N) ? B[(k*TILE+i)*N+col]:0;
+        __syncthreads();
+        for (int x = 0; x<TILE;++x){
+            sum += As[i][x]* Bs[x][j];
+        }
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row*N+col] = sum;
 }
 
 inline bool launch_tiled(const float* A, const float* B, float* C, int M, int N, int K, cudaStream_t s) {
     // TODO：constexpr int TILE = 16;（之后试 32）启动 gemm_tiled<TILE>
-    return false;
+    constexpr int TILE = 16;
+    dim3 block(TILE, TILE);
+    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    gemm_tiled<TILE><<<grid, block, 0, s>>>(A, B, C, M, N, K);
+    return true;
 }
 
 // ───────────── 第 3 版：寄存器分块 ─────────────
