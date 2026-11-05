@@ -43,3 +43,8 @@ add_library(rmsnorm_trt_plugin SHARED src/rmsnorm/tensorrt/plugin.cu)
 target_include_directories(rmsnorm_trt_plugin PRIVATE "${TENSORRT_INCLUDE_DIR}")
 target_link_libraries(rmsnorm_trt_plugin PRIVATE CUDA::cudart "${TENSORRT_LIBRARY}")
 target_compile_options(rmsnorm_trt_plugin PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O2> $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+
+# 手写 GEMM 练习：kernel 写在 src/gemm/kernels.cuh，gemm_bench 对比 cuBLAS 查正确性并计时
+add_cuda_example(gemm_bench src/gemm/gemm_bench.cu)
+target_link_libraries(gemm_bench PRIVATE CUDA::cublas)
+target_compile_options(gemm_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3> $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
