@@ -84,7 +84,7 @@ __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N,
     float c[TM][TN] ={0};
     float a[TM];
     float b[TN];
-    __shared__ float As [BM][BK];
+    __shared__ float As [BK][BM];
     __shared__ float Bs [BK][BN];
     for (int t = 0; t < K; t += BK) {
         for(int idx = tid ;idx < BM*BK ;idx +=num_threads){
@@ -92,7 +92,7 @@ __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N,
             int local_j = idx%BK;
             int ar = row + local_i;
             int ak = t + local_j;
-            As[local_i][local_j] =
+            As[local_j][local_i] =
                 (ar < M && ak < K) ? A[ar * K + ak] : 0.0f;
         }
         for(int idx = tid ;idx < BK*BN ;idx +=num_threads){
@@ -105,11 +105,16 @@ __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N,
         }
         __syncthreads();
         for(int kk = 0;kk<BK;++kk){
-            for (int ti =0;ti< TM ;++ti){
-                a[ti] = As[ti*(BM/TM)+i][kk];
-            }
-            for (int tj =0;tj <TN ;++tj){
-                b[tj] = Bs[kk][tj*(BN/TN)+j];
+            for (int q = 0; q < TM/4; ++q) {
+            float4 v = *reinterpret_cast<const float4*>(&As[kk][q*(BM/TM)*4 + i*4]);
+            a[q*4+0] = v.x;  a[q*4+1] = v.y;  a[q*4+2] = v.z;  a[q*4+3] = v.w;
+        }
+            for (int tj =0;tj <TN/4 ;++tj){
+                float4 v = *reinterpret_cast<const float4*> (&Bs[kk][tj*(BN/TN)*4 + j*4]);
+                b[tj*4+0] = v.x;
+                b[tj*4+1] = v.y;
+                b[tj*4+2] = v.z;
+                b[tj*4+3] = v.w;
             }
 
             for (int ti =0;ti< TM ;++ti){
@@ -122,8 +127,8 @@ __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N,
     }
     for (int ti =0;ti< TM ;++ti){
         for (int tj =0;tj <TN;++tj){
-            int r  = row +ti*(BM/TM)+i;
-            int c_col = col +tj*(BN/TN)+j;
+            int r  = row + (ti/4)*(BM/TM)*4 + i*4 + ti%4;
+            int c_col = col + (tj/4)*(BN/TN)*4 + j*4 + tj%4;
             if (r < M && c_col < N) {
                 C[r *N+ c_col] = c[ti][tj];
             }
