@@ -84,7 +84,7 @@ __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N,
     float c[TM][TN] ={0};
     float a[TM];
     float b[TN];
-    __shared__ float As [BK][BM];
+    __shared__ float As [BK][BM+4];
     __shared__ float Bs [BK][BN];
     for (int t = 0; t < K; t += BK) {
         for(int idx = tid ;idx < BM*BK ;idx +=num_threads){
@@ -104,6 +104,7 @@ __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N,
                 (bk < K && bc < N) ? B[bk * N + bc] : 0.0f;
         }
         __syncthreads();
+        #pragma unroll
         for(int kk = 0;kk<BK;++kk){
             for (int q = 0; q < TM/4; ++q) {
             float4 v = *reinterpret_cast<const float4*>(&As[kk][q*(BM/TM)*4 + i*4]);
