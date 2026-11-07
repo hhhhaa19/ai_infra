@@ -35,23 +35,23 @@ __global__ void gemm_tiled(const float* A, const float* B, float* C, int M, int 
     // TODO：__shared__ float As[TILE][TILE], Bs[TILE][TILE];
     __shared__  float As[TILE][TILE];
     __shared__  float Bs[TILE][TILE];
-    int bj= blockIdx.x;
-    int bi = blockIdx.y; 
-    int j = threadIdx.x;
+    int bi = blockIdx.y;
+    int bj = blockIdx.x;
     int i = threadIdx.y;
-    int row = bi*TILE + i;
-    int col = bj*TILE + j;
-    float sum = 0.0f;  
-    for (int k =0;k<(K+TILE-1)/TILE;++k){
-        As[i][j] = (row < M && k*TILE+j < K) ? A[row*K+k*TILE+j]:0;
-        Bs[i][j] = (k*TILE+i < K && col < N) ? B[(k*TILE+i)*N+col]:0;
+    int j = threadIdx.x;
+    float sum = 0.0f;
+    int row = bi*TILE+i;
+    int col = bj*TILE+j;
+    for (int k = 0; k< (K+TILE-1) / TILE;++k){
+        As [i][j] = k*TILE+j < K && row <M? A[row*K+k*TILE+j]:0;
+        Bs [i][j] = k*TILE+i < K && col < N ? B[(k*TILE+i)*N+col]:0;
         __syncthreads();
-        for (int x = 0; x<TILE;++x){
-            sum += As[i][x]* Bs[x][j];
+        for (int s= 0;s<TILE;++s){
+            sum += As[i][s] * Bs[s][j]; 
         }
         __syncthreads();
     }
-    if (row < M && col < N) C[row*N+col] = sum;
+    if (row < M && col <N)C[row*N+col] = sum;
 }
 
 inline bool launch_tiled(const float* A, const float* B, float* C, int M, int N, int K, cudaStream_t s) {
@@ -71,9 +71,71 @@ inline bool launch_tiled(const float* A, const float* B, float* C, int M, int N,
 template <int BM, int BN, int BK, int TM, int TN>
 __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N, int K) {
     // TODO
+    int bj = blockIdx.x;
+    int bi = blockIdx.y;
+    int i = threadIdx.y;
+    int j = threadIdx.x;
+    //在block中位置
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int num_threads = blockDim.x * blockDim.y;
+    // 在输出中的位置
+    int row = BM * bi;
+    int col = bj* BN;
+    float c[TM][TN] ={0};
+    float a[TM];
+    float b[TN];
+    __shared__ float As [BM][BK];
+    __shared__ float Bs [BK][BN];
+    for (int t = 0; t < K; t += BK) {
+        for(int idx = tid ;idx < BM*BK ;idx +=num_threads){
+            int local_i = idx/BK;
+            int local_j = idx%BK;
+            int ar = row + local_i;
+            int ak = t + local_j;
+            As[local_i][local_j] =
+                (ar < M && ak < K) ? A[ar * K + ak] : 0.0f;
+        }
+        for(int idx = tid ;idx < BK*BN ;idx +=num_threads){
+            int local_i = idx / BN;
+            int local_j = idx % BN;
+            int bk = t + local_i;
+            int bc = col + local_j;
+            Bs[local_i][local_j] =
+                (bk < K && bc < N) ? B[bk * N + bc] : 0.0f;
+        }
+        __syncthreads();
+        for(int kk = 0;kk<BK;++kk){
+            for (int ti =0;ti< TM ;++ti){
+                a[ti] = As[ti+i*TM][kk];
+            }
+            for (int tj =0;tj <TN ;++tj){
+                b[tj] = Bs[kk][tj+j*TN];
+            }
+
+            for (int ti =0;ti< TM ;++ti){
+                for (int tj =0;tj <TN ;++tj){
+                    c[ti][tj] += a[ti] *b[tj];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (int ti =0;ti< TM ;++ti){
+        for (int tj =0;tj <TN;++tj){
+            int r  = row +i*TM+ ti;
+            int c_col = col + j*TN +tj;
+            if (r < M && c_col < N) {
+                C[r *N+ c_col] = c[ti][tj];
+            }
+        }
+    }
 }
 
 inline bool launch_reg(const float* A, const float* B, float* C, int M, int N, int K, cudaStream_t s) {
     // TODO：比如 BM=BN=128, BK=8, TM=TN=8 → block 256 个线程（一维）
-    return false;
+    constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+    dim3 block(BN/TN, BM/TM);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    gemm_reg<BM, BN, BK, TM, TN><<<grid, block, 0, s>>>(A, B, C, M, N, K);
+    return true;
 }
