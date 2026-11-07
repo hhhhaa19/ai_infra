@@ -106,10 +106,10 @@ __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N,
         __syncthreads();
         for(int kk = 0;kk<BK;++kk){
             for (int ti =0;ti< TM ;++ti){
-                a[ti] = As[ti+i*TM][kk];
+                a[ti] = As[ti*(BM/TM)+i][kk];
             }
             for (int tj =0;tj <TN ;++tj){
-                b[tj] = Bs[kk][tj+j*TN];
+                b[tj] = Bs[kk][tj*(BN/TN)+j];
             }
 
             for (int ti =0;ti< TM ;++ti){
@@ -122,8 +122,8 @@ __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N,
     }
     for (int ti =0;ti< TM ;++ti){
         for (int tj =0;tj <TN;++tj){
-            int r  = row +i*TM+ ti;
-            int c_col = col + j*TN +tj;
+            int r  = row +ti*(BM/TM)+i;
+            int c_col = col +tj*(BN/TN)+j;
             if (r < M && c_col < N) {
                 C[r *N+ c_col] = c[ti][tj];
             }
