@@ -70,68 +70,116 @@ inline bool launch_tiled(const float* A, const float* B, float* C, int M, int N,
 // BM、BN、BK、TM、TN 都用编译期常量，循环才能展开、c[][] 才能放进寄存器。
 template <int BM, int BN, int BK, int TM, int TN>
 __global__ void gemm_reg(const float* A, const float* B, float* C, int M, int N, int K) {
-    // TODO
+    // 双缓冲：As/Bs 各两份。算 As[cur] 的同时，下一块先读进寄存器 ra/rb，算完再写进另一份。
+    constexpr int NT = (BM / TM) * (BN / TN);   // block 线程数（编译期常量，循环才能展开）
+    constexpr int LA = BM * BK / NT;            // 每个线程搬几个 A
+    constexpr int LB = BK * BN / NT;            // 每个线程搬几个 B
     int bj = blockIdx.x;
     int bi = blockIdx.y;
     int i = threadIdx.y;
     int j = threadIdx.x;
     //在block中位置
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int num_threads = blockDim.x * blockDim.y;
     // 在输出中的位置
     int row = BM * bi;
-    int col = bj* BN;
-    float c[TM][TN] ={0};
+    int col = bj * BN;
+    float c[TM][TN] = {0};
     float a[TM];
     float b[TN];
-    __shared__ float As [BK][BM+4];
-    __shared__ float Bs [BK][BN];
-    for (int t = 0; t < K; t += BK) {
-        for(int idx = tid ;idx < BM*BK ;idx +=num_threads){
-            int local_i = idx/BK;
-            int local_j = idx%BK;
-            int ar = row + local_i;
-            int ak = t + local_j;
-            As[local_j][local_i] =
-                (ar < M && ak < K) ? A[ar * K + ak] : 0.0f;
-        }
-        for(int idx = tid ;idx < BK*BN ;idx +=num_threads){
-            int local_i = idx / BN;
-            int local_j = idx % BN;
-            int bk = t + local_i;
-            int bc = col + local_j;
-            Bs[local_i][local_j] =
-                (bk < K && bc < N) ? B[bk * N + bc] : 0.0f;
-        }
-        __syncthreads();
-        #pragma unroll
-        for(int kk = 0;kk<BK;++kk){
-            for (int q = 0; q < TM/4; ++q) {
-            float4 v = *reinterpret_cast<const float4*>(&As[kk][q*(BM/TM)*4 + i*4]);
-            a[q*4+0] = v.x;  a[q*4+1] = v.y;  a[q*4+2] = v.z;  a[q*4+3] = v.w;
-        }
-            for (int tj =0;tj <TN/4 ;++tj){
-                float4 v = *reinterpret_cast<const float4*> (&Bs[kk][tj*(BN/TN)*4 + j*4]);
-                b[tj*4+0] = v.x;
-                b[tj*4+1] = v.y;
-                b[tj*4+2] = v.z;
-                b[tj*4+3] = v.w;
-            }
+    float ra[LA];
+    float rb[LB];
+    __shared__ float As[2][BK][BM + 4];
+    __shared__ float Bs[2][BK][BN];
+    int cur = 0;
 
-            for (int ti =0;ti< TM ;++ti){
-                for (int tj =0;tj <TN ;++tj){
-                    c[ti][tj] += a[ti] *b[tj];
+    // 准备阶段：第 0 块直接放进 buf 0
+    #pragma unroll
+    for (int r = 0; r < LA; ++r) {
+        int idx = tid + r * NT;
+        int local_i = idx / BK;
+        int local_j = idx % BK;
+        int ar = row + local_i;
+        int ak = local_j;
+        As[cur][local_j][local_i] = (ar < M && ak < K) ? A[ar * K + ak] : 0.0f;
+    }
+    #pragma unroll
+    for (int r = 0; r < LB; ++r) {
+        int idx = tid + r * NT;
+        int local_i = idx / BN;
+        int local_j = idx % BN;
+        int bk = local_i;
+        int bc = col + local_j;
+        Bs[cur][local_i][local_j] = (bk < K && bc < N) ? B[bk * N + bc] : 0.0f;
+    }
+    __syncthreads();
+
+    for (int t = 0; t < K; t += BK) {
+        bool has_next = t + BK < K;
+        // ① 发出下一块的读请求，只进寄存器，不等结果
+        if (has_next) {
+            #pragma unroll
+            for (int r = 0; r < LA; ++r) {
+                int idx = tid + r * NT;
+                int local_i = idx / BK;
+                int local_j = idx % BK;
+                int ar = row + local_i;
+                int ak = t + BK + local_j;
+                ra[r] = (ar < M && ak < K) ? A[ar * K + ak] : 0.0f;
+            }
+            #pragma unroll
+            for (int r = 0; r < LB; ++r) {
+                int idx = tid + r * NT;
+                int local_i = idx / BN;
+                int local_j = idx % BN;
+                int bk = t + BK + local_i;
+                int bc = col + local_j;
+                rb[r] = (bk < K && bc < N) ? B[bk * N + bc] : 0.0f;
+            }
+        }
+        // ② 用当前 buffer 计算，盖住 ① 的延迟
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            #pragma unroll
+            for (int q = 0; q < TM / 4; ++q) {
+                float4 v = *reinterpret_cast<const float4*>(&As[cur][kk][q * (BM / TM) * 4 + i * 4]);
+                a[q * 4 + 0] = v.x;  a[q * 4 + 1] = v.y;  a[q * 4 + 2] = v.z;  a[q * 4 + 3] = v.w;
+            }
+            #pragma unroll
+            for (int tj = 0; tj < TN / 4; ++tj) {
+                float4 v = *reinterpret_cast<const float4*>(&Bs[cur][kk][tj * (BN / TN) * 4 + j * 4]);
+                b[tj * 4 + 0] = v.x;  b[tj * 4 + 1] = v.y;  b[tj * 4 + 2] = v.z;  b[tj * 4 + 3] = v.w;
+            }
+            #pragma unroll
+            for (int ti = 0; ti < TM; ++ti) {
+                #pragma unroll
+                for (int tj = 0; tj < TN; ++tj) {
+                    c[ti][tj] += a[ti] * b[tj];
                 }
             }
         }
+        // ③ 换到另一份 buffer，把寄存器里的下一块写进去（越界的位置读的时候已经是 0）
+        cur ^= 1;
+        if (has_next) {
+            #pragma unroll
+            for (int r = 0; r < LA; ++r) {
+                int idx = tid + r * NT;
+                As[cur][idx % BK][idx / BK] = ra[r];
+            }
+            #pragma unroll
+            for (int r = 0; r < LB; ++r) {
+                int idx = tid + r * NT;
+                Bs[cur][idx / BN][idx % BN] = rb[r];
+            }
+        }
+        // ④ 每轮只同步一次：下一块写完才能算；写的那份上一轮已经算完并同步过
         __syncthreads();
     }
-    for (int ti =0;ti< TM ;++ti){
-        for (int tj =0;tj <TN;++tj){
-            int r  = row + (ti/4)*(BM/TM)*4 + i*4 + ti%4;
-            int c_col = col + (tj/4)*(BN/TN)*4 + j*4 + tj%4;
+    for (int ti = 0; ti < TM; ++ti) {
+        for (int tj = 0; tj < TN; ++tj) {
+            int r = row + (ti / 4) * (BM / TM) * 4 + i * 4 + ti % 4;
+            int c_col = col + (tj / 4) * (BN / TN) * 4 + j * 4 + tj % 4;
             if (r < M && c_col < N) {
-                C[r *N+ c_col] = c[ti][tj];
+                C[r * N + c_col] = c[ti][tj];
             }
         }
     }
