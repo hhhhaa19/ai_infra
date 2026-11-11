@@ -29,12 +29,21 @@ inline bool launch_copy(const float* X, float* Y, int rows, int n, cudaStream_t 
 // 线程 r 负责第 r 行，三遍循环：① 求最大值 m；② 求 d = Σ exp(x - m)；③ 写 y = exp(x - m) / d。
 // 问题在哪（写完测出来再想）：同一个 warp 的 32 个线程读的是 32 个不同的行，地址相隔 n 个 float。
 __global__ void softmax_naive(const float* __restrict__ X, float* __restrict__ Y, int rows, int n) {
-    // TODO
+    int r = blockIdx.x * blockDim.x + threadIdx.x;   // 全局行号
+    if (r >= rows) return;                           // 多出来的线程直接退出（这一版没有 __syncthreads，可以 return）
+    size_t base = size_t(r) * n;                     // 用 size_t，行数和列数大时 r * n 不会溢出
+    float m = -INFINITY;
+    for (int i = 0; i < n; ++i) m = fmaxf(m, X[base + i]);
+    float d = 0.0f;
+    for (int i = 0; i < n; ++i) d += expf(X[base + i] - m);
+    for (int i = 0; i < n; ++i) Y[base + i] = expf(X[base + i] - m) / d;
 }
 
 inline bool launch_naive(const float* X, float* Y, int rows, int n, cudaStream_t s) {
-    // TODO：一维 block（比如 128 个线程），grid 向上取整盖住 rows 行
-    return false;
+    int threads = 128;
+    int blocks = (rows + threads - 1) / threads;
+    softmax_naive<<<blocks, threads, 0, s>>>(X, Y, rows, n);
+    return true;
 }
 
 // ───────────── 第 2 版：一个 block 算一行，shared memory + warp shuffle 做规约 ─────────────
@@ -46,12 +55,41 @@ inline bool launch_naive(const float* X, float* Y, int rows, int n, cudaStream_t
 // 这一版要读 X 三遍（①②③各一遍）、写 Y 一遍。
 template <int BLOCK>
 __global__ void softmax_block(const float* __restrict__ X, float* __restrict__ Y, int rows, int n) {
-    // TODO：int r = blockIdx.x;
+    int b = blockIdx.x;                  // 这个 block 负责第 b 行
+    int r = threadIdx.x;                 // 线程在 block 里的编号
+    size_t base = size_t(b) * n;         // 这一行的起点
+    __shared__ float mb[BLOCK];
+    __shared__ float sumb[BLOCK];
+
+    // ① 最大值：线程 r 读第 r、r+BLOCK、… 个（相邻线程读相邻地址），分不到数的线程保持 -INFINITY
+    float m = -INFINITY;
+    for (int i = r; i < n; i += BLOCK) m = fmaxf(m, X[base + i]);
+    mb[r] = m;
+    __syncthreads();
+    for (int offset = BLOCK / 2; offset > 0; offset /= 2) {
+        if (r < offset) mb[r] = fmaxf(mb[r], mb[r + offset]);
+        __syncthreads();                 // 放在 if 外面：所有线程都要执行到
+    }
+    float row_max = mb[0];               // 所有线程都读 mb[0]，拿到整行的最大值
+
+    // ② 分母：分不到数的线程保持 0
+    float sum = 0.0f;
+    for (int i = r; i < n; i += BLOCK) sum += expf(X[base + i] - row_max);
+    sumb[r] = sum;
+    __syncthreads();
+    for (int offset = BLOCK / 2; offset > 0; offset /= 2) {
+        if (r < offset) sumb[r] += sumb[r + offset];
+        __syncthreads();
+    }
+    float row_sum = sumb[0];
+
+    // ③ 写结果
+    for (int i = r; i < n; i += BLOCK) Y[base + i] = expf(X[base + i] - row_max) / row_sum;
 }
 
 inline bool launch_block(const float* X, float* Y, int rows, int n, cudaStream_t s) {
-    // TODO：grid = rows，block = 256，启动 softmax_block<256>
-    return false;
+    softmax_block<256><<<rows, 256, 0, s>>>(X, Y, rows, n);   // 一个 block 负责一行
+    return true;
 }
 
 // ───────────── 第 3 版：online softmax，最大值和分母一遍求出 ─────────────
