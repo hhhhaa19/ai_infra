@@ -9,7 +9,7 @@
 
 // ───────────── 天花板：直接复制（不是转置，只用来对比速度）─────────────
 // 读和写都连续，是这块数据量能达到的最快速度。
-__global__ void copy_kernel(const float* A, float* B, int M, int N) {
+__global__ void copy_kernel(const float* __restrict__ A, float* __restrict__ B, int M, int N) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * 32+ threadIdx.y;
     #pragma unroll
