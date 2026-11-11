@@ -11,12 +11,15 @@
 // 读和写都连续，是这块数据量能达到的最快速度。
 __global__ void copy_kernel(const float* A, float* B, int M, int N) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (y < M && x < N) B[y * N + x] = A[y * N + x];
+    int y = blockIdx.y * 32+ threadIdx.y;
+    #pragma unroll
+    for(int i = 0;i<4;++i){
+        if (y + i*8 < M && x < N) B[(y+i*8) * N + x] = A[(y+i*8) * N + x];
+    }
 }
 
 inline bool launch_copy(const float* A, float* B, int M, int N, cudaStream_t s) {
-    dim3 block(32, 32);
+    dim3 block(32, 8);
     dim3 grid((N + 31) / 32, (M + 31) / 32);
     copy_kernel<<<grid, block, 0, s>>>(A, B, M, N);
     return true;
@@ -27,13 +30,16 @@ inline bool launch_copy(const float* A, float* B, int M, int N, cudaStream_t s) 
 // 读 A[i][j]（同一个 warp 里 j 连续 → 读是连续的），写 B[j][i]（每个线程相隔 M 个 float → 写是跳着的）。
 __global__ void transpose_naive(const float* A, float* B, int M, int N) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (y < M && x < N) B[x*M+y] = A[y*N+x];
+    int y = blockIdx.y * 32 + threadIdx.y;       // 每个 block 负责 32 行，线程每次跨 8 行
+    #pragma unroll
+    for(int i = 0;i<4;++i){
+        if (y + i*8 < M && x < N) B[x * M + y+i*8] = A[(y+i*8) * N + x];
+    }
 }
 
 inline bool launch_naive(const float* A, float* B, int M, int N, cudaStream_t s) {
     // TODO：block 32×32，grid 向上取整盖住 N 列、M 行，启动 transpose_naive<<<grid, block, 0, s>>>
-    dim3 block(32, 32);
+    dim3 block(32, 8);
     dim3 grid((N + 31) / 32, (M + 31) / 32);
     transpose_naive<<<grid, block, 0, s>>>(A, B, M, N);
     return true;
@@ -46,23 +52,29 @@ inline bool launch_naive(const float* A, float* B, int M, int N, cudaStream_t s)
 // 注意：A 的第 (by, bx) 块，转置后落在 B 的第 (bx, by) 块。
 __global__ void transpose_shared(const float* A, float* B, int M, int N) {
     __shared__ float tile[32][32];
-    int tx = threadIdx.x, ty = threadIdx.y;      // 块内坐标，0~31
+    int tx = threadIdx.x, ty = threadIdx.y;      // tx 0~31，ty 0~7（block 32×8，每个线程搬 4 行，每次跨 8 行）
     int bx = blockIdx.x * 32;                    // 这个小块在 A 里的起始列
     int by = blockIdx.y * 32;                    // 这个小块在 A 里的起始行
 
     // 第 1 步：读 A 的 第 (by+ty) 行、第 (bx+tx) 列
     int ar = by + ty, ac = bx + tx;
-    if (ar < M && ac < N) tile[ty][tx] = A[ar * N + ac];
+    #pragma unroll
+    for(int i = 0;i<4;++i){
+        if ((ar +i*8) < M && ac < N) tile[ty+i*8][tx] = A[(ar +i*8)* N + ac];
+    }
 
     __syncthreads();
 
     // 第 2 步：写 B 的 第 (bx+ty) 行、第 (by+tx) 列   ← bx、by 对调了
     int br = bx + ty, bc = by + tx;
-    if (br < N && bc < M) B[br * M + bc] = tile[tx][ty];
+    #pragma unroll
+    for(int i = 0;i<4;++i){
+        if (br + i*8 < N && bc < M) B[(br +i*8)* M + bc] = tile[tx][ty+i*8];
+    }
 }
 
 inline bool launch_shared(const float* A, float* B, int M, int N, cudaStream_t s) {
-    dim3 block(32, 32);
+    dim3 block(32, 8);
     dim3 grid((N + 31) / 32, (M + 31) / 32);
     transpose_shared<<<grid, block, 0, s>>>(A, B, M, N);
     return true;
@@ -72,24 +84,30 @@ inline bool launch_shared(const float* A, float* B, int M, int N, cudaStream_t s
 // 只把 tile 改成 [32][33]，其余和第 2 版一样。
 __global__ void transpose_shared_pad(const float* A, float* B, int M, int N) {
     __shared__ float tile[32][33];               // 只有这里多 1 列，其余和第 2 版一样
-    int tx = threadIdx.x, ty = threadIdx.y;      // 块内坐标，0~31
+    int tx = threadIdx.x, ty = threadIdx.y;      // tx 0~31，ty 0~7（block 32×8，每个线程搬 4 行，每次跨 8 行）
     int bx = blockIdx.x * 32;                    // 这个小块在 A 里的起始列
     int by = blockIdx.y * 32;                    // 这个小块在 A 里的起始行
 
     // 第 1 步：读 A 的 第 (by+ty) 行、第 (bx+tx) 列
     int ar = by + ty, ac = bx + tx;
-    if (ar < M && ac < N) tile[ty][tx] = A[ar * N + ac];
+    #pragma unroll
+    for(int i = 0;i<4;++i){
+        if (ar + i*8 < M && ac < N) tile[ty+i*8][tx] = A[(ar +i*8)* N + ac];
+    }
 
     __syncthreads();
 
     // 第 2 步：写 B 的 第 (bx+ty) 行、第 (by+tx) 列   ← bx、by 对调了
     int br = bx + ty, bc = by + tx;
-    if (br < N && bc < M) B[br * M + bc] = tile[tx][ty];
+    #pragma unroll
+    for(int i = 0;i<4;++i){
+        if (br + i*8 < N && bc < M) B[(br +i*8)* M + bc] = tile[tx][ty+i*8];
+    }
     
 }
 
 inline bool launch_shared_pad(const float* A, float* B, int M, int N, cudaStream_t s) {
-    dim3 block(32, 32);
+    dim3 block(32, 8);
     dim3 grid((N + 31) / 32, (M + 31) / 32);
     transpose_shared_pad<<<grid, block, 0, s>>>(A, B, M, N);
     return true;
