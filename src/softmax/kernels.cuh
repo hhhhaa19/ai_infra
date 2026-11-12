@@ -100,12 +100,47 @@ inline bool launch_block(const float* X, float* Y, int rows, int n, cudaStream_t
 // 这一版读 X 两遍、写 Y 一遍。FlashAttention 就是用这个合并公式把 softmax 拆成块来算的。
 template <int BLOCK>
 __global__ void softmax_online(const float* __restrict__ X, float* __restrict__ Y, int rows, int n) {
-    // TODO
+    int b = blockIdx.x;                  // 这个 block 负责第 b 行
+    int r = threadIdx.x;                 // 线程在 block 里的编号
+    size_t base = size_t(b) * n;         // 这一行的起点
+    __shared__ float mb[BLOCK];
+    __shared__ float sumb[BLOCK];
+
+    // ① 一遍同时求 (m, d)：分不到数的线程保持 (-INFINITY, 0)
+    float m = -INFINITY;
+    float d = 0.0f;
+    for (int i = r; i < n; i += BLOCK) {
+        float cur = X[base + i];
+        float m_new = fmaxf(m, cur);     // cur 是实数，所以 m_new 也是实数
+        d = d * expf(m - m_new) + expf(cur - m_new);
+        m = m_new;
+    }
+    mb[r] = m;
+    sumb[r] = d;
+    __syncthreads();                     // 所有线程写完，才能读别人的
+
+    // ② block 内合并 (m, d)
+    for (int offset = BLOCK / 2; offset > 0; offset /= 2) {
+        if (r < offset) {
+            float m1 = mb[r], m2 = mb[r + offset];
+            float m_new = fmaxf(m1, m2);
+            if (m_new != -INFINITY) {    // 两边都是空的就跳过：-inf - (-inf) 是 NaN
+                sumb[r] = sumb[r] * expf(m1 - m_new) + sumb[r + offset] * expf(m2 - m_new);
+                mb[r] = m_new;
+            }
+        }
+        __syncthreads();
+    }
+    float row_max = mb[0];
+    float row_sum = sumb[0];
+
+    // ③ 写结果
+    for (int i = r; i < n; i += BLOCK) Y[base + i] = expf(X[base + i] - row_max) / row_sum;
 }
 
 inline bool launch_online(const float* X, float* Y, int rows, int n, cudaStream_t s) {
-    // TODO
-    return false;
+    softmax_online<256><<<rows, 256, 0, s>>>(X, Y, rows, n);   // 一个 block 负责一行
+    return true;
 }
 
 // ───────────── 第 4 版：一个 warp 算一行，整行放在寄存器里 ─────────────
