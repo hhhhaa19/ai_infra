@@ -150,10 +150,54 @@ inline bool launch_online(const float* X, float* Y, int rows, int n, cudaStream_
 // n 超过上限时 launch 返回 false，这一版在测试里就会显示 not implemented / 跳过。
 template <int PER_LANE>
 __global__ void softmax_warp(const float* __restrict__ X, float* __restrict__ Y, int rows, int n) {
-    // TODO
+    int lane = threadIdx.x % 32;                                  // 在 warp 里的编号 0..31
+    int warp = threadIdx.x / 32;                                  // 在 block 里是第几个 warp
+    int row  = blockIdx.x * (blockDim.x / 32) + warp;             // 一个 warp 负责一行
+    if (row >= rows) return;                                      // 同一个 warp 的 32 个线程行号相同，会一起退出，shuffle 安全
+    size_t base = size_t(row) * n;
+
+    // ① 读进寄存器：lane 读第 lane、lane+32、… 个（每次 32 个线程读连续 128 字节）
+    float v[PER_LANE];
+    float row_max = -INFINITY;
+    #pragma unroll
+    for (int k = 0; k < PER_LANE; k++) {
+        int i = lane + k * 32;
+        v[k] = (i < n) ? X[base + i] : -INFINITY;                 // 越界位置填 -INF：不影响 max，exp 后是 0
+        row_max = fmaxf(row_max, v[k]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        row_max = fmaxf(row_max, __shfl_xor_sync(0xffffffff, row_max, offset));
+
+    // ② exp 算一次，结果留在 v[] 里，写结果时直接用
+    float row_sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < PER_LANE; k++) {
+        v[k] = expf(v[k] - row_max);                              // 越界位置：exp(-INF) = 0
+        row_sum += v[k];
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        row_sum += __shfl_xor_sync(0xffffffff, row_sum, offset);
+
+    // ③ 写结果
+    float inv = 1.0f / row_sum;
+    #pragma unroll
+    for (int k = 0; k < PER_LANE; k++) {
+        int i = lane + k * 32;
+        if (i < n) Y[base + i] = v[k] * inv;
+    }
 }
 
 inline bool launch_warp(const float* X, float* Y, int rows, int n, cudaStream_t s) {
-    // TODO：if (n > 32 * 32) return false; 一个 block 放 4 个 warp（128 线程）处理 4 行，grid = (rows + 3) / 4
-    return false;
+    constexpr int WARPS = 4;                                      // 一个 block 4 个 warp = 128 线程，处理 4 行
+    int blocks = (rows + WARPS - 1) / WARPS;
+    if      (n <= 32)   softmax_warp<1> <<<blocks, WARPS * 32, 0, s>>>(X, Y, rows, n);
+    else if (n <= 64)   softmax_warp<2> <<<blocks, WARPS * 32, 0, s>>>(X, Y, rows, n);
+    else if (n <= 128)  softmax_warp<4> <<<blocks, WARPS * 32, 0, s>>>(X, Y, rows, n);
+    else if (n <= 256)  softmax_warp<8> <<<blocks, WARPS * 32, 0, s>>>(X, Y, rows, n);
+    else if (n <= 512)  softmax_warp<16><<<blocks, WARPS * 32, 0, s>>>(X, Y, rows, n);
+    else if (n <= 1024) softmax_warp<32><<<blocks, WARPS * 32, 0, s>>>(X, Y, rows, n);
+    else return false;                                            // 一行放不进寄存器，用 block / online 版
+    return true;
 }
