@@ -111,17 +111,76 @@ inline bool launch_multi(const int* X, int* Y, int n, int* work, cudaStream_t s)
     return true;
 }
 
-// ───────────── 第 3 版：block 内的 scan 用 warp shuffle ─────────────
-// 和第 2 版一样三步走，只换掉 block 内部的做法：
-//   (a) warp 内用 __shfl_up_sync 做 Hillis-Steele：offset = 1, 2, 4, 8, 16，
-//       x += (lane >= offset) ? 从 lane - offset 拿到的值 : 0。不需要 shared、不需要 sync。
-//   (b) 每个 warp 的最后一个 lane 把 warp 的总和写进 shared 的 warp_sums[warp]，__syncthreads()。
-//   (c) 第 0 个 warp 对 warp_sums 再做一次 warp scan（一个 block 最多 32 个 warp，正好一个 warp 能算）。
-//   (d) __syncthreads() 后，每个线程加上前面所有 warp 的和 warp_sums[warp - 1]。
-// 可选：每个线程处理多个数（先在寄存器里串行加，再参与 warp scan），一个 block 负责的段更长，sums 更少。
-inline bool launch_warp(const int* X, int* Y, int n, int* work, cudaStream_t s) {
+// ───────────── 第 3 版：每个线程 4 个数 + warp shuffle ─────────────
+// 和第 2 版一样三步走（① 局部 scan + 写段总和 → ② 递归 scan 段总和 → ③ 加偏移），只换掉 ① 的 kernel。
+// 一个 block 256 个线程（8 个 warp），每个线程负责连续的 4 个数，一个 block 负责一段 1024 个数。
+// 为什么每个线程拿"连续"的 4 个数，而不是 softmax 那样 lane + k*32 交错：
+//   scan 要保持顺序（只用结合律，不用交换律），线程 t 的 4 个数必须整段排在线程 t+1 前面，线程内串行前缀才有意义。
+//   用 int4 一次读 16 字节，一个 warp 读的是连续 512 字节，仍然是合并访问。
+
+// warp 内的 inclusive scan：每个 lane 传入自己的 x，返回 lane 0 到自己（含）的 x 之和。
+// __shfl_up_sync(mask, x, offset) 返回 lane - offset 的 x；lane < offset 时返回自己的 x（所以要判断，不能直接加）。
+__device__ __forceinline__ int warp_scan_incl(int x) {
+    int lane = threadIdx.x % 32;
+    // TODO：offset = 1, 2, 4, 8, 16：
+    //       int y = __shfl_up_sync(0xffffffff, x, offset);
+    //       if (lane >= offset) x += y;
+    return x;
+}
+
+template <int BLOCK, int ITEMS>
+__global__ void scan_local_warp(const int* X, int* Y, int n, int* __restrict__ sums) {   // X、Y 不加 __restrict__：递归时 X == Y
+    static_assert(ITEMS == 4, "这一版用 int4 读写，一个线程正好 4 个数");
+    constexpr int TILE = BLOCK * ITEMS;                  // 一个 block 负责的数的个数
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+    int base = blockIdx.x * TILE + threadIdx.x * ITEMS;  // 本线程 4 个数中第一个的位置（一定是 4 的倍数）
+    __shared__ int warp_sums[BLOCK / 32];
+    int v[ITEMS];
+
+    // 第 0 步：读 4 个数到 v[0..3]
+    //   base + 3 < n：一次 int4 读：int4 t = *reinterpret_cast<const int4*>(X + base);  v[0] = t.x; … v[3] = t.w;
+    //   否则（最后一个线程凑不满 4 个）：逐个读，base + k >= n 的位置补 0
+    //   （X 的地址按 16 字节对齐、base 是 4 的倍数，int4 读才合法；launch_warp 已经保证了递归时也对齐）
     // TODO
-    return false;
+
+    // 第 1 步：线程内串行前缀：v[1] += v[0]; v[2] += v[1]; v[3] += v[2];  本线程总和 = v[3]
+    // TODO
+
+    // 第 2 步：warp 内对"本线程总和"做 scan
+    //   int incl = warp_scan_incl(v[3]);   含自己
+    //   int excl = incl - v[3];            同一 warp 里排在自己前面的线程的总和
+    // TODO
+
+    // 第 3 步：warp 之间合并
+    //   lane 31 把 incl（整个 warp 的总和）写进 warp_sums[warp]；__syncthreads()
+    //   warp 0：读 warp_sums[lane]（lane >= BLOCK/32 的读 0），warp_scan_incl，写回 warp_sums[lane]；__syncthreads()
+    //   （两个 __syncthreads() 都要放在 if 外面）
+    // TODO
+
+    // 第 4 步：本线程的偏移 = excl + (warp > 0 ? warp_sums[warp - 1] : 0)，加到 v[0..3] 上，写回 Y
+    //   base + 3 < n：一次 int4 写：*reinterpret_cast<int4*>(Y + base) = make_int4(v[0], v[1], v[2], v[3]);
+    //   否则逐个写，只写 base + k < n 的位置
+    // TODO
+
+    // 第 5 步：段总和写进 sums[blockIdx.x]
+    //   warp_sums[BLOCK/32 - 1] 就是整个 block 的总和（越界的位置补了 0，最后一段不满时也对），让 threadIdx.x == 0 写
+    // TODO
+}
+
+inline bool launch_warp(const int* X, int* Y, int n, int* work, cudaStream_t s) {
+    return false;   // ← kernel 写好后删掉这一行
+
+    constexpr int BLOCK = 256, ITEMS = 4, TILE = BLOCK * ITEMS;   // TILE = 1024
+    int nb = (n + TILE - 1) / TILE;                     // 段数，也就是 sums 的个数
+    int* sums = work;
+    scan_local_warp<BLOCK, ITEMS><<<nb, BLOCK, 0, s>>>(X, Y, n, sums);
+    if (nb == 1) return true;
+    // 下一层的草稿纸起点按 4 个 int（16 字节）对齐：递归时 sums 会被当作 X、Y 用 int4 读写，必须对齐
+    int* next = work + (nb + 3) / 4 * 4;
+    launch_warp(sums, sums, nb, next, s);
+    add_offset<TILE><<<nb, TILE, 0, s>>>(Y, n, sums);   // 复用第 2 版：段长 1024，一个 block 1024 个线程，每个线程一个数
+    return true;
 }
 
 // ───────────── 第 4 版（可选）：decoupled look-back，一个 kernel 完成 ─────────────
