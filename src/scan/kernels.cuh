@@ -38,11 +38,24 @@ inline bool launch_copy(const int* X, int* Y, int n, int* work, cudaStream_t s) 
 template <int BLOCK>
 __global__ void scan_block(const int* __restrict__ X, int* __restrict__ Y, int n) {
     // TODO
+    int i = threadIdx.x;
+    int r = blockIdx.x * blockDim.x+i;
+    __shared__ int buf [BLOCK] ;
+    buf[i] = r < n ? X[r]:0;
+    __syncthreads();
+    for(int offset = 1;offset< n;offset *=2){
+      int cur = (i >= offset) ? buf[i - offset] : 0;   // 所有线程都读（不该加的读 0）
+        __syncthreads();
+        buf[i] += cur;
+        __syncthreads();
+    }
+    if (r < n) Y[r] = buf[i];
 }
 
 inline bool launch_block(const int* X, int* Y, int n, int* work, cudaStream_t s) {
-    // TODO：if (n > 1024) return false;  scan_block<1024><<<1, 1024, 0, s>>>(X, Y, n);
-    return false;
+    if (n > 1024) return false;                         // 一个 block 只能处理 1024 个数
+    scan_block<1024><<<1, 1024, 0, s>>>(X, Y, n);
+    return true;
 }
 
 // ───────────── 第 2 版：多个 block，三步走 ─────────────
@@ -52,11 +65,50 @@ inline bool launch_block(const int* X, int* Y, int n, int* work, cudaStream_t s)
 //   ② 对 sums 做 scan：sums 有 ceil(n / BLOCK) 个数。如果 ≤ BLOCK，一个 block 就够；
 //                 如果更多（n = 2^26 时有 65536 个），就对 sums 再调用一次 launch_multi —— 递归。
 //   ③ add_offset：第 b 个 block（b ≥ 1）给自己那段的每个数加上 sums[b - 1]（前面所有段的总和）。
+
 // sums 放在 work 里；递归时下一层的 sums 接在这一层后面。
 // 这一版读写显存的遍数：① 读 X 写 Y，③ 读 Y 写 Y，比 copy 多一读一写。
+// ① 每个 block 在自己那段里做 scan，再把段的总和写进 sums[blockIdx.x]
+//   基本就是你的 scan_block，只改两处：
+//   (1) 用全局位置 g = blockIdx.x * BLOCK + threadIdx.x 去读 X、写 Y
+//   (2) 最后由一个线程写总和：if (threadIdx.x == BLOCK - 1) sums[blockIdx.x] = buf[BLOCK - 1];
+//       越界的位置补的是 0，所以 buf[BLOCK-1] 就是这段的总和，最后一个 block 不满时也成立
+template <int BLOCK>
+__global__ void scan_local(const int* X, int* Y, int n, int* __restrict__ sums) {   // X、Y 不加 __restrict__：递归时 X == Y
+    int i = threadIdx.x;
+    int r = blockDim.x* blockIdx.x+ i;
+    __shared__ int buf [BLOCK] ;
+    buf[i] = r < n ? X[r]:0;
+    __syncthreads();
+    for(int offset = 1;offset< BLOCK;offset *=2){
+      int cur = (i >= offset) ? buf[i - offset] : 0;   // 所有线程都读（不该加的读 0）
+        __syncthreads();
+        buf[i] += cur;
+        __syncthreads();
+    }
+    if (r < n) Y[r] = buf[i];
+    if (threadIdx.x == BLOCK -1) sums[blockIdx.x] = buf[BLOCK -1];
+
+}
+
+// ③ 第 b 段（b ≥ 1）的每个数加上 sums[b - 1]
+template <int BLOCK>
+__global__ void add_offset(int* Y, int n, const int* __restrict__ sums) {
+    int b = blockIdx.x;
+    int g = b * BLOCK + threadIdx.x;
+    if (b == 0 || g >= n) return;          // 第 0 段前面没有东西；越界的线程不写
+    Y[g] += sums[b - 1];
+}
+
 inline bool launch_multi(const int* X, int* Y, int n, int* work, cudaStream_t s) {
-    // TODO
-    return false;
+    constexpr int BLOCK = 1024;
+    int nb = (n + BLOCK - 1) / BLOCK;      // block 数，也就是 sums 的个数
+    int* sums = work;  
+       scan_local<BLOCK><<<nb, BLOCK, 0, s>>>(X, Y, n, sums);
+    if (nb == 1) return true;
+    launch_multi(sums, sums, nb, work + nb, s);
+    add_offset<BLOCK><<<nb, BLOCK, 0, s>>>(Y, n, sums);
+    return true;
 }
 
 // ───────────── 第 3 版：block 内的 scan 用 warp shuffle ─────────────
