@@ -18,8 +18,8 @@ struct ConvShape {
     int N, C, H, W;   // 输入
     int K, R, S;      // 卷积核
     int stride, pad;
-    int P() const { return (H + 2 * pad - R) / stride + 1; }
-    int Q() const { return (W + 2 * pad - S) / stride + 1; }
+    __host__ __device__ int P() const { return (H + 2 * pad - R) / stride + 1; }
+    __host__ __device__ int Q() const { return (W + 2 * pad - S) / stride + 1; }
 };
 
 // ───────────── 第 1 版：直接卷积，一个线程算一个输出数 ─────────────
@@ -36,7 +36,28 @@ struct ConvShape {
 // 想一想：同一个 warp 的 32 个线程，q 连续，它们读 X 的地址是不是连续的？读 Wt 呢？
 __global__ void conv_direct(const float* __restrict__ X, const float* __restrict__ Wt,
                             float* __restrict__ Y, ConvShape sh) {
-    // TODO
+    const int C = sh.C, H = sh.H, W = sh.W, K = sh.K, R = sh.R, S = sh.S;
+    const int P = sh.P(), Q = sh.Q();
+    size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= size_t(sh.N) * K * P * Q) return;      // 多出来的线程没有格子可算
+    int q = int(idx % Q);
+    int p = int((idx / Q) % P);
+    int k = int((idx / (size_t(P) * Q)) % K);
+    int n = int(idx / (size_t(K) * P * Q));
+    float sum = 0.0f;
+    for (int c = 0; c < C; c++) {
+        for (int r = 0; r < R; r++) {
+            int h = p * sh.stride - sh.pad + r;          // 窗口左上角 + 窗口里第 r 行
+            if (h < 0 || h >= H) continue;               // 落在补的 0 上，跳过
+            for (int s = 0; s < S; s++) {
+                int w = q * sh.stride - sh.pad + s;
+                if (w < 0 || w >= W) continue;
+                sum += Wt[((size_t(k) * C + c) * R + r) * S + s] *
+                       X[((size_t(n) * C + c) * H + h) * W + w];
+            }
+        }
+    }
+    Y[idx] = sum;
 }
 
 inline bool launch_direct(const float* X, const float* Wt, float* Y, const ConvShape& sh, cudaStream_t s) {
