@@ -13,6 +13,7 @@
 //   Y[n,k,p,q]  = Y[((n*K + k)*P + p)*Q + q]
 #pragma once
 #include <cuda_runtime.h>
+#include "../gemm/kernels.cuh"   // 第 2 版直接调用你写的 GEMM：launch_tiled、launch_reg
 
 struct ConvShape {
     int N, C, H, W;   // 输入
@@ -68,7 +69,86 @@ inline bool launch_direct(const float* X, const float* Wt, float* Y, const ConvS
     return true;
 }
 
-// ───────────── 第 2 版：implicit GEMM（之后再写）─────────────
+// ───────────── 第 2 版：显式 im2col + 你的 GEMM ─────────────
+// 思路就是动画里那样：先把每个窗口抄成矩阵 B 的一列，再把 Wt · B 交给 src/gemm 里写好的 GEMM。
+//   B 的形状 [CRS × PQ]（一张图）：
+//     行号 row = (c*R + r)*S + s        —— 窗口里的第几个数，和 Wt[k,c,r,s] 摊平的顺序一样
+//     列号 col = p*Q + q                —— 第几个窗口（输出位置）
+//     B[row][col] = X[n, c, p*stride - pad + r, q*stride - pad + s]，越界就是 0
+//     （补的 0 这次要真的写进 B：GEMM 不知道哪些是补的，它会把整列都乘一遍）
+//   Y_n[K × PQ] = Wt[K × CRS] · B[CRS × PQ]
+//     Wt 的内存本来就是 [K × CRS] 行主序；Y 里第 n 张图那一段（从 Y + n*K*P*Q 开始）本来就是 [K × PQ] 行主序。
+//     所以 Wt 和 Y 都不用搬，只有 B 需要抄。
+// N > 1 时一张一张来：每个 n 做一次 im2col、一次 GEMM。
+//   （如果 N 张一起做，B 是 [CRS × NPQ]，乘出来是 [K][N][P][Q]，和 Y 的 [N][K][P][Q] 对不上，还得再搬一次。）
+
+// 2a. im2col：一个线程抄 B 的一个数。B 一共 CRS × PQ 个数。
+//   Xn 是第 n 张图的开头（launch 里传 X + n*C*H*W），所以这里不用管 n。
+//   步骤：
+//     1. idx ≥ CRS*PQ 的线程 return。
+//     2. row = idx / PQ，col = idx % PQ。
+//     3. 拆 row：s = row % S;  r = (row / S) % R;  c = row / (R*S)
+//        拆 col：q = col % Q;  p = col / Q
+//     4. h = p*stride - pad + r;  w = q*stride - pad + s
+//     5. B[idx] = 越界 ? 0.0f : Xn[(c*H + h)*W + w]
+// 想一想：同一个 warp 里 idx 连续 → col 连续 → q 连续。写 B 是连续的；读 X 呢？stride 16 时呢？
+__global__ void im2col_kernel(const float* __restrict__ Xn, float* __restrict__ B, ConvShape sh) {
+    const int C = sh.C, H = sh.H, W = sh.W, R = sh.R, S = sh.S;
+    const int P = sh.P(), Q = sh.Q();
+    const int rowline = P*Q;
+    size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= size_t(C)*R*S*P*Q) return;      // 多出来的线程没有格子可算（先转 size_t 再乘，免得 int 溢出）
+    int row = idx /rowline;
+    int col = idx %rowline;
+    int c = row /(R*S);
+    int r = (row /S) %R;
+    int s = row %S;
+    int q = col % Q;
+    int p = col /Q;
+    int h = p*sh.stride - sh.pad + r;
+    int w = q*sh.stride - sh.pad + s;
+    B[idx] = (h < 0 || h >= H || w < 0 || w >= W) ? 0.0f : Xn[(c*H + h)*W + w]; 
+}
+
+// 2b. B 放在哪：申请一块显存，以后的调用接着用，不够大才换一块更大的。
+//   bench 对每个形状先跑一次查对错（不计时），再预热、计时，所以 cudaMalloc 只发生在不计时的那一次。
+//   这块显存到程序结束才释放，测试程序里可以接受。
+inline float* im2col_workspace(size_t floats) {
+    static float* buf = nullptr;
+    static size_t cap = 0;
+    if (floats > cap) {
+        if (buf) cudaFree(buf);
+        cudaMalloc(&buf, floats * sizeof(float));
+        cap = floats;
+    }
+    return buf;
+}
+
+// 2c. launch：对每张图，im2col 一次，GEMM 一次。
+//   你的 GEMM 是 C[M×N] = A[M×K] · B[K×N]，这里的 M、N、K 和卷积的 N、K 不是一个意思，别搞混：
+//     GEMM 的 M = ?（Wt 有几行）  GEMM 的 N = ?（B 有几列）  GEMM 的 K = ?（Wt 的列数 = B 的行数）
+//     A = ?   B = ?   C = ?（第 n 张图的输出从哪里开始）
+//   GEMM 部分换成哪一版由参数 gemm 决定：launch_tiled（16×16 小块）或 launch_reg（128×128 大块）。
+//   答案：M = K（Wt 有 K 行），N = PQ（B 有 PQ 列），K = CRS；A = Wt，B = B，C = Y + n*K*PQ。
+using GemmLaunch = bool (*)(const float*, const float*, float*, int, int, int, cudaStream_t);
+inline bool im2col_then_gemm(const float* X, const float* Wt, float* Y, const ConvShape& sh, cudaStream_t s,
+                             GemmLaunch gemm) {
+    int P = sh.P(), Q = sh.Q();  int CRS = sh.C*sh.R*sh.S;  int PQ = P*Q;
+    float* B = im2col_workspace(size_t(CRS) * PQ);
+    for (int n = 0; n < sh.N; ++n) {
+        im2col_kernel<<<(CRS*PQ + 255) / 256, 256, 0, s>>>(X + size_t(n)*sh.C*sh.H*sh.W, B, sh);
+        gemm(Wt, B, Y + size_t(n)*sh.K*PQ, sh.K, PQ, CRS, s);
+    }
+    return true;
+}
+inline bool launch_im2col(const float* X, const float* Wt, float* Y, const ConvShape& sh, cudaStream_t s) {
+    return im2col_then_gemm(X, Wt, Y, sh, s, launch_tiled);
+}
+inline bool launch_im2col_reg(const float* X, const float* Wt, float* Y, const ConvShape& sh, cudaStream_t s) {
+    return im2col_then_gemm(X, Wt, Y, sh, s, launch_reg);
+}
+
+// ───────────── 第 3 版：implicit GEMM（之后再写）─────────────
 // 把卷积看成矩阵乘 Y[K × NPQ] = Wt[K × CRS] · B[CRS × NPQ]，
 // B 不真的存下来，搬 tile 进 shared memory 的时候现算地址。
 inline bool launch_igemm(const float* X, const float* Wt, float* Y, const ConvShape& sh, cudaStream_t s) {

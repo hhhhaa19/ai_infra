@@ -99,6 +99,8 @@ using LaunchFn = bool (*)(const float*, const float*, float*, const ConvShape&, 
 struct Impl { const char* name; LaunchFn fn; };
 static const Impl kImpls[] = {
     {"direct", launch_direct},
+    {"im2col", launch_im2col},          // im2col + gemm_tiled
+    {"im2c_rg", launch_im2col_reg},     // im2col + gemm_reg
     {"igemm", launch_igemm},
 #ifdef USE_CUDNN
     {"cudnn", launch_cudnn},
