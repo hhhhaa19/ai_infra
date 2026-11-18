@@ -148,9 +148,66 @@ inline bool launch_im2col_reg(const float* X, const float* Wt, float* Y, const C
     return im2col_then_gemm(X, Wt, Y, sh, s, launch_reg);
 }
 
-// ───────────── 第 3 版：implicit GEMM（之后再写）─────────────
-// 把卷积看成矩阵乘 Y[K × NPQ] = Wt[K × CRS] · B[CRS × NPQ]，
-// B 不真的存下来，搬 tile 进 shared memory 的时候现算地址。
+// ───────────── 第 3 版：implicit GEMM ─────────────
+// 要解决的问题：第 2 版先用 im2col_kernel 把 B 写进显存（resnet3x3 是 7.2 MB，X 的 9 倍），
+//   GEMM 再把它读回来。B 只是中间产物，这一写一读是白花的。
+// 改法：拿 gemm_tiled 抄一份，只改"把 B 搬进 shared memory"那一行：
+//   以前 Bs[i][j] = B[brow][col]，现在 Bs[i][j] = X[c][h][w]，c、h、w 用 brow、col 现算
+//   （公式和 im2col_kernel 里一模一样）。im2col_kernel 不用了，显存里不再有 B。
+// 还是一张图一张图来：Xn = 第 n 张图的 X，Yn = 第 n 张图的 Y。
+// GEMM 的三个尺寸（换个名字，免得和卷积的 K、N 搞混）：
+//   GM = sh.K（Wt 的行数）   GN = P*Q（B 的列数）   GK = C*R*S（Wt 的列数 = B 的行数）
+template <int TILE>
+__global__ void conv_igemm_tiled(const float* __restrict__ Xn, const float* __restrict__ Wt,
+                                 float* __restrict__ Yn, ConvShape sh) {
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+    const int C = sh.C, H = sh.H, W = sh.W, R = sh.R, S = sh.S;
+    const int P = sh.P(), Q = sh.Q();
+    const int GM = sh.K, GN = P * Q, GK = C * R * S;
+    int i = threadIdx.y, j = threadIdx.x;
+    int row = blockIdx.y * TILE + i;      // C 的第几行 = 第几个卷积核 k
+    int col = blockIdx.x * TILE + j;      // C 的第几列 = 第几个输出位置 p*Q + q
+    float sum = 0.0f;
+    for (int t = 0; t < (GK + TILE - 1) / TILE; ++t) {
+        // 搬 A（Wt）：和 gemm_tiled 一样，Wt 本来就是 [GM × GK] 行主序
+        As[i][j] = (row < GM && t * TILE + j < GK) ? Wt[size_t(row) * GK + t * TILE + j] : 0.0f;
+
+        // 搬 B：这一行是第 3 版唯一要动脑子的地方。
+        //   这个线程负责 B 的第 brow 行、第 col 列：brow = t * TILE + i
+        //   1. brow ≥ GK 或 col ≥ GN → 0（矩阵本身越界）
+        //   2. 拆 brow → c, r, s；拆 col → p, q（和 im2col_kernel 一样）
+        //   3. h = p*stride - pad + r;  w = q*stride - pad + s
+        //   4. h、w 越界 → 0（补的 0）；否则 Xn[(c*H + h)*W + w]
+        //   记法：row 只和卷积核 k 有关，col 只和输出位置 pq 有关，brow 是 crs（每轮走 TILE 的那一维）。
+        int brow = t * TILE + i;
+        int p = col / Q;
+        int q = col % Q;
+        int c = brow / (R * S);
+        int r = (brow / S) % R;
+        int s = brow % S;
+        int h = p * sh.stride - sh.pad + r;
+        int w = q * sh.stride - sh.pad + s;
+        // brow、col 越界时上面的 c、h、w 没意义，但条件为假就不会去读
+        Bs[i][j] = (brow < GK && col < GN && h >= 0 && h < H && w >= 0 && w < W)
+                   ? Xn[(c * H + h) * W + w] : 0.0f;
+        __syncthreads();
+        // 乘加：和 gemm_tiled 一样，一个字不用改
+        for (int kk = 0; kk < TILE; ++kk) sum += As[i][kk] * Bs[kk][j];
+        __syncthreads();
+    }
+    // 写回：Yn 本来就是 [GM × GN] 行主序，和 gemm_tiled 一样
+    if (row < GM && col < GN) Yn[size_t(row) * GN + col] = sum;
+}
+
 inline bool launch_igemm(const float* X, const float* Wt, float* Y, const ConvShape& sh, cudaStream_t s) {
-    return false;
+    // 和 launch_tiled 一样定 block、grid，再对每张图启动一次
+    constexpr int TILE = 16;
+    const int GM = sh.K, GN = sh.P() * sh.Q();
+    dim3 block(TILE, TILE);
+    dim3 grid((GN + TILE - 1) / TILE, (GM + TILE - 1) / TILE);   // x 方向盖住 GN 列，y 方向盖住 GM 行
+    for (int n = 0; n < sh.N; ++n)
+        conv_igemm_tiled<TILE><<<grid, block, 0, s>>>(X + size_t(n) * sh.C * sh.H * sh.W, Wt,
+                                                      Y + size_t(n) * sh.K * GN, sh);
+    return true;
 }
