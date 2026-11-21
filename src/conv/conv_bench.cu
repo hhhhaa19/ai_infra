@@ -101,7 +101,8 @@ static const Impl kImpls[] = {
     {"direct", launch_direct},
     {"im2col", launch_im2col},          // im2col + gemm_tiled
     {"im2c_rg", launch_im2col_reg},     // im2col + gemm_reg
-    {"igemm", launch_igemm},
+    {"igemm", launch_igemm},            // implicit GEMM + gemm_tiled
+    {"igem_rg", launch_igemm_reg},      // implicit GEMM + gemm_reg
 #ifdef USE_CUDNN
     {"cudnn", launch_cudnn},
 #endif

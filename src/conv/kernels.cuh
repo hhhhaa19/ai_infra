@@ -211,3 +211,158 @@ inline bool launch_igemm(const float* X, const float* Wt, float* Y, const ConvSh
                                                       Y + size_t(n) * sh.K * GN, sh);
     return true;
 }
+
+// ───────────── 第 3b 版：implicit GEMM + 寄存器分块（底子换成你的 gemm_reg）─────────────
+// 为什么：第 3 版的底子是 16×16 tiled，GEMM 本身就慢（显式 im2col 时 tiled 0.596 ms，reg 0.422 ms）。
+// 改法和第 3 版一样："只改搬 B"。gemm_reg 里搬 B 的地方有两处：
+//   ① 准备阶段：第 0 块直接写进 Bs[0]
+//   ② 循环里：下一块先读进寄存器 rb[]（双缓冲）
+// 两处都从 B[bk * N + bc] 改成现算地址读 X。为了不写两遍，把"B 的 (brow, bcol) 是多少"写成一个小函数。
+// 其余（搬 A = Wt、外积累加、双缓冲、写回 Yn）和 gemm_reg 一字不差，只是改了名字：
+//   A → Wt，C → Yn，M → GM = K，N → GN = P*Q，K → GK = C*R*S。
+
+// 2-1. 虚拟矩阵 B 第 brow 行、第 bcol 列的值。越界（矩阵越界 或 pad）都返回 0。
+//   就是你第 3 版里那几行：拆 brow → c,r,s；拆 bcol → p,q；算 h,w；判断越界；读 Xn。
+__device__ __forceinline__ float igemm_b(const float* __restrict__ Xn, const ConvShape& sh, int brow, int bcol) {
+    const int H = sh.H, W = sh.W, R = sh.R, S = sh.S;
+    const int Q = sh.Q();
+    const int GK = sh.C * R * S, GN = sh.P() * Q;
+    if (brow >= GK || bcol >= GN) return 0.0f;   // 矩阵越界：tile 盖出去的行、列
+    int c = brow / (R*S);
+    int r = (brow/S)%R;
+    int s = brow%S;
+    int p = bcol/Q;
+    int q = bcol%Q;
+    int h = p*sh.stride - sh.pad + r;
+    int w = q*sh.stride - sh.pad + s;
+    return (h < 0 || h >= H || w < 0 || w >= W) ? 0.0f : Xn[(c*H + h)*W + w];
+}
+
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void conv_igemm_reg(const float* __restrict__ Xn, const float* __restrict__ Wt,
+                               float* __restrict__ Yn, ConvShape sh) {
+    const int GM = sh.K, GN = sh.P() * sh.Q(), GK = sh.C * sh.R * sh.S;
+    constexpr int NT = (BM / TM) * (BN / TN);
+    constexpr int LA = BM * BK / NT;
+    constexpr int LB = BK * BN / NT;
+    int bj = blockIdx.x;
+    int bi = blockIdx.y;
+    int i = threadIdx.y;
+    int j = threadIdx.x;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int row = BM * bi;
+    int col = bj * BN;
+    float c[TM][TN] = {0};
+    float a[TM];
+    float b[TN];
+    float ra[LA];
+    float rb[LB];
+    __shared__ float As[2][BK][BM + 4];
+    __shared__ float Bs[2][BK][BN];
+    int cur = 0;
+
+    // 准备阶段：第 0 块直接放进 buf 0
+    #pragma unroll
+    for (int r = 0; r < LA; ++r) {
+        int idx = tid + r * NT;
+        int local_i = idx / BK;
+        int local_j = idx % BK;
+        int ar = row + local_i;
+        int ak = local_j;
+        As[cur][local_j][local_i] = (ar < GM && ak < GK) ? Wt[ar * GK + ak] : 0.0f;
+    }
+    #pragma unroll
+    for (int r = 0; r < LB; ++r) {
+        int idx = tid + r * NT;
+        int local_i = idx / BN;
+        int local_j = idx % BN;
+        int bk = local_i;
+        int bc = col + local_j;
+        // gemm_reg 原来是：Bs[cur][local_i][local_j] = (bk < K && bc < N) ? B[bk * N + bc] : 0.0f;
+        Bs[cur][local_i][local_j] = igemm_b(Xn, sh, bk, bc);   // ① 现算地址读 X
+    }
+    __syncthreads();
+
+    for (int t = 0; t < GK; t += BK) {
+        bool has_next = t + BK < GK;
+        // ① 发出下一块的读请求，只进寄存器，不等结果
+        if (has_next) {
+            #pragma unroll
+            for (int r = 0; r < LA; ++r) {
+                int idx = tid + r * NT;
+                int local_i = idx / BK;
+                int local_j = idx % BK;
+                int ar = row + local_i;
+                int ak = t + BK + local_j;
+                ra[r] = (ar < GM && ak < GK) ? Wt[ar * GK + ak] : 0.0f;
+            }
+            #pragma unroll
+            for (int r = 0; r < LB; ++r) {
+                int idx = tid + r * NT;
+                int local_i = idx / BN;
+                int local_j = idx % BN;
+                int bk = t + BK + local_i;
+                int bc = col + local_j;
+                // gemm_reg 原来是：rb[r] = (bk < K && bc < N) ? B[bk * N + bc] : 0.0f;
+                rb[r] = igemm_b(Xn, sh, bk, bc);   // ② 现算地址读 X
+            }
+        }
+        // ② 用当前 buffer 计算，盖住 ① 的延迟
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            #pragma unroll
+            for (int q = 0; q < TM / 4; ++q) {
+                float4 v = *reinterpret_cast<const float4*>(&As[cur][kk][q * (BM / TM) * 4 + i * 4]);
+                a[q * 4 + 0] = v.x;  a[q * 4 + 1] = v.y;  a[q * 4 + 2] = v.z;  a[q * 4 + 3] = v.w;
+            }
+            #pragma unroll
+            for (int tj = 0; tj < TN / 4; ++tj) {
+                float4 v = *reinterpret_cast<const float4*>(&Bs[cur][kk][tj * (BN / TN) * 4 + j * 4]);
+                b[tj * 4 + 0] = v.x;  b[tj * 4 + 1] = v.y;  b[tj * 4 + 2] = v.z;  b[tj * 4 + 3] = v.w;
+            }
+            #pragma unroll
+            for (int ti = 0; ti < TM; ++ti) {
+                #pragma unroll
+                for (int tj = 0; tj < TN; ++tj) {
+                    c[ti][tj] += a[ti] * b[tj];
+                }
+            }
+        }
+        // ③ 换到另一份 buffer，把寄存器里的下一块写进去
+        cur ^= 1;
+        if (has_next) {
+            #pragma unroll
+            for (int r = 0; r < LA; ++r) {
+                int idx = tid + r * NT;
+                As[cur][idx % BK][idx / BK] = ra[r];
+            }
+            #pragma unroll
+            for (int r = 0; r < LB; ++r) {
+                int idx = tid + r * NT;
+                Bs[cur][idx / BN][idx % BN] = rb[r];
+            }
+        }
+        // ④ 每轮只同步一次
+        __syncthreads();
+    }
+    for (int ti = 0; ti < TM; ++ti) {
+        for (int tj = 0; tj < TN; ++tj) {
+            int r = row + (ti / 4) * (BM / TM) * 4 + i * 4 + ti % 4;
+            int c_col = col + (tj / 4) * (BN / TN) * 4 + j * 4 + tj % 4;
+            if (r < GM && c_col < GN) {
+                Yn[r * GN + c_col] = c[ti][tj];
+            }
+        }
+    }
+}
+
+inline bool launch_igemm_reg(const float* X, const float* Wt, float* Y, const ConvShape& sh, cudaStream_t s) {
+    constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+    const int GM = sh.K, GN = sh.P() * sh.Q();
+    dim3 block(BN / TN, BM / TM);
+    dim3 grid((GN + BN - 1) / BN, (GM + BM - 1) / BM);
+    for (int n = 0; n < sh.N; ++n)
+        conv_igemm_reg<BM, BN, BK, TM, TN><<<grid, block, 0, s>>>(X + size_t(n) * sh.C * sh.H * sh.W, Wt,
+                                                                 Y + size_t(n) * sh.K * GN, sh);
+    return true;
+}
