@@ -13,6 +13,7 @@
 //   Y[n,k,p,q]  = Y[((n*K + k)*P + p)*Q + q]
 #pragma once
 #include <cuda_runtime.h>
+#include <vector>
 #include "../gemm/kernels.cuh"   // 第 2 版直接调用你写的 GEMM：launch_tiled、launch_reg
 
 struct ConvShape {
@@ -363,6 +364,181 @@ inline bool launch_igemm_reg(const float* X, const float* Wt, float* Y, const Co
     dim3 grid((GN + BN - 1) / BN, (GM + BM - 1) / BM);
     for (int n = 0; n < sh.N; ++n)
         conv_igemm_reg<BM, BN, BK, TM, TN><<<grid, block, 0, s>>>(X + size_t(n) * sh.C * sh.H * sh.W, Wt,
+                                                                 Y + size_t(n) * sh.K * GN, sh);
+    return true;
+}
+
+// ───────────── 第 3c 版：implicit GEMM + gemm_reg + 增量算下标 ─────────────
+// ncu（resnet3x3）：第 3b 版的整数指令是 gemm_reg 的 6.1 倍（0.26 亿 → 1.61 亿，占 32%），
+//   多出来的就是 igemm_b 里每个元素每轮都做的 5 次除法/取余。
+// 关键：X 的地址可以拆成两半相加：
+//   (c*H + h)*W + w，h = h0 + r，w = w0 + s，h0 = p*stride - pad，w0 = q*stride - pad
+//   = [h0*W + w0]                 —— base：只和列 bcol（p,q）有关
+//   + [c*H*W + r*W + s]           —— delta：只和行 brow（c,r,s）有关
+// ① 列那一半：每个线程搬的那几列 bc = col + local_j 在整个循环里不变，
+//    所以 p、q、h0、w0 在循环外算一次，存在寄存器里。
+// ② 行那一半：brow → (delta, r, s) 对所有 block、所有线程都一样，host 上预先算成一张表，放进 __constant__。
+//    同一个 warp 的 32 个线程 local_i 相同 → 查同一个 brow → constant memory 广播，几乎不花时间。
+// 循环里读一个 B 元素 = 查表 1 次 + 加法 2 次 + 比较 + 读 X，没有除法。
+
+constexpr int kMaxGK = 4096;                 // 表最多 4096 项（8 字节一项，共 32 KB；constant 内存上限 64 KB）
+__constant__ int2 c_btab[kMaxGK];            // c_btab[brow] = { delta, (r << 16) | s }
+
+// host：按形状建表，只在形状变化时重新拷贝（bench 先跑一次查对错，所以拷贝不在计时里）
+inline bool igemm_upload_table(const ConvShape& sh) {
+    static ConvShape last{};
+    static bool has = false;
+    const int GK = sh.C * sh.R * sh.S;
+    if (GK > kMaxGK) return false;
+    if (has && last.C == sh.C && last.H == sh.H && last.W == sh.W && last.R == sh.R && last.S == sh.S) return true;
+    std::vector<int2> tab(GK);
+    for (int c = 0; c < sh.C; ++c)
+        for (int r = 0; r < sh.R; ++r)
+            for (int s = 0; s < sh.S; ++s) {
+                int brow = (c * sh.R + r) * sh.S + s;
+                tab[brow] = make_int2(c * sh.H * sh.W + r * sh.W + s, (r << 16) | s);
+            }
+    cudaMemcpyToSymbol(c_btab, tab.data(), GK * sizeof(int2));
+    last = sh;  has = true;
+    return true;
+}
+
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void conv_igemm_inc(const float* __restrict__ Xn, const float* __restrict__ Wt,
+                               float* __restrict__ Yn, ConvShape sh) {
+    const int H = sh.H, W = sh.W, Q = sh.Q();
+    const int GM = sh.K, GN = sh.P() * Q, GK = sh.C * sh.R * sh.S;
+    constexpr int NT = (BM / TM) * (BN / TN);
+    constexpr int LA = BM * BK / NT;
+    constexpr int LB = BK * BN / NT;
+    int bj = blockIdx.x;
+    int bi = blockIdx.y;
+    int i = threadIdx.y;
+    int j = threadIdx.x;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int row = BM * bi;
+    int col = bj * BN;
+    float c[TM][TN] = {0};
+    float a[TM];
+    float b[TN];
+    float ra[LA];
+    float rb[LB];
+    __shared__ float As[2][BK][BM + 4];
+    __shared__ float Bs[2][BK][BN];
+    int cur = 0;
+
+    // ① 列那一半：这个线程搬的 LB 个 B 元素，各自的列在整个循环里不变 → 循环外算一次
+    int h0[LB], w0[LB];
+    #pragma unroll
+    for (int r = 0; r < LB; ++r) {
+        int bc = col + (tid + r * NT) % BN;
+        if (bc < GN) {
+            h0[r] = (bc / Q) * sh.stride - sh.pad;
+            w0[r] = (bc % Q) * sh.stride - sh.pad;
+        } else {
+            h0[r] = -(1 << 20);              // 列越界：让下面的 h 判断永远失败 → 补 0
+            w0[r] = 0;
+        }
+    }
+    // ② 行那一半：查表。brow 越界或 h、w 越界都返回 0
+    auto load_b = [&](int r, int brow) -> float {
+        if (brow >= GK) return 0.0f;
+        int2 e = c_btab[brow];
+        int h = h0[r] + (e.y >> 16);
+        int w = w0[r] + (e.y & 0xffff);
+        return ((unsigned)h < (unsigned)H && (unsigned)w < (unsigned)W)   // 负数转 unsigned 变很大，一次比较同时查两边
+               ? Xn[h0[r] * W + w0[r] + e.x] : 0.0f;
+    };
+
+    // 准备阶段：第 0 块直接放进 buf 0
+    #pragma unroll
+    for (int r = 0; r < LA; ++r) {
+        int idx = tid + r * NT;
+        int local_i = idx / BK;
+        int local_j = idx % BK;
+        int ar = row + local_i;
+        int ak = local_j;
+        As[cur][local_j][local_i] = (ar < GM && ak < GK) ? Wt[ar * GK + ak] : 0.0f;
+    }
+    #pragma unroll
+    for (int r = 0; r < LB; ++r) {
+        int idx = tid + r * NT;
+        Bs[cur][idx / BN][idx % BN] = load_b(r, idx / BN);
+    }
+    __syncthreads();
+
+    for (int t = 0; t < GK; t += BK) {
+        bool has_next = t + BK < GK;
+        if (has_next) {
+            #pragma unroll
+            for (int r = 0; r < LA; ++r) {
+                int idx = tid + r * NT;
+                int local_i = idx / BK;
+                int local_j = idx % BK;
+                int ar = row + local_i;
+                int ak = t + BK + local_j;
+                ra[r] = (ar < GM && ak < GK) ? Wt[ar * GK + ak] : 0.0f;
+            }
+            #pragma unroll
+            for (int r = 0; r < LB; ++r) {
+                int idx = tid + r * NT;
+                rb[r] = load_b(r, t + BK + idx / BN);   // 只有行号在变：每轮 +BK
+            }
+        }
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            #pragma unroll
+            for (int q = 0; q < TM / 4; ++q) {
+                float4 v = *reinterpret_cast<const float4*>(&As[cur][kk][q * (BM / TM) * 4 + i * 4]);
+                a[q * 4 + 0] = v.x;  a[q * 4 + 1] = v.y;  a[q * 4 + 2] = v.z;  a[q * 4 + 3] = v.w;
+            }
+            #pragma unroll
+            for (int tj = 0; tj < TN / 4; ++tj) {
+                float4 v = *reinterpret_cast<const float4*>(&Bs[cur][kk][tj * (BN / TN) * 4 + j * 4]);
+                b[tj * 4 + 0] = v.x;  b[tj * 4 + 1] = v.y;  b[tj * 4 + 2] = v.z;  b[tj * 4 + 3] = v.w;
+            }
+            #pragma unroll
+            for (int ti = 0; ti < TM; ++ti) {
+                #pragma unroll
+                for (int tj = 0; tj < TN; ++tj) {
+                    c[ti][tj] += a[ti] * b[tj];
+                }
+            }
+        }
+        cur ^= 1;
+        if (has_next) {
+            #pragma unroll
+            for (int r = 0; r < LA; ++r) {
+                int idx = tid + r * NT;
+                As[cur][idx % BK][idx / BK] = ra[r];
+            }
+            #pragma unroll
+            for (int r = 0; r < LB; ++r) {
+                int idx = tid + r * NT;
+                Bs[cur][idx / BN][idx % BN] = rb[r];
+            }
+        }
+        __syncthreads();
+    }
+    for (int ti = 0; ti < TM; ++ti) {
+        for (int tj = 0; tj < TN; ++tj) {
+            int r = row + (ti / 4) * (BM / TM) * 4 + i * 4 + ti % 4;
+            int c_col = col + (tj / 4) * (BN / TN) * 4 + j * 4 + tj % 4;
+            if (r < GM && c_col < GN) {
+                Yn[r * GN + c_col] = c[ti][tj];
+            }
+        }
+    }
+}
+
+inline bool launch_igemm_inc(const float* X, const float* Wt, float* Y, const ConvShape& sh, cudaStream_t s) {
+    constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+    if (!igemm_upload_table(sh)) return false;
+    const int GM = sh.K, GN = sh.P() * sh.Q();
+    dim3 block(BN / TN, BM / TM);
+    dim3 grid((GN + BN - 1) / BN, (GM + BM - 1) / BM);
+    for (int n = 0; n < sh.N; ++n)
+        conv_igemm_inc<BM, BN, BK, TM, TN><<<grid, block, 0, s>>>(X + size_t(n) * sh.C * sh.H * sh.W, Wt,
                                                                  Y + size_t(n) * sh.K * GN, sh);
     return true;
 }

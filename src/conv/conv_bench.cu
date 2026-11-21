@@ -103,6 +103,7 @@ static const Impl kImpls[] = {
     {"im2c_rg", launch_im2col_reg},     // im2col + gemm_reg
     {"igemm", launch_igemm},            // implicit GEMM + gemm_tiled
     {"igem_rg", launch_igemm_reg},      // implicit GEMM + gemm_reg
+    {"igem_in", launch_igemm_inc},      // implicit GEMM + gemm_reg + 增量算下标（查表）
 #ifdef USE_CUDNN
     {"cudnn", launch_cudnn},
 #endif
