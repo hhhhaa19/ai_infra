@@ -2,14 +2,13 @@
       <div class="eyebrow">模块 1</div>
       <h2>全流程总览：从模型到 C++ 推理</h2>
       <p class="why"><strong>这一模块讲什么</strong>：把一个训练好的 PyTorch 模型放到 C++ 程序里，在 GPU 上跑起来，并证明结果正确。整件事可以看成三条线：先把程序编译出来，再把模型变成 engine，最后加载 engine 执行。下面用 ResNet-50 走一遍。</p>
-
-      <div class="blk"><h3>第一条线：把 C++ 程序编译出来</h3>
+      <div class="blk ch" id="m1-ch1"><h3><span class="chn">1</span>三条线</h3>
+        <section class="sub"><h4 class="subt">编译 C++ 程序</h4>
         <p>我们要写的 <code>build_engine</code> 和 <code>infer</code> 是普通的 C++ 程序，它们会用到 TensorRT 和 CUDA 的头文件和库。所以第一步是让编译器能找到这些东西。<code>module load</code> 和环境脚本负责选好工具和路径；<code>CMakeLists.txt</code> 写清楚要编译哪些程序、用哪些源文件、链接哪些库。</p>
         <p>接着 <code>cmake -S . -B build</code> 读取这份配置，生成构建规则；<code>cmake --build build</code> 再按规则调用 <code>nvcc</code>、<code>g++</code> 和链接器，得到可执行程序。这条线只产出程序，还没有碰到模型。</p>
 <pre><code>module / 环境脚本 → CMakeLists.txt + 命令行配置 → CMake 生成规则 → 编译链接 → C++ 可执行程序</code></pre>
-      </div>
-
-      <div class="blk"><h3>第二条线：把模型变成 engine</h3>
+        </section>
+        <section class="sub"><h4 class="subt">模型变成 engine</h4>
         <p>PyTorch 模型是 Python 对象，C++ 程序没法直接用，所以先导出成 ONNX。ONNX 是一个不绑定硬件的模型文件，里面有计算图和权重。导出的同时，我们用 PyTorch 跑一张真实图片，把输入存成 <code>input.bin</code>，把结果存成 <code>output_ref.bin</code>，之后用来检查 C++ 的结果对不对。</p>
         <p>然后 <code>build_engine</code> 把 ONNX 编译成 engine。Builder 先创建一个空的 Network 和一份 Config；Parser 解析 ONNX，把图、权重和输入输出描述填进 Network；<code>buildSerializedNetwork</code> 根据 Network 和 Config 做优化，得到一段放在 CPU 内存里的字节（<code>IHostMemory</code>），写进 <code>.engine</code> 文件。</p>
         <p>这里容易把两种"构建"混起来：CMake / GCC 构建的是<strong>程序</strong>，TensorRT Builder 构建的是<strong>模型的执行方案</strong>。</p>
@@ -19,9 +18,8 @@ Builder 创建 Network 和 Config
 ONNX → Parser 解析 → 填充 Network（图、权重、I/O 描述）
 Network + Config → buildSerializedNetwork → IHostMemory（CPU 里的序列化字节）→ .engine
 初始 engine 130,783,044 B；A100-PCIE-40GB 重建版 129,788,252 B。文件大小不是运行显存。</code></pre>
-      </div>
-
-      <div class="blk"><h3>第三条线：加载 engine 并执行</h3>
+        </section>
+        <section class="sub"><h4 class="subt">加载 engine 并执行</h4>
         <p><code>infer</code> 程序先把 <code>.engine</code> 读进 CPU 内存，交给 Runtime 反序列化，得到 <code>ICudaEngine</code>。Engine 是建好的执行方案，真正运行还需要一份执行状态和内部工作内存，所以再创建 Context。</p>
         <p>接着准备数据。程序用 <code>cudaMalloc</code> 申请输入输出的显存，用 <code>setTensorAddress</code> 告诉 Context 去这些地址读写。这一步只是登记地址，没有搬数据。真正运行时，三件事排进同一个 stream：把输入拷到 GPU（H2D）、执行推理、把输出拷回 CPU（D2H）。最后 CPU 调用 <code>cudaStreamSynchronize</code> 等待完成，再读取结果。</p>
         <p>"异步"只表示 CPU 提交后不用立刻等，同一个 stream 里的三步还是按顺序执行，并不是同时运行。</p>
@@ -32,15 +30,19 @@ H2D → enqueueV3(stream) → D2H → cudaStreamSynchronize → CPU 读 hostOutp
 
 输入 FP32 [1,3,224,224] 602112 B；输出 FP32 [1,1000] 4000 B
 1000 项容差 PASS，Top-1 均为 258。</code></pre>
+        </section>
       </div>
 
-      <div class="blk"><h3>最后：确认结果，再和算子优化连起来</h3>
+      <div class="blk ch" id="m1-ch2"><h3><span class="chn">2</span>验证与衔接</h3>
+        <section class="sub"><h4 class="subt">确认结果、衔接算子优化</h4>
         <p>C++ 输出保存下来后，和 <code>output_ref.bin</code> 逐项比较。1000 个 logits 都在容差内，Top-1 都是 258，说明这张图上 C++ 推理是对的。这只证明单个样本正确，不等于整个数据集都验收通过；基线和对照测量放在模块 6。</p>
         <p>那手写算子放在哪？TensorRT 负责组织和优化整个模型，一次 enqueue 背后会提交很多 kernel，自写 kernel 只完成其中一项计算。接入方式可以是 TensorRT plugin，也可以是 PyTorch 自定义算子。框架把 GPU 上的输入输出地址、shape 和 stream 交给我们的代码，kernel 在这个 stream 上运行，结果留在 GPU 给下一个节点用，不用每层都拷回 CPU。</p>
         <p>ResNet-50 本身没有 RMSNorm，它只是用来学部署流程。RMSNorm 的收益要放在包含它的模型里看：已在 LLaMA 风格 decoder layer 里测量，见模块 7；TensorRT plugin 的接入见模块 9。</p>
+        </section>
       </div>
 
-      <div class="blk iv" id="m1-iv"><h3>面试要求</h3>
+      <div class="blk ch" id="m1-ch3"><h3><span class="chn">3</span>复习</h3>
+        <section class="sub iv" id="m1-iv"><h4 class="subt">面试要求</h4>
         <h4>必须会</h4>
         <ul class="plain">
           <li>讲清三条线：编译 C++ 程序（CMake → nvcc / g++ → 链接 TensorRT 库）、把模型变成 engine（PyTorch → ONNX → TensorRT builder）、加载 engine 执行（runtime → deserialize → context → 绑定地址 → enqueue）。</li>
@@ -57,7 +59,9 @@ H2D → enqueueV3(stream) → D2H → cudaStreamSynchronize → CPU 读 hostOutp
           <li>动态形状（optimization profile）、多 engine / 多 stream 部署。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>不看代码解释 ONNX、engine、build_engine、infer 的区别。单样本通过为什么不等于全数据集验收？</li>

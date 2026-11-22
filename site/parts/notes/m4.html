@@ -2,8 +2,8 @@
       <div class="eyebrow">模块 4</div>
       <h2>模型导出与正确性：张量、ONNX、误差</h2>
       <p class="why"><strong>这一模块讲什么</strong>：模型换一个后端运行时，怎么保证算的还是同一件事。流程是：固定权重和输入 → 正确设置 PyTorch 模式 → 导出 ONNX → 用同一份输入比较输出。正确性通过以后，性能结论才有意义；但两者是两件事。</p>
-
-      <div class="blk"><h3>第一步：搞清楚文件里存了什么</h3>
+      <div class="blk ch" id="m4-ch1"><h3><span class="chn">1</span>导出流程</h3>
+        <section class="sub"><h4 class="subt">文件里存了什么</h4>
         <p>比较之前，先分清几种文件。<code>state_dict</code> 保存参数和缓冲区的名字、形状和数值，不保存 <code>forward</code> 的执行关系，所以权重 <code>.pt</code> 不能单独代表模型。ONNX 同时保存计算图和权重。engine 则是针对目标环境优化后的执行方案。</p>
         <p><code>input.bin</code> 是裸字节，文件里没有写 dtype 和布局，这些要靠双方约定。我们的约定是：输入 NCHW、<code>[1,3,224,224]</code>、FP32，共 602112 字节；输出 <code>[1,1000]</code>、FP32，共 4000 字节。</p>
         <p>张量在内存里是连续的，所以多维下标可以算成偏移：</p>
@@ -12,9 +12,8 @@
 例：[0,1,10,20]
 元素偏移 = ((0*3+1)*224+10)*224+20 = 52436
 字节偏移 = 52436 * 4 = 209744</code></pre>
-      </div>
-
-      <div class="blk"><h3>第二步：设置模型的运行方式</h3>
+        </section>
+        <section class="sub"><h4 class="subt">模型的运行方式</h4>
         <p>运行前要让模型和输入都在同一设备上：<code>.to(device)</code> 搬的是参数和缓冲区，输入要另外搬。调用 <code>model(x)</code> 才是真正的前向计算。</p>
         <p>接着设置两个开关。<code>model.eval()</code> 把模块的 <code>training</code> 标记改为 False，Dropout 和 BatchNorm 这类层会据此改变计算：Dropout 不再随机置 0，BatchNorm 用训练时存下的统计量。所以它会影响输出。卷积、线性层不检查这个标记。</p>
         <p><code>no_grad()</code> 和 <code>inference_mode()</code> 不改变输出，只让 PyTorch 不为反向传播做记录。<code>inference_mode()</code> 比 <code>no_grad()</code> 省得更多，还省去版本计数和 view 记录，但它产生的张量不能再进入要求导的计算。它们控制的都是求导记录，不控制 CUDA 同步。</p>
@@ -25,9 +24,8 @@ with torch.inference_mode():  # 不为反向传播做记录
 no_grad 的结果可以当常量继续参与训练；
 inference_mode 的结果进入要求导的计算会报错。</code></pre>
         <p>导出 ONNX 不需要 autograd 图，因为 ONNX 只记录前向计算，权重作为常量保存。但 <code>eval()</code> 必须先调用，否则训练模式的计算可能被记录进去。</p>
-      </div>
-
-      <div class="blk"><h3>第三步：导出 ONNX</h3>
+        </section>
+        <section class="sub"><h4 class="subt">导出 ONNX</h4>
         <p>仓库里有两种导出。<code>src/tensorrt_intro/export_resnet.py</code> 用 <code>dynamo=True</code>：通过 <code>torch.export</code> 得到 aten 层的 FX 图，再按转换表翻译成 ONNX。<code>src/llama/export_onnx.py</code> 在 Orin 的 torch 2.1 上用老导出器：TorchScript tracing 真的跑一遍模型，得到含 <code>aten::</code> 节点的 TorchScript 图，再用 symbolic 函数翻译成 ONNX。所以两边都经过 aten 算子，区别在于抓图和翻译的方式。</p>
 <pre><code>Quest：Python 模型 → torch.export → aten FX 图 → 翻译 → ONNX（opset 18）
 Orin： Python 模型 → tracing 真跑 → TorchScript 图 → symbolic → ONNX（opset 17）
@@ -38,25 +36,27 @@ opset_version 是算子规范版本，不是数值精度
 checker / Netron 只查结构，不证明数值正确</code></pre>
         <p>这里容易把两件事混起来：两条路的中间图看起来都有 aten，但 Quest 那条是 FX 图，Orin 那条是 TorchScript 图。另外，名字叫 <code>dynamo=True</code>，新版 <code>torch.export</code> 不一定走 Dynamo 的字节码抓图，取决于 torch 版本和导出策略，这点没在 Quest 上确认。</p>
         <p>如果 RmsNorm 改走 Quest 这条路，<code>register_custom_op_symbolic</code> 就不能用了，要改用转换表（<code>custom_translation_table</code>），Meta 实现可以用来推形状。这条路还没实际跑过。</p>
-      </div>
-
-      <div class="blk"><h3>第四步：验证数值</h3>
+        </section>
+        <section class="sub"><h4 class="subt">数值验证</h4>
         <p>比较时要用同一份 <code>input.bin</code>，把 <code>output_ref.bin</code> 和 <code>output_trt.bin</code> 放在一起看。先查基础项：字节数、shape、dtype、有没有 NaN / Inf。基础项没问题，再逐项比较所有 logits。比的是 logits，不能和 softmax 概率混在一起比。</p>
 <pre><code>abs(actual - reference) &lt;= 1e-5 + 1e-4 * abs(reference)
 当前：1000 个输出 PASS，Top-1 258 / 258</code></pre>
         <p>为什么不能只看 Top-1？Top-1 只比较最大值的位置。比如 logits 整体放大 10 倍，Top-1 不变，但概率已经错了。所以 Top-1 一致只能算最基本的检查。</p>
         <p>反过来，如果已经知道每个元素的绝对误差不超过 ε，而且前两名差距大于 2ε，就能证明 Top-1 不会变。设第一名是 a，第二名是 b，其他任一类是 c（c ≤ b）。部署后 a′ ≥ a − ε，c′ ≤ c + ε ≤ b + ε，所以 a′ − c′ ≥ (a − b) − 2ε &gt; 0，第一名仍然最大。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>换精度时要注意什么</h3>
+      <div class="blk ch" id="m4-ch2"><h3><span class="chn">2</span>精度与内存</h3>
+        <section class="sub"><h4 class="subt">换精度的注意事项</h4>
         <p>后面的 FP16 路线会改变数值。FP32 精度最高；FP16 范围较小，但尾数比 BF16 细；BF16 范围接近 FP32。<code>.half()</code> 可能发生舍入、溢出、下溢，再转回 FP32 也恢复不了丢失的信息。<code>autocast</code> 按规则为算子选择精度；<code>GradScaler</code> 只用于训练。</p>
-      </div>
-
-      <div class="blk"><h3>大模型加载时占多少内存</h3>
+        </section>
+        <section class="sub"><h4 class="subt">加载时的内存占用</h4>
         <p>大模型要分开看三块：CPU 加载时的峰值、GPU 上权重的容量、运行时的 activation / KV / workspace。分片和 meta 初始化能降低加载峰值，但不会让最终权重变小；真正压缩权重要靠量化。</p>
+        </section>
       </div>
 
-      <div class="blk iv" id="m4-iv"><h3>面试要求</h3>
+      <div class="blk ch" id="m4-ch3"><h3><span class="chn">3</span>复习</h3>
+        <section class="sub iv" id="m4-iv"><h4 class="subt">面试要求</h4>
         <h4>必须会</h4>
         <ul class="plain">
           <li>导出前为什么要 <code>model.eval()</code>（Dropout、BatchNorm 行为不同）；<code>no_grad</code> / <code>inference_mode</code> 只是省反向记录。</li>
@@ -76,7 +76,9 @@ checker / Netron 只查结构，不证明数值正确</code></pre>
           <li>ONNX 图清理：常量折叠、去掉冗余的 Squeeze / Unsqueeze（ACT 2945 个节点里有 1212 个）。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>Top-1 一致为什么不够？若误差上界为 ε、前两名差距 &gt; 2ε，为什么 Top-1 不会变？</li>

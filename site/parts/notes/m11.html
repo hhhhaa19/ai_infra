@@ -2,8 +2,8 @@
       <div class="eyebrow">模块 11</div>
       <h2>核心算子：卷积与 GEMM，从手算到分块</h2>
       <p class="why"><strong>主线</strong>：GEMM 从 naive 一步步优化到 cuBLAS 的 85%。每一版只看三件事：<strong>改了什么、为什么快（或慢）、测出多少</strong>，配一个数据流动画。核心思路只有一句：<strong>让数据搬一次、用多次，并且别让硬件干等。</strong></p>
-
-      <div class="blk" id="m11-s13"><h3>结果总览</h3>
+      <div class="blk ch" id="m11-ch1"><h3><span class="chn">1</span>概览</h3>
+        <section class="sub" id="m11-s13"><h4 class="subt">结果总览</h4>
         <p>Orin，锁频 1300 MHz，FP32，单位 GFLOPS；全部通过正确性检查。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>版本</th><th>改了什么</th><th class="num">4096³</th><th class="num">占 cuBLAS</th><th>相比上一版</th></tr></thead>
@@ -23,9 +23,8 @@
           <li>⑦ 和 ⑥ 是同一次运行里对比的（那次 ⑥ 测到 2382，和表里的 2366 是两次运行的差别）；1024³ / 2048³ 下 ⑦ 是 2756 / 2840，占 cuBLAS 87% / 83%。</li>
           <li><strong>测法</strong>：C 先填 NaN 查漏写；小形状和 CPU double 比、大形状和 cuBLAS 比，rel_l2 &lt; 1e-5；<code>jetson_clocks</code> 锁频，预热 5 次、CUDA event 计 20 次取中位数；GFLOPS = 2·M·N·K / 时间。</li>
         </ul>
-      </div>
-
-      <div class="blk"><h3>卷积：一个线程一个输出 → shared 分块</h3>
+        </section>
+        <section class="sub"><h4 class="subt">引子：朴素卷积</h4>
         <p>和 GEMM 是同一条路，先在卷积上看一遍。一个输出 = 窗口和卷积核对应相乘再相加（C × 3 × 3 次乘加）：</p>
 <pre><code>y[o, i, j] = b[o] + Σ_c Σ_u Σ_v  w[o, c, u, v] × x[c, i·s + u − p, j·s + v − p]
 权重形状 = 输出通道 × 输入通道 × k × k，例：layer1 是 64 × 64 × 3 × 3
@@ -82,9 +81,11 @@ __global__ void conv2d_tiled(const float* x, const float* w, float* y, int C, in
           <li>halo = 核大小 / 2，输入块边长 = 输出块边长 + 核大小 − 1（3×3 → 18×18，5×5 → 20×20）。</li>
           <li>库里的做法：im2col + GEMM（展开成矩阵，A 是原输入的 9 倍大）、implicit GEMM（不展开，搬数据时现场算下标，cuDNN / TensorRT 主流）、Winograd（3×3 乘法少 2.25 倍）。所以卷积最终也落到 GEMM。</li>
         </ul>
+        </section>
       </div>
 
-      <div class="blk"><h3>① naive：一个线程算一个 C（408）</h3>
+      <div class="blk ch" id="m11-ch2"><h3><span class="chn">2</span>GEMM 优化</h3>
+        <section class="sub"><h4 class="subt">① naive</h4>
 <pre><code>__global__ void gemm_naive(const float* A, const float* B, float* C, int M, int N, int K) {
     int i = blockIdx.y * blockDim.y + threadIdx.y;   // C 的行
     int j = blockIdx.x * blockDim.x + threadIdx.x;   // C 的列
@@ -153,9 +154,8 @@ sv.addEventListener('click',e=>{const p=sv.createSVGPoint();p.x=e.clientX;p.y=e.
 draw();
 })();
 </script>
-      </div>
-
-      <div class="blk"><h3>② shared memory 分块（614，1.5×）</h3>
+        </section>
+        <section class="sub"><h4 class="subt">② shared memory 分块</h4>
 <pre><code>template &lt;int TILE&gt;
 __global__ void gemm_tiled(const float* A, const float* B, float* C, int M, int N, int K) {
     __shared__ float As[TILE][TILE], Bs[TILE][TILE];
@@ -237,9 +237,8 @@ sv.addEventListener('click',e=>{const p=sv.createSVGPoint();p.x=e.clientX;p.y=e.
 draw();
 })();
 </script>
-      </div>
-
-      <div class="blk"><h3>③ 寄存器分块：一个线程算 8×8（1744，2.8×）</h3>
+        </section>
+        <section class="sub"><h4 class="subt">③ 寄存器分块</h4>
         <p><strong>核心想法</strong>：一个线程多算几个 C，读进寄存器的数就能重复用。</p>
 <pre><code>sum0 += As[i][s] * Bs[s][j]
 sum1 += As[i][s] * Bs[s][j+1]        ← As[i][s] 在两行里是同一个数
@@ -314,9 +313,8 @@ $('play').onclick=()=>{stop();kk=-1;ph=0;draw();tm=setInterval(()=>{next();if(kk
 draw();
 })();
 </script>
-      </div>
-
-      <div class="blk" id="m11-s14"><h3>④ 交错分工：消除 bank conflict（2091，+20%）</h3>
+        </section>
+        <section class="sub" id="m11-s14"><h4 class="subt">④ 交错分工消除 bank conflict</h4>
         <ul class="plain">
           <li><strong>bank</strong>：shared 分 32 个 bank，第 n 个 float 在 bank n % 32，每个 bank 每周期送 1 个 float。一个 warp 里多个线程落在同一 bank 的不同地址 → 排队，几个就几轮。读同一地址是广播，不算冲突。</li>
           <li><strong>③ 的问题</strong>：每个线程负责<strong>连续 8 列</strong>。要"竖着看"——同一时刻 16 个线程读的是第 0、8、16、24… 列，只落在 4 个 bank → 读 Bs 4 路冲突；读 As 两排 ty 相差 64 个 float → 2 路冲突。</li>
@@ -442,9 +440,8 @@ draw();
           </tbody>
         </table></div>
         <div class="note good"><strong>指令多了 60% 却快了 20%</strong>：③ 里每个线程读的 8 个 b 连续，编译器自动合并成 2 条 <code>LDS.128</code>；交错后不连续，变成 16 条 <code>LDS</code>。但 wavefront 少了一半。<strong>看硬件工作了多少轮，不看指令数。</strong></div>
-      </div>
-
-      <div class="blk" id="m11-s15"><h3>⑤ float4 + As 转置：反而变慢（1790，−15%）</h3>
+        </section>
+        <section class="sub" id="m11-s15"><h4 class="subt">⑤ float4 + As 转置</h4>
         <ul class="plain">
           <li><strong>想法</strong>：既要无冲突，又要像 ③ 那样用 128 位读取。float4 只要求 4 个连续、16 字节对齐，所以每个线程读"两段、每段 4 个连续"：</li>
         </ul>
@@ -676,9 +673,8 @@ st=5;batch=31;draw();
 })();
 </script>
         <div class="note">SASS 确认读 a、读 b 各 2 条 <code>LDS.128</code>，指令从 16 条降到 4 条，<strong>速度却慢了 15%</strong>。</div>
-      </div>
-
-      <div class="blk" id="m11-s16"><h3>为什么变慢：ncu 和 SASS</h3>
+        </section>
+        <section class="sub" id="m11-s16"><h4 class="subt">变慢的原因：ncu 与 SASS</h4>
         <ul class="plain">
           <li><strong>占用率 33%</strong>：119 个寄存器 × 256 线程，每个 SM 只放得下 2 个 block = 16 个 warp（上限 48），可轮换的 warp 少，延迟藏不住。</li>
           <li><strong>warp 在等</strong>：每发一条指令平均间隔从 6.21 周期（④）变成 7.75（⑤）。指令少了，但每个 warp 等得更久。L1 吞吐 43～48%、L2 17%：不是带宽不够，是延迟藏不住。</li>
@@ -696,9 +692,8 @@ st=5;batch=31;draw();
           <li><strong>kk 循环没展开</strong>：SASS 里只有 64 条 FFMA、4 条 <code>LDS.128</code>（一次 kk 的量），每次 kk 都是"读 → 等 → 算"串行。</li>
         </ol>
         <div class="note good"><strong>瓶颈会转移</strong>：float4 确实减少了指令，但那时指令数已经不是瓶颈。先用 ncu 的 stall 找最大的一项，再改。</div>
-      </div>
-
-      <div class="blk" id="m11-s17"><h3>⑥ padding + 展开 kk（2366，cuBLAS 的 70%）</h3>
+        </section>
+        <section class="sub" id="m11-s17"><h4 class="subt">⑥ padding + 展开 kk</h4>
         <p><strong>padding</strong>：<code>As[BK][BM+4]</code>，每行起点错开 4 个 bank。</p>
 <pre><code>写 As 时 bank = (local_j × 132 + local_i) % 32 = (local_j × 4 + local_i) % 32
 local_j = 0..7，local_i = 0..3 → 正好 0..31，32 个不同的 bank</code></pre>
@@ -808,9 +803,8 @@ tnow=K*(L+W+F);draw();
           </tbody>
         </table></div>
         <div class="note good"><strong>和 RMSNorm 的区别</strong>：RMSNorm 每个数只用一次，是带宽瓶颈（接入 PyTorch 后在 rows=4096、n=8192 的大形状上做到 192 GB/s，即 204.8 GB/s 的 94%；own_reg 在 rows=512、n=4096 是约 153 GB/s），靠合并访存、向量化、展开；GEMM 数据被反复用，是算力瓶颈，靠分块复用。相通的是最后都落到"不让硬件干等"。</div>
-      </div>
-
-      <div class="blk" id="m11-s19"><h3>⑦ double buffering：边算这一块，边读下一块（2895，cuBLAS 的 85%）</h3>
+        </section>
+        <section class="sub" id="m11-s19"><h4 class="subt">⑦ double buffering</h4>
         <ul class="plain">
           <li><strong>瓶颈</strong>：⑥ 之后最大的停顿是 long_scoreboard（1.81），也就是等全局内存。出在搬数据那一行：<code>As[..] = A[..]</code> 先 LDG 读全局，紧接着 STS 写 shared，读完立刻就用，只能干等。搬数据时 block 里所有 warp 都在搬，没有计算可以填进来。</li>
           <li><strong>关键事实</strong>：GPU 读全局内存不阻塞，LDG 发出后接着执行下一条，<strong>用到那个寄存器时</strong>才等。所以把"读下一块"提前到"算这一块"之前，读的延迟就被计算盖住了。</li>
@@ -898,9 +892,11 @@ draw();
           </tbody>
         </table></div>
         <div class="note good"><strong>验证时看你针对的那一项</strong>：改的是全局读取的等待，就看 long_scoreboard 有没有降。</div>
+        </section>
       </div>
 
-      <div class="blk" id="m11-s20"><h3>怎么读 ncu：时间账单、占用率、stack frame 和 spill</h3>
+      <div class="blk ch" id="m11-ch3"><h3><span class="chn">3</span>分析方法</h3>
+        <section class="sub" id="m11-s20"><h4 class="subt">读 ncu：时间账单、占用率、spill</h4>
         <p><strong>核心只有一个概念</strong>：一个 SM 里有 4 个调度器，每个调度器管几个 warp，每个周期从"准备好了"的 warp 里挑一个发一条指令。于是任何一个周期，每个 warp 都正好处在一种状态：<strong>selected</strong>（正在发指令，唯一在干活的状态）、<strong>not_selected</strong>（准备好了，但这拍选了别人）、或某种 <strong>stalled</strong>（在等某样东西，等什么就记成什么）。Warp State Statistics 统计的就是 warp 的时间花在了哪种状态上。</p>
         <p><strong>单位</strong>：<code>…_per_issue_active.ratio</code> = 平均每发射一条指令，warp 在这个状态上花了几个周期。各项加起来就是 Warp Cycles Per Issued Instruction，可以当成一张<strong>时间账单</strong>：</p>
 <pre><code>selected 1.00 + not_selected 0.65 + wait 0.40 + short 0.39 + barrier 0.12
@@ -973,9 +969,8 @@ draw();
 <pre><code>nvcc -O3 -arch=sm_87 -Xptxas=-v ...                          # 编译时看那一行
 cuobjdump -sass build-orin/gemm_bench | grep -cE "LDL|STL"   # 0 就说明完全没碰 local memory</code></pre>
         <p>少量 spill 有时可以接受（只发生在循环外，或者 L1 能命中），出现时要实测，不能光看数字下结论。所以 long_scoreboard 高时，除了全局读取，还要查是不是有数组掉进了 local memory。</p>
-      </div>
-
-      <div class="blk" id="m11-s21"><h3>RMSNorm 和 GEMM 对照</h3>
+        </section>
+        <section class="sub" id="m11-s21"><h4 class="subt">RMSNorm 与 GEMM 对照</h4>
         <div class="tablewrap"><table>
           <thead><tr><th></th><th>RMSNorm</th><th>GEMM</th></tr></thead>
           <tbody>
@@ -1020,9 +1015,11 @@ cuobjdump -sass build-orin/gemm_bench | grep -cE "LDL|STL"   # 0 就说明完全
           <li><strong>最大的不同点</strong>：GEMM 有复用，所以要用 shared memory 和寄存器分层存数据，才有 bank conflict、分块、双缓冲这些问题；RMSNorm 每个数只用一次，shared memory 只用来做规约。</li>
           <li>先判断是哪类瓶颈，再选看哪些指标；编译期常量是性能的前提；两次都是 SASS 揭示了真相；"理论上更好"不等于更快（RMSNorm 有被推翻的猜测，GEMM 有变慢的 float4）。</li>
         </ul>
+        </section>
       </div>
 
-      <div class="blk" id="m11-conv"><h3>卷积 bench：v1 直接卷积</h3>
+      <div class="blk ch" id="m11-ch4"><h3><span class="chn">4</span>卷积</h3>
+        <section class="sub" id="m11-conv"><h4 class="subt">v1 直接卷积</h4>
         <p><strong>先把卷积本身讲清</strong>。卷积核是一个小窗口，在图上滑动，每停一个位置就把窗口里对应位置的数相乘再求和，得到一个输出数。一层一层加上去：</p>
         <ol class="plain">
           <li><strong>一个通道、一个卷积核</strong>：4×4 的输入、3×3 的卷积核、不补边，横竖各能放 2 个位置，输出 2×2。左列 +1、右列 −1 的卷积核在找竖直边缘；权重是训练学出来的。</li>
@@ -1065,9 +1062,8 @@ Y[idx] = sum;                                // Y 的摊平顺序就是 n、k、
         <p><strong>下一步 v2 implicit GEMM</strong>：把 (c, r, s) 压成一个下标，长度 CRS，每个输出就是两个长度 CRS 的向量点积，所有输出合起来是一次 GEMM：A = 权重 reshape 成 K × CRS，B = "补丁矩阵" CRS × NPQ（每列是一个输出位置要用的那块输入，越界处为 0），C = K × NPQ。</p>
         <p>显式 im2col 要把 B 真写进显存，3×3 stride 1 时 B 约是输入的 9 倍；implicit 只改 GEMM 里"搬 B 的 tile"那一行，加载时按卷积规则现算地址，其余（shared 分块、寄存器分块、双缓冲）照搬模块里的 GEMM。</p>
         <p>之后的难点：每个元素都要做几次 <code>/</code> 和 <code>%</code>（预先算好或沿 k 增量更新）；NHWC 布局让 c 连续、可以 float4；padding 分支。形状差别：1×1 卷积本身就是 GEMM；siglip 的 patch embed 窗口互不重叠，im2col 只是 reshape；resnet3x3 对应 M = 64、N = 3136、K = 576。</p>
-      </div>
-
-      <div class="blk" id="m11-im2col"><h3>卷积 v2：显式 im2col + 自己的 GEMM</h3>
+        </section>
+        <section class="sub" id="m11-im2col"><h4 class="subt">v2 显式 im2col</h4>
         <p><strong>要解决什么</strong>：v1 每做一次乘加都从显存读 2 个数、读进来的不复用，resnet3x3 只有 0.199 TFLOPS。GEMM 里同样的问题已经用分块解决过，所以思路是<strong>把卷积改写成矩阵乘，再直接调用自己写好的 GEMM</strong>。</p>
         <p><strong>最小例子</strong>：X 是 3×3，一个 2×2 卷积核，输出 2×2。v1 算 Y[0,0] 是窗口 <code>1 2 / 4 5</code> 和 Wt <code>1 0 / 0 1</code> 对应相乘再加：1 + 5 = 6。这其实是两个长度 4 的向量点积：窗口摊平成 [1,2,4,5]，Wt 摊平成 [1,0,0,1]。把 4 个窗口都摊平、竖着排成 4 列，就是矩阵 B：</p>
 <pre><code>            窗口(0,0) (0,1) (1,0) (1,1)
@@ -1129,9 +1125,8 @@ B[row*PQ + col] = (h &lt; 0 || h &gt;= H || w &lt; 0 || w &gt;= W) ? 0.0f : Xn[(
           <li>resnet3x3_s2 上为什么 128×128 的 reg 版反而比 16×16 的 tiled 版慢？</li>
           <li>显式 im2col 的数据膨胀约等于多少？哪两组形状没有膨胀？</li>
         </ul></div>
-      </div>
-
-      <div class="blk" id="m11-igemm"><h3>卷积 v3：implicit GEMM</h3>
+        </section>
+        <section class="sub" id="m11-igemm"><h4 class="subt">v3 implicit GEMM</h4>
         <p><strong>要解决什么</strong>：v2 分两个 kernel。第 1 个 <code>im2col_kernel</code> 读 X、抄成 B、把 B 写进显存；第 2 个 GEMM 从显存把 B 读回来、搬进 shared memory 再乘加。B 是用完就扔的中间产物，而且是 X 的 9 倍（resnet3x3：X 0.8 MB，B 7.2 MB），这一写一读全是额外的显存流量。问题是：能不能不要 B？</p>
         <p><strong>只改一行</strong>：<code>B[row][col]</code> 的值本来就是从 X 的某一格抄过去的，那 GEMM 需要它时自己算出该读 X 的哪一格就行了。拿 <code>gemm_tiled</code> 当骨架，只改搬 B 的那一行：</p>
 <pre><code>改之前：Bs[i][j] = B[brow][col];                 // 读 im2col 写好的 B
@@ -1189,9 +1184,11 @@ B[row*PQ + col] = (h &lt; 0 || h &gt;= H || w &lt; 0 || w &gt;= W) ? 0.0f : Xn[(
           <li>TILE 同时决定哪三件事？为什么说它和卷积的 K 无关？gemm_reg 是怎么把它们拆开的？</li>
           <li>implicit GEMM 也会重复读 X 的同一格，为什么比显式 im2col 省？代价是什么？</li>
         </ul></div>
+        </section>
       </div>
 
-      <div class="blk" id="m11-s18"><h3>下一步</h3>
+      <div class="blk ch" id="m11-ch5"><h3><span class="chn">5</span>复习</h3>
+        <section class="sub" id="m11-s18"><h4 class="subt">未做的优化</h4>
         <p>⑦ 之后剩下的停顿主要是 not_selected 0.65、wait 0.40、short_scoreboard 0.39，后两个都属于"每个调度器只有 2 个 warp，可轮换的对象太少"。下面这些都没做，GEMM 先收尾（剩下的主要是调参）：</p>
         <div class="tablewrap"><table>
           <thead><tr><th>优化</th><th>做法</th></tr></thead>
@@ -1219,9 +1216,8 @@ sudo .../ncu --kernel-name regex:gemm_reg --launch-skip 3 --launch-count 1 --met
   smsp__average_warps_issue_stalled_wait_per_issue_active.ratio \
   ./build-orin/gemm_bench 4096 4096 4096</code></pre>
         <p class="small muted">gemm_bench 会先预热再循环计时，不加 <code>--launch-skip</code> / <code>--launch-count</code> 时 ncu 会把同一个 kernel 抓很多遍，数字都一样，看一块就够。</p>
-      </div>
-
-      <div class="blk iv" id="m11-iv"><h3>面试要求</h3>
+        </section>
+        <section class="sub iv" id="m11-iv"><h4 class="subt">面试要求</h4>
         <p>推理优化、CUDA 算子岗位里 GEMM 几乎必问。下面合并了卷积部分和 GEMM 的要求；完整优化过程见本模块上面的 ①～⑥。</p>
         <h4>必须会</h4>
         <ul class="plain">
@@ -1255,7 +1251,9 @@ sudo .../ncu --kernel-name regex:gemm_reg --launch-skip 3 --launch-count 1 --met
           <li>depthwise 卷积为什么难优化（计算强度低）。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>4×4 输入、3×3 核、padding 1、步长 2，输出多大？ResNet-18 从 480×640 怎么一步步变成 15×20？</li>

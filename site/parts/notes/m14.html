@@ -2,8 +2,8 @@
       <div class="eyebrow">模块 14</div>
       <h2>核心算子：Softmax，从三遍读到 online softmax</h2>
       <p class="why"><strong>主线</strong>：softmax 把一行分数变成概率（lm_head 后的采样、attention 的权重），计算很少，是带宽问题；每行要先做两次规约（最大值、求和）。优化沿两个方向：<strong>分工</strong>（一行交给 1 个线程 / 1 个 block / 1 个 warp）和<strong>算法</strong>（读 3 遍 / 2 遍 / 1 遍）。最后按行长 n 分档派发。online softmax 是 FlashAttention 的核心。</p>
-
-      <div class="blk"><h3>结果总览</h3>
+      <div class="blk ch" id="m14-ch1"><h3><span class="chn">1</span>概览</h3>
+        <section class="sub"><h4 class="subt">结果总览</h4>
         <p>Orin，锁频，FP32；GB/s 按读 X 一遍 + 写 Y 一遍计算，括号是占 copy 的比例。全部和 CPU double 比，误差 &lt; 1e-6。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>rows × n</th><th class="num">① naive</th><th class="num">② block</th><th class="num">③ online</th><th class="num">④ warp</th></tr></thead>
@@ -28,9 +28,8 @@
             <tr><td>④ warp</td><td>1 warp 1 行</td><td>1</td><td>1</td><td>无（shuffle）</td><td>n ≤ 1024</td></tr>
           </tbody>
         </table></div>
-      </div>
-
-      <div class="blk"><h3>公式、减最大值、两个坑</h3>
+        </section>
+        <section class="sub"><h4 class="subt">公式、减最大值与两个坑</h4>
 <pre><code>y_j = e^(x_j − m) / Σᵢ e^(xᵢ − m)，m = 这一行的最大值
 x = [102, 101, 100] → 减 102 → [0, −1, −2] → y = [0.665, 0.245, 0.090]，和 [2, 1, 0] 一样</code></pre>
         <ul class="plain">
@@ -40,9 +39,11 @@ x = [102, 101, 100] → 减 102 → [0, −1, −2] → y = [0.665, 0.245, 0.090
           <li><strong>坑 2</strong>：分不到数的线程，求最大值填 −∞、求和填 0。</li>
           <li><code>expf</code> 精确；<code>__expf</code> 走 SFU（<code>MUFU.EX2</code>）更快，减完最大值后输入在误差小的区间；<code>exp2f</code> 用于已乘好 log₂e 时。softmax 卡在带宽，换快速版收益不确定（没测）。</li>
         </ul>
+        </section>
       </div>
 
-      <div class="blk"><h3>① naive：一个线程一行（copy 的 4～11%）</h3>
+      <div class="blk ch" id="m14-ch2"><h3><span class="chn">2</span>四个版本</h3>
+        <section class="sub"><h4 class="subt">① naive：一个线程一行</h4>
 <pre><code>int r = blockIdx.x * blockDim.x + threadIdx.x;   // 全局行号
 if (r &gt;= rows) return;
 size_t base = size_t(r) * n;
@@ -89,9 +90,8 @@ $('k').oninput=()=>{k=+$('k').value;$('ko').textContent=k;draw()};
 draw();
 })();
 </script>
-      </div>
-
-      <div class="blk"><h3>② block：一个 block 一行</h3>
+        </section>
+        <section class="sub"><h4 class="subt">② block：一个 block 一行</h4>
 <pre><code>template &lt;int BLOCK&gt;   // launch: softmax_block&lt;256&gt;&lt;&lt;&lt;rows, 256&gt;&gt;&gt;
 int b = blockIdx.x, r = threadIdx.x;  size_t base = size_t(b) * n;
 __shared__ float mb[BLOCK], sumb[BLOCK];
@@ -110,9 +110,8 @@ float row_max = mb[0];                      // 所有线程都拿到结果
           <li><strong>n = 128 只有 19%</strong>：256 个线程一半闲着，两次规约 16 次同步只处理 128 个数。→ ④ 解决。</li>
         </ul>
         <div class="note"><strong>易错</strong>：① 循环从 <code>i = r</code> 开始，检查的就是实际读的位置；写成 <code>i = 0</code> 读 <code>r + i</code> 会读到下一行；② 规约条件是 <code>if (r &lt; off)</code>，干活的线程多了会越界和数据竞争；③ <code>__syncthreads()</code> 必须所有线程都执行到，不能被 <code>continue</code> 或提前 return 跳过。</div>
-      </div>
-
-      <div class="blk"><h3>③ online softmax：最大值和分母一遍求出（n = 32000：49% → 63%）</h3>
+        </section>
+        <section class="sub"><h4 class="subt">③ online softmax</h4>
 <pre><code>读到新数 x：  m_new = max(m, x)
               d     = d × e^(m − m_new) + e^(x − m_new)
               m     = m_new
@@ -161,9 +160,8 @@ draw();
 })();
 </script>
         <div class="note"><strong>易错：两个空线程合并会得到 NaN</strong>。n 小于线程数时有线程是 (−∞, 0)，两个空线程合并时 −∞ − (−∞) = NaN，一路传上去整行都是 NaN。合并前判断 m_new 是 −∞ 就跳过；只有一边空没问题（e^(−∞) = 0）。</div>
-      </div>
-
-      <div class="blk" id="m14-s4"><h3>④ warp 版：一个 warp 一行，整行放进寄存器（n = 128：20% → 108%）</h3>
+        </section>
+        <section class="sub" id="m14-s4"><h4 class="subt">④ warp：一个 warp 一行</h4>
 <pre><code>template &lt;int PER_LANE&gt;   // = ceil(n / 32)；n ≤ 1024 → PER_LANE 1/2/4/8/16/32
 int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
 int row  = blockIdx.x * (blockDim.x / 32) + warp;    // 一个 block 4 个 warp = 4 行
@@ -224,18 +222,19 @@ draw();
           <li><code>__shfl_down_sync</code>：单向往下传，只有 lane 0 对，还要再广播一次。softmax 每个 lane 都要用 max 和 sum，所以用 xor。</li>
           <li>mask 里的 lane 必须都执行到 shuffle，所以前面不能有部分线程 return。</li>
         </ul>
+        </section>
       </div>
 
-      <div class="blk"><h3>按 n 分档</h3>
+      <div class="blk ch" id="m14-ch3"><h3><span class="chn">3</span>分档与易错</h3>
+        <section class="sub"><h4 class="subt">按 n 分档</h4>
         <ul class="plain">
           <li><strong>n ≤ 1024</strong>：warp 版（整行进寄存器，读 1 遍）。</li>
           <li><strong>中等 n</strong>（几千）：block 版（后两遍命中缓存）。</li>
           <li><strong>很长 n</strong>（词表 32000）：online 版（读 2 遍）；行很少时再把一行拆给多个 block（Flash-Decoding，没做）。</li>
         </ul>
         <p>和 RMSNorm 按 n 分档、n ≤ 256 一个 warp 一行是同一个思路，cuDNN、PyTorch 也这样按形状派发。</p>
-      </div>
-
-      <div class="blk"><h3>reduction 写对的前提</h3>
+        </section>
+        <section class="sub"><h4 class="subt">reduction 的正确性前提</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>写法</th><th>隐含前提</th><th>不满足时</th></tr></thead>
           <tbody>
@@ -247,16 +246,17 @@ draw();
           </tbody>
         </table></div>
         <p>更快的写法：warp 之间合并时，各 warp 的部分和写进 shared，再让 warp 0 读进来做一次 shuffle，只要 1 次同步。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>对应源码</h3>
+      <div class="blk ch" id="m14-ch4"><h3><span class="chn">4</span>复习</h3>
+        <section class="sub"><h4 class="subt">对应源码</h4>
         <ul class="plain">
           <li><a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/f213f82413427dc65ecf0c98d120ac8f399413d7/src/softmax/kernels.cuh#L31">kernels.cuh:31 softmax_naive</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/f213f82413427dc65ecf0c98d120ac8f399413d7/src/softmax/kernels.cuh#L57">:57 softmax_block</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/f213f82413427dc65ecf0c98d120ac8f399413d7/src/softmax/kernels.cuh#L102">:102 softmax_online</a></li>
           <li><a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/f213f82413427dc65ecf0c98d120ac8f399413d7/src/softmax/softmax_bench.cu#L48">softmax_bench.cu:48 run_shape</a></li>
         </ul>
-      </div>
-
-      <div class="blk iv" id="m14-iv"><h3>面试要求</h3>
+        </section>
+        <section class="sub iv" id="m14-iv"><h4 class="subt">面试要求</h4>
         <p>softmax（含 online softmax）是手写 CUDA 题里的高频题，也是理解 FlashAttention 的前提。</p>
         <h4>必须会</h4>
         <ul class="plain">
@@ -280,7 +280,9 @@ draw();
           <li>和前后算子融合（scale、mask、softmax 合成一个 kernel）。</li>
         </ul>
         <p class="small muted">三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>x = [102, 101, 100] 直接算会怎样？减最大值后是多少？为什么和 [2, 1, 0] 结果一样？</li>

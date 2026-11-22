@@ -2,8 +2,8 @@
       <div class="eyebrow">模块 9</div>
       <h2>ONNX → TensorRT plugin：把自己的算子接进 TensorRT</h2>
       <p class="why"><strong>这一模块讲什么</strong>：端侧部署走 ONNX → TensorRT，部署环境里通常没有 PyTorch。不做处理时，eager 写法的 RMSNorm 导出后是 7 个标准节点，由 TensorRT 自己融合，我们的 kernel 完全用不上。要让 TensorRT 调用我们的 kernel，需要四步：让 kernel 不依赖 PyTorch → 在 ONNX 里留一个自定义节点 → 写 plugin → 加载 <code>.so</code> 后建 engine。下面按这个顺序讲，先从"手上有哪些图"开始。</p>
-
-      <div class="blk"><h3>第一步：先分清有哪几种"图"</h3>
+      <div class="blk ch" id="m9-ch1"><h3><span class="chn">1</span>图与编译器</h3>
+        <section class="sub"><h4 class="subt">几种图</h4>
         <p>这条线上"图"这个词出现了很多次，意思各不相同：</p>
         <div class="tablewrap"><table>
           <thead><tr><th>图</th><th>谁生成</th><th>里面是什么</th><th>存在哪</th><th>和硬件有关吗</th></tr></thead>
@@ -22,9 +22,8 @@
         <p><code>ai_infra::rms_norm</code> 只填了 CUDA 和 Meta 两格，Autograd 是空的，所以能推理、不能训练。</p>
         <p>既然 CUDA Graph 已经记录了 kernel 调用，为什么不能直接交给 TensorRT？因为 ONNX 记的是"要算什么"，CUDA Graph 记的是"已经选好的 kernel 怎么调"。TensorRT 的价值是自己决定怎么融合、挑哪个 kernel，所以必须拿到前者。</p>
         <p>CUDA Graph 里还有这个进程的显存地址，也没有标准的文件格式给别的程序加载。CUDA 本身没有"模型"概念，要不用 PyTorch，可以直接用 TensorRT API 搭网络（TensorRT-LLM 的做法），或者整个模型手写 CUDA（llama.cpp、llm.c）。</p>
-      </div>
-
-      <div class="blk"><h3>第二步：TensorRT 在这条线上相当于 Inductor</h3>
+        </section>
+        <section class="sub"><h4 class="subt">TensorRT 与 Inductor 的对应</h4>
         <p>TensorRT builder 的角色和 Inductor 很像，都接收一张图，做融合，再决定用什么 kernel：</p>
         <div class="tablewrap"><table>
           <thead><tr><th></th><th>torch.compile</th><th>TensorRT</th></tr></thead>
@@ -38,9 +37,11 @@
           </tbody>
         </table></div>
         <p>两边对待自定义算子的方式几乎对称：都不往里融合，只在它前后融合。区别是 TensorRT 在 PyTorch 外面，多一步导出 ONNX，外壳也要用 TensorRT 的 C++ 接口重写。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>第三步：让 kernel 不依赖 PyTorch</h3>
+      <div class="blk ch" id="m9-ch2"><h3><span class="chn">2</span>plugin 实现</h3>
+        <section class="sub"><h4 class="subt">kernel 去掉 PyTorch 依赖</h4>
         <p>plugin 要用选档逻辑，但它原来写在 <code>rmsnorm_ext.cu</code> 里，文件第一行就是 <code>#include &lt;torch/extension.h&gt;</code>。include 它就得带上 libtorch；复制一份又容易两边改漏。所以把选档和启动代码剪切到 <code>launch.cuh</code>，让两个外壳都 include 它。</p>
 <pre><code>                 kernels.cu（所有 kernel）+ launch.cuh（chooseBlock / withBlock / launchRMSNorm，只依赖 CUDA）
                      ▲                                        ▲
@@ -55,9 +56,8 @@
         <p>改动只有两类。第一，SM 数改用 <code>cudaDeviceGetAttribute(…, cudaDevAttrMultiProcessorCount, …)</code>，用 <code>static</code> 加立即调用的 lambda，只查一次。第二，<code>TORCH_CHECK</code> 改成返回错误字符串，成功返回 nullptr。这样"有没有错"由头文件判断，"怎么报错"由各自的外壳决定：PyTorch 用 <code>TORCH_CHECK</code>，TensorRT 返回错误码。</p>
         <p>验证方法很直接：<code>echo '#include "launch.cuh"' &gt; t.cu &amp;&amp; nvcc -arch=sm_87 -c t.cu</code>，不给任何 PyTorch 路径，能编过就说明干净。</p>
         <p>顺便还用 <code>withBlock</code> 去掉了重复代码。模板参数要编译期确定，而 BLOCK 运行时才知道，switch 把运行时的数翻译成编译期常量，语法细节见模块 3 第 6 节。<code>launchReg</code> 和 <code>launchFusedReg</code> 没有合并，因为要把"哪个 kernel"也做成模板参数，太绕。另外 <code>build_ext.py</code> 的 <code>_DEPS</code> 要加上新头文件，否则改了头文件扩展不会重编，这个坑以前踩过。</p>
-      </div>
-
-      <div class="blk"><h3>第四步：跟着一个 RmsNorm 节点走完全程</h3>
+        </section>
+        <section class="sub"><h4 class="subt">一个 RmsNorm 节点的全程</h4>
         <p>现在看整体流程。节点先在导出时产生，plugin 单独编译；建 engine 时两者碰头，加载 engine 时再恢复一次。</p>
 <pre><code>阶段 A  导出（PyTorch 世界）  python src/llama/export_onnx.py ours
   A1 register_custom_op_symbolic("ai_infra::rms_norm", rms_norm_symbolic, 17)
@@ -94,9 +94,8 @@
        rows = 前面所有维度相乘，n = 最后一维 → launchRMSNorm(rows, n, inputs[0], inputs[1], outputs[0], eps_, stream)</code></pre>
         <p>导出时完全用不到 plugin。两边<strong>唯一的联系是两个约定</strong>：节点名（symbolic 写 "RmsNorm"，creator 的 <code>getPluginName()</code> 也返回 "RmsNorm"）和属性名（<code>eps_f=eps</code> 对应 <code>createPlugin</code> 里找的 "eps"）。写错一边（比如 "RMSNorm"），导出照样成功，建 engine 时才报找不到 plugin。</p>
         <p>导出时用什么设备？老导出器拿示例输入把模型真的跑一遍，模型和输入在哪就在哪跑；"记录操作"本身是 CPU 上的 Python。我们的算子没有 CPU 实现，所以 ours 要在 GPU 上导出。导出不需要锁频，建 engine 需要。</p>
-      </div>
-
-      <div class="blk"><h3>第五步：plugin 类的每个函数什么时候被调用</h3>
+        </section>
+        <section class="sub"><h4 class="subt">plugin 函数的调用时机</h4>
         <p>读 plugin 代码时，别从上往下看语法，要按"TensorRT 什么时候来调用"分组。建 engine 时问形状和类型，推理时调 <code>enqueue</code>，保存 engine 时写 <code>eps</code>。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>函数</th><th>谁调用 / 什么时候</th><th>我们写了什么</th><th>PyTorch 那边对应</th></tr></thead>
@@ -116,9 +115,8 @@
         <p>这里最容易混的是 eps 和 weight。weight 是 2048 个 float 的张量，在 ONNX 里是节点的<strong>输入</strong>，TensorRT 自己把它当常量存进 engine。eps 只是一个数，是节点的<strong>属性</strong>，要 plugin 自己保存。部署时只有 <code>.engine</code>，没有 ONNX，所以 plugin 需要的参数必须自己写进去。以后加参数，就在 <code>serialize</code> 里往后写，构造函数按同样顺序读。</p>
         <p>ONNX 里显示 <code>eps=9.999999747378752e-06</code>，是因为 float32 存不下精确的 1e-5。它的二进制是 0x3727C5AC，engine 里按小端序存为 AC C5 27 37。</p>
         <p>做 FP16 时，<code>supportsFormatCombination</code> 要区分 pos：<code>pos == 0</code> 时允许 kFLOAT 或 kHALF，其余位置 <code>return inOut[pos].type == inOut[0].type</code>，因为问到 pos 时前面的类型已经定了。也可以让 weight 保持 FP32，单独判断。</p>
-      </div>
-
-      <div class="blk"><h3>第六步：creator，生产 plugin 的工厂</h3>
+        </section>
+        <section class="sub"><h4 class="subt">creator</h4>
         <p>为什么要 creator？Parser 遇到 RmsNorm 时手里还没有 plugin 对象，必须事先有个东西待在注册表里，等着被找到。这就是工厂模式：creator 整个程序一个，由它生产 plugin。</p>
 <pre><code>RmsNormPluginCreator() {
     fields_.emplace_back("eps", nullptr, PluginFieldType::kFLOAT32, 1);   // 属性说明书：有个叫 eps 的 float，没有数值
@@ -145,9 +143,8 @@ REGISTER_TENSORRT_PLUGIN(RmsNormPluginCreator);
         </table></div>
         <p>什么时候创建 plugin？你不用自己判断，调用时机全由 TensorRT 掌握。这和 PyTorch 里我们从没自己调用过 forward 一样：按接口把格子填好，框架在合适的时候来调用。ONNX 里有几个 RmsNorm 节点，<code>createPlugin</code> 就调几次，比如 5 个节点是 1 个 creator、调 5 次，不是 5 个 creator。</p>
         <p><code>fields_</code>、<code>fc_</code> 必须是成员变量，因为 <code>getFieldNames()</code> 返回的是指向它们的指针。写成局部变量，函数一返回就销毁，指针就悬空了。<strong>把指针交给别人之前，先想清楚它指向的东西能活多久。</strong>同样，对象在我们的 <code>.so</code> 里 new，就在我们的 <code>.so</code> 里 delete（<code>destroy()</code> 里的 <code>delete this</code>），因为两边可能用不同的内存分配器。</p>
-      </div>
-
-      <div class="blk"><h3>第七步：编译成 .so，只有 nvcc 真正在编译</h3>
+        </section>
+        <section class="sub"><h4 class="subt">编译成 .so</h4>
         <p>写好 plugin 后要把它编译出来。这里 Python、CMake、ninja 看着很乱，其实它们都只是组织命令的工具：</p>
 <pre><code>plugin.cu ─ GPU 部分 ─▶ PTX ─ptxas─▶ SASS（sm_87）
           └ CPU 部分（enqueue、launchRMSNorm…）─▶ g++ ─▶ CPU 机器码
@@ -164,9 +161,11 @@ PyTorch load()：生成 build.ninja（要和已装 torch 完全一致的编译�
         <p>再看 GPU 代码的三层：CUDA C++ 是人写的；PTX 是"虚拟 GPU 汇编"，寄存器不限、跨代兼容，新驱动可以 JIT；SASS 是真正的机器码，每代架构不同，寄存器在这一步分配，存在 cubin 里。float4 那次看的 <code>LDG.E.128</code> 是 SASS，PTX 里对应 <code>ld.global.v4.f32</code>。</p>
         <p>Triton 不经过 CUDA C++，直接生成 PTX 再交给 ptxas。engine 不能跨 GPU，就是因为里面有为这块 GPU 挑好的 SASS kernel。</p>
         <p>想自己看的话：<code>nvcc -arch=sm_87 -ptx src/rmsnorm/kernels.cu -o k.ptx</code>；<code>nvcc -arch=sm_87 -cubin … &amp;&amp; cuobjdump -sass k.cubin | grep LDG</code>。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>第八步：engine 和 context</h3>
+      <div class="blk ch" id="m9-ch3"><h3><span class="chn">3</span>engine 与验证</h3>
+        <section class="sub"><h4 class="subt">engine 与 context</h4>
         <p>建好的 engine 可以反复加载。engine 是只读的方案，context 是一次运行的状态：</p>
         <div class="tablewrap"><table>
           <thead><tr><th></th><th>engine</th><th>context</th></tr></thead>
@@ -188,9 +187,8 @@ PyTorch load()：生成 build.ninja（要和已装 torch 完全一致的编译�
           </tbody>
         </table></div>
         <p>RmsNorm 是个例外：engine 里<strong>没有我们的 CUDA 代码</strong>，只记下 plugin 的类型名、版本和 <code>serialize</code> 写的 4 字节 eps，kernel 还在 <code>.so</code> 里。所以运行时必须加载同一个 <code>.so</code>，反序列化时才能靠 creator 的 <code>deserializePlugin</code> 把 plugin 重建出来，没加载就会失败。</p>
-      </div>
-
-      <div class="blk"><h3>第九步：用什么工具建 engine 和验证</h3>
+        </section>
+        <section class="sub"><h4 class="subt">建 engine 与验证的工具</h4>
         <p>这次实际用的是 <code>trtexec</code> 和 <code>trt_check.py</code>，没有用你自己的 C++。三者的区别是：</p>
         <div class="tablewrap"><table>
           <thead><tr><th></th><th>trtexec（TensorRT 自带）</th><th>trt_check.py（Python 检查脚本）</th><th>你自己的 C++（src/tensorrt_intro）</th></tr></thead>
@@ -229,9 +227,8 @@ PyTorch load()：生成 build.ninja（要和已装 torch 完全一致的编译�
         <p>两种方法能对上：同一个 eager engine，trtexec 和 trt_check.py 在 b1 是 1.309 / 1.311 ms，b8 是 8.882 / 9.030 ms，prefill 是 14.790 / 14.789 ms。</p>
         <p>改用自己的 C++ 程序还要做三件事（还没做）：① 链接 plugin 或用 <code>dlopen</code> 加载；② <code>createNetworkV2(0U)</code> 在 TensorRT 8.5 是隐式 batch，ONNX parser 不支持，要传显式 batch 标志（原代码是在 Quest 的 TensorRT 10 上写的）；③ 用 <code>clearFlag(kTF32)</code> / <code>setFlag(kFP16)</code> 设置精度。</p>
         <p>另外 <code>infer_async.cpp</code> 为 ResNet 写死了形状和路径，要改成从 <code>getTensorShape()</code> 读。</p>
-      </div>
-
-      <div class="blk"><h3>第十步：三份代码逐段读</h3>
+        </section>
+        <section class="sub"><h4 class="subt">三份代码逐段读</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>文件</th><th>类型</th><th>输入 → 产出</th><th>什么时候用</th></tr></thead>
           <tbody>
@@ -302,9 +299,8 @@ runtime = trt.Runtime(logger)                                # 建 engine 用 Bu
           </tbody>
         </table></div>
         <p>trt_check.py 的计时方法和 bench_layer.py 相同，所以数字能和 PyTorch 的结果放在一起比。<code>infer_async.cpp</code> 对应这里加载和推理的部分，调的是同一套接口。</p>
-      </div>
-
-      <div class="blk"><h3>补充：三个产物、两种翻译写法、对接细节</h3>
+        </section>
+        <section class="sub"><h4 class="subt">产物、翻译写法与对接细节</h4>
         <p>先分清这条线上的三个产物。第七步编译的只有 plugin，也就是 RMSNorm 这一个算子的代码，和模型结构、权重都没有关系；模型里的矩阵乘和 attention 用的是 TensorRT 自带的 kernel 库。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>产物</th><th>里面有什么</th><th>怎么来</th></tr></thead>
@@ -364,9 +360,11 @@ torch.onnx.export(layer, (x,), path, dynamo=True,
             <tr><td>报错</td><td><code>TORCH_CHECK</code></td><td><code>fprintf</code> + 返回 1</td></tr>
           </tbody>
         </table></div>
+        </section>
       </div>
 
-      <div class="blk"><h3>补充：FP16 为什么分两步、TensorRT 选错 kernel 怎么办</h3>
+      <div class="blk ch" id="m9-ch4"><h3><span class="chn">4</span>FP16 与结果</h3>
+        <section class="sub"><h4 class="subt">FP16 两步与选错 kernel</h4>
         <p>我们的 kernel 只支持 FP32，<code>supportsFormatCombination</code> 也只接受 <code>kFLOAT</code>。如果拿 ours ONNX 直接开 <code>--fp16</code>，TensorRT 要么在 plugin 前后插 FP16 ↔ FP32 转换，要么建不出来，哪种要实测；就算跑通也不是真正的 FP16 算子。所以分两步：</p>
         <div class="tablewrap"><table>
           <thead><tr><th>阶段</th><th>ONNX</th><th>要不要改 kernel</th><th>目的</th></tr></thead>
@@ -377,9 +375,8 @@ torch.onnx.export(layer, (x,), path, dynamo=True,
         </table></div>
         <p>累加不用 half，是因为 FP16 范围和精度有限，2048 个元素求和容易出问题。先不碰 kernel，是为了一次只变一个变量。</p>
         <p>b8 的教训是：我们能控制自己的算子，但矩阵乘这类大头由 TensorRT 选，而且核心闭源。不能改编译器时，至少要能证明问题在哪（<code>--exportLayerInfo</code>、<code>--dumpProfile</code>、nsys）。可以按这个顺序处理：① 先验证原因，用 FP16 或开 TF32 重建，看 kernel 和时间变不变；② 调整模型结构，比如改 ONNX 图、切分节点，影响 Myelin 怎么分组；③ 换 TensorRT 版本或平台比较；④ 某个矩阵乘特别值得时自己写 plugin；⑤ 换运行时对照，比如 ONNX Runtime。另外，之前 b8 变快恰好是 plugin 切开了 Myelin，不是主动设计，不能当成稳定方法。</p>
-      </div>
-
-      <div class="blk" id="fp16"><h3>FP16 基线实测：开 FP16 后改了什么、快了多少、误差怎么看</h3>
+        </section>
+        <section class="sub" id="fp16"><h4 class="subt">FP16 基线实测</h4>
         <p><strong>要回答的问题</strong>：FP32 + 禁 TF32 时，eager engine 的 decode b8 要 8.92 ms，比 PyTorch eager 的 1.80 ms 还慢，推测是 Myelin 给 M=8 的矩阵乘挑了慢 kernel。按上一节"FP16 分两步"的第一步，只用现有的 eager ONNX、不改 kernel，看 FP16 快多少、矩阵乘 kernel 变没变。</p>
         <p><strong>开 <code>--fp16</code> 改的是什么</strong>：代码和 ONNX 文件都不改，改的只是 TensorRT 建 engine 时允许用的精度，所以变化全在 engine 里面。① 每层的候选实现里多了 FP16 版本，TensorRT 照样逐层实测，哪个快、能用就选哪个，不是强制所有层都变 FP16；② 选了 FP16 实现的层，权重会被转成 FP16 存进 engine，这次三个 engine 都是 99 MB；③ FP32 + <code>--noTF32</code> 时矩阵乘不能用 Tensor Core，开 FP16 后可以；④ 相邻层都是 FP16 时中间结果也是 FP16，读写减半，前后精度不同的地方 TensorRT 会插格式转换层，转换太多会抵消收益；⑤ ONNX 的输入 <code>x</code> 和输出 <code>out</code> 是 FP32，不额外设置时 engine 对外仍收发 FP32，只在内部转换，所以 <code>trt_check.py</code> 和以后的 C++ 程序不用改接口。</p>
         <p>要让接口也变成 FP16，得加 <code>--inputIOFormats=fp16:chw --outputIOFormats=fp16:chw</code>，这次没加。<code>--noTF32</code> 管的是仍保留 FP32 的那些层，保证它们和 FP32 基线条件一致。</p>
@@ -437,9 +434,8 @@ out = [ 2.002, 0.002, -0.999 ]   TensorRT FP16 输出
         <p>第三层，看最终任务：分类看 Top-1 和准确率，LLM 看困惑度和评测，机器人策略看动作误差、成功率和动作是否平稳。工程上的起点（经验值，不是标准）：FP32 engine 相对 L2 &lt; 1e-5；FP16 engine 相对 L2 不明显超过 PyTorch FP16 基线；INT8 先看任务指标再定能接受多少数值误差。</p>
         <p><strong>还没证明的</strong>：只测了单层，几十层叠起来误差会累积；数值接近不等于任务一样好；相对 L2 和余弦是在 Orin 上临时算的，没加进 <code>trt_check.py</code>；没有同一次运行的 PyTorch FP16 对照（要先给 <code>bench_layer.py</code> 加 dtype 参数，提了但没做）。</p>
         <p><strong>为什么到这里就停</strong>：这次要回答的三个问题（FP16 有没有收益、b8 慢是不是和矩阵乘 kernel 有关、FP16 误差正不正常）都有了答案。b8 仍慢于 PyTorch FP32 是这个测试用 decoder layer 的问题，不是项目目标；由此定下一条规则：每做一个实验先问"这个结果会改变下一步要做什么吗"，不会就记录下来，不继续追。下一步转 ACT 部署（模块 10）。</p>
-      </div>
-
-      <div class="blk"><h3>最后：Orin 结果（FP32 + noTF32，锁频，ms）</h3>
+        </section>
+        <section class="sub"><h4 class="subt">Orin 结果</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>形状</th><th class="num">eager engine（Myelin 生成 norm）</th><th class="num">ours engine（plugin）</th><th class="num">PyTorch eager（bench_layer）</th></tr></thead>
           <tbody>
@@ -451,8 +447,11 @@ out = [ 2.002, 0.002, -0.999 ]   TensorRT FP16 输出
         <p>eager engine 里，Myelin 把整层包成 1 个 ForeignNode。"1 层"不等于 1 个 kernel，里面还会启动很多个。norm 是 <code>__myl_bb0_3_MulMeaAddSqrDivMulMul</code>，名字就是 7 个操作的缩写，相当于 Inductor 的 <code>triton_red_fused_add_mean_mul_pow_rsqrt</code>。</p>
         <p>ours engine 里，Myelin 被 plugin 切成 17 段。第一个残差 Add 被包进 attention 那段 Myelin，第二个变成独立的 <code>/Add_1</code>。b8 快一倍多，并不是因为 norm 快，而是 MLP 三个矩阵乘离开 Myelin，交给了普通矩阵乘层（0.87 ms）；attention 段 b8 仍要 3.05 ms（推测同样是挑错 kernel）。<strong>矩阵乘选对 kernel 比少几个 kernel 重要得多</strong>，norm 只有几 μs。</p>
         <p>b8 下 TensorRT 两个 engine 都比 PyTorch eager（cuBLAS）慢。问题在 Myelin 对"FP32、禁 TF32、M=8"的选择，和 RMSNorm 无关。开 FP16 后矩阵乘换成了 Tensor Core kernel，b8 降到 2.44 ms（见上面的 FP16 基线）；开 TF32 的情况没测。</p>
+        </section>
       </div>
-      <div class="blk iv" id="m9-iv"><h3>面试要求</h3>
+
+      <div class="blk ch" id="m9-ch5"><h3><span class="chn">5</span>复习</h3>
+        <section class="sub iv" id="m9-iv"><h4 class="subt">面试要求</h4>
         <h4>必须会</h4>
         <ul class="plain">
           <li>什么时候需要 plugin：TensorRT 不支持的算子，或它实现得明显不好的地方。</li>
@@ -473,7 +472,9 @@ out = [ 2.002, 0.002, -0.999 ]   TensorRT FP16 输出
           <li>TensorRT 选错 kernel 时的手段（tactic 选择、timing cache、改形状）。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>eager、compile、ONNX 三条线各有哪些图？哪些和硬件无关、哪些绑定 GPU？Dynamo 是图吗？</li>

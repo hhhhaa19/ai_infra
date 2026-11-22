@@ -3,14 +3,13 @@
       <h2>PyTorch 接入、torch.compile 与端到端</h2>
       <p class="why"><strong>这一模块讲什么</strong>：前面解释了单个算子为什么快，这里回答下一个问题：把它用进真实工程以后，完整模型有没有变快？顺序是：先搭出 decoder layer，理解 prefill 和 decode，再看测量结果；然后解释融合和 compile，最后把算子正式注册进 PyTorch，并排查 graph break。</p>
       <p class="small muted">文件位置：<code>rmsnorm_ext.cu</code> → <code>src/rmsnorm/torch/ext.cu</code>，<code>rmsNormWarp.cu</code> → <code>src/rmsnorm/kernels.cu</code>。下面保留的旧名字是当时的记录。</p>
-
-      <div class="blk"><h3>第一步：写模型要用到的 PyTorch 基础</h3>
+      <div class="blk ch" id="m7-ch1"><h3><span class="chn">1</span>PyTorch 与模型</h3>
+        <section class="sub"><h4 class="subt">PyTorch 基础</h4>
         <p>写 decoder layer 之前，先要会用几个基础语法。<code>nn.Parameter</code> 把张量登记成模型参数，这样 <code>.cuda()</code> 和 <code>state_dict()</code> 才会带上它。<code>nn.Linear</code> 会自动创建 weight，形状是 [输出, 输入]。</p>
         <p>RMSNorm 里要用到广播。两个张量右对齐逐维比较，相等或有一边是 1 就能运算，是 1 的那一边沿该维重复使用，不会真的复制（stride=0）。scale 每行一个，形状是 <code>[rows,1]</code>，所以 <code>mean</code> 要写 <code>keepdim=True</code>；w 每列一个，形状是 <code>[n]</code>。两者都能广播到 <code>[rows,n]</code>。这里的乘法用 <code>*</code>，表示逐元素；<code>@</code> 才是矩阵乘法。</p>
         <p>Attention 要把一个维度拆成多个头：<code>[b,s,2048]</code> → reshape 成 <code>[b,s,16,128]</code> → transpose 成 <code>[b,16,s,128]</code> → SDPA → 再换回来。reshape 只是换一种切法，内存顺序不变；transpose 交换两个维度后，张量在内存里不再连续，这时再 reshape 就要拷贝。写 <code>b, s, h = x.shape</code> 解包时，还能顺便检查维数。</p>
-      </div>
-
-      <div class="blk"><h3>第二步：搭 decoder layer</h3>
+        </section>
+        <section class="sub"><h4 class="subt">搭建 decoder layer</h4>
         <p>有了这些基础，就能写一层 LLaMA 风格的 decoder。输入先经过 norm1 和 attention，再和原来的 x 相加；结果经过 norm2 和 mlp，再相加一次，这就是 pre-norm 加残差。</p>
 <pre><code>x ─┬─ norm1 ─ attn ─┐                         attn：q/k/v/o 四个投影 + SDPA(is_causal=True)
    └────────────────+─▶ x ─┬─ norm2 ─ mlp ─┐   mlp ：down( silu(gate(x)) * up(x) )，SwiGLU
@@ -18,18 +17,19 @@
 norm1 / norm2 是两个位置不同的 RMSNorm（各有 weight），impl 对两者相同
 hidden 2048、16 头 × 128、intermediate 5632，一层约 5138 万参数（FP32 约 205 MB）</code></pre>
         <p><code>impl</code> 决定两个 RMSNorm 用 eager 写法，还是用我们的算子。</p>
-      </div>
-
-      <div class="blk"><h3>第三步：prefill 和 decode 是什么</h3>
+        </section>
+        <section class="sub"><h4 class="subt">prefill 与 decode</h4>
         <p>先分清两个名字：<strong>decoder layer</strong> 是模型结构，<strong>decode</strong> 是运行阶段。一次生成分两段：prefill 把整段 prompt 一次送入，decode 之后每一步给每个请求送入 1 个新 token。两个阶段穿过同样的层、用同样的权重，只是输入形状不同。</p>
         <p>再说权重。同一层在两个阶段用同一套权重；不同层结构相同，但权重各有一套。所以参数量 = 每层 × 层数 + embedding / 输出层。开源模型主要发布的是权重、<code>config.json</code> 和分词器。</p>
         <p>这也解释了为什么可以放心替换算子：训练只改权重，不改公式。只要数学等价（eps 位置一致）、权重形状和含义一致、误差在容差内，就能换一种实现。测速时还可以用随机权重，因为计算量和读写量只看形状（MoE 路由除外）。但结论不能直接套到别的模型：hidden 变大时 RMSNorm 占比下降，走的分档也不同。数值验证（尤其 FP16）仍需要真实权重，这一点待验证。</p>
         <p>batch 是同时处理几个请求。decode 的主要成本是读一遍权重，b8 共用这一遍读取，所以只比 b1 慢约 24%，均摊到每个请求快很多。这就是批处理的意义。</p>
         <p>真实请求长度不同怎么办？hidden 由模型决定，大家都一样；会变的是 prompt 长度和历史长度。主流做法是把所有请求的 token 拼成一长条（packing），配一张 <code>cu_seqlens</code> 边界表。RMSNorm、投影、MLP 这些按行处理的算子不用知道边界，只有 Attention 要用 varlen 接口。</p>
         <p>在此之上还有连续批处理（prefill 与 decode 混排）、chunked prefill（长 prompt 切块、每步有 token 预算），更大规模时会把 prefill 和 decode 分开部署。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>第四步：调用是怎么走到 GPU 的</h3>
+      <div class="blk ch" id="m7-ch2"><h3><span class="chn">2</span>调用链与整层收益</h3>
+        <section class="sub"><h4 class="subt">从 Python 到 GPU 的调用链</h4>
         <p>现在看调用 <code>layer(x)</code> 时发生了什么。Python 一层层走到 <code>RMSNorm.forward</code>，再进入我们的算子，由 dispatcher 按张量类型选择实现，最后启动 kernel。</p>
 <pre><code>【现在（TORCH_LIBRARY）】
 DecoderLayer(impl="ours") → RMSNorm.__init__ → rms_norm_op() → load_rmsnorm()   # 建模型时就加载
@@ -46,18 +46,16 @@ ext().forward(x, w, eps) → C++ forward → …
 PYBIND11_MODULE 只把 C++ 函数交给 Python，PyTorch 本身不知道它存在，torch.compile 只能切断图。</code></pre>
         <p>有三点要注意。第一，张量本来就在 GPU 上，所以不需要 H2D / D2H；但必须用 <code>getCurrentCUDAStream()</code>，这样才能和前后的 PyTorch 运算保持顺序。第二，这个算子只有前向，训练时梯度会断在这里，要支持训练就得另写反向 kernel，并用 <code>autograd.Function</code> 配对，所以它是推理加速。</p>
         <p>第三，已知限制：没有同设备检查和 device guard；rows / n 转 int 缺大尺寸检查；只支持 FP32、连续存储。</p>
-      </div>
-
-      <div class="blk"><h3>第五步：测出来整层到底快了多少</h3>
+        </section>
+        <section class="sub"><h4 class="subt">整层收益</h4>
         <p><strong>prefill</strong>（1 × 512 token）是矩阵 × 矩阵，GPU 一直在忙。RMSNorm 只占约 2%，算子本身快 3.5 倍，整层也只快约 1.5%。这符合 Amdahl 定律：整体加速 = 1 / ((1−p) + p/s)，p 是占比，s 是该部分的加速倍数。占比太小，算子再快也没用。</p>
         <p><strong>decode</strong>（每次 1 个 token）不一样：它是向量 × 矩阵，每个 kernel 只要几 μs，但 CPU 发射一个 kernel 要几十 μs，所以 GPU 常常在等 CPU。eager 每层比 kernel 合计多约 170 μs，GPU 约 12% 的时间在等。</p>
         <p>我们把每层 kernel 从 34 个减到 24 个，不开 nsys 实测 b1 整层快约 10%、b8 约 2%。收益来自少发射，不是 kernel 变快。batch 越大，kernel 越大，GPU 越不空闲，这部分收益就越小。nsys 会放大发射开销，在它下面测得的 −23% / −20% 不能作为结论。</p>
         <p>由此可以判断瓶颈：wall 约等于 kernel 合计时，是 GPU 受限；wall 远大于 kernel 合计时，是 CPU 受限。</p>
         <p>decode 的 kernel 时间主要花在读权重：205 MB ÷ 约 190 GB/s ≈ 1.08 ms，实测 1.26 ms。cuBLAS 的名字也能看出来：GEMM 是矩阵 × 矩阵，GEMV 是矩阵 × 向量，前缀 s 表示 FP32。</p>
         <p>prefill 走 sgemm（计算受限）；decode b1 走 gemv（读权重受限，和 RMSNorm 一样受带宽限制）；b8 走扁矩阵的 sliced sgemm + splitK。这些 kernel 占整层 95% 以上，决定了换 RMSNorm 的收益上限。</p>
-      </div>
-
-      <div class="blk"><h3>第六步：减少开销的几种办法</h3>
+        </section>
+        <section class="sub"><h4 class="subt">减少开销的方法</h4>
         <p>上面的问题可以分成两类：kernel 之间搬数据太多，以及 CPU 发射太多。"搬运"指的是 GPU 内部显存（DRAM）和 SM 寄存器之间，不是 CPU 和 GPU 之间。kernel 结束时寄存器就清空，下一个 kernel 只能再从显存读。融合把多个运算合成一个 kernel，中间结果留在寄存器里；CUDA Graphs 录下一串 kernel，之后一次重放，省掉 CPU 发射。<code>torch.compile</code> 负责自动做融合。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>技术</th><th>解决什么</th><th>怎么做</th></tr></thead>
@@ -69,9 +67,11 @@ PYBIND11_MODULE 只把 C++ 函数交给 Python，PyTorch 本身不知道它存�
           </tbody>
         </table></div>
         <p>Triton 是比 CUDA 更容易写 kernel 的语言和编译器。Orin（ARM + CUDA 11.4 + Jetson torch）没有可用的 Triton，所以 <code>torch.compile</code> 跑不了，eager 和我们的扩展不受影响。<code>dynamic=False</code> 时形状写成常量，这和我们用模板参数是同一思路，只是我们提前编译好各个档位，它在运行时为每个形状编译一份。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>第七步：把算子注册进 PyTorch</h3>
+      <div class="blk ch" id="m7-ch3"><h3><span class="chn">3</span>注册自定义算子</h3>
+        <section class="sub"><h4 class="subt">注册进 PyTorch</h4>
         <p>最早我们用 PYBIND11，它只是把 C++ 函数交给 Python，PyTorch 本身不知道这个算子，<code>torch.compile</code> 只能切断图。后来改成 <code>TORCH_LIBRARY</code>，把它注册进 PyTorch 的算子系统，也就是 dispatcher。</p>
         <p>dispatcher 像一个前台：每个张量带着设备标签（CPU / CUDA / Meta），同一个算子可以为每种标签各注册一份实现，调用时按输入的标签选。<code>a + a</code> 在 CPU 和 GPU 上调用的就是两份代码。</p>
         <div class="tablewrap"><table>
@@ -112,9 +112,8 @@ TORCH_LIBRARY_IMPL(ai_infra, Meta, m) {  // ③ 输入是 Meta / Fake 张量：�
         <p><code>torch.ops</code> 是 dispatcher 里所有算子的总目录，<code>aten</code> 是 PyTorch 自带算子的分区（名字来自 C++ 核心库 ATen），<code>ai_infra</code> 是 <code>TORCH_LIBRARY(ai_infra, m)</code> 开的分区。<code>torch.rsqrt(x)</code> 只是 <code>torch.ops.aten.rsqrt(x)</code> 的短名字。C++ 里写 <code>aten::rsqrt</code>、<code>ai_infra::rms_norm</code>，Python 里写点号，指的是同一个东西。</p>
         <p>迁移时不是一步切换：先两种接口并存，确认 <code>torch.ops</code> 和原 forward 结果完全一致、Meta 能推形状；再把脚本全部改调 <code>torch.ops</code>；最后删除 PYBIND11，改用 <code>load(..., is_python_module=False)</code>。<code>torch.ops</code> 在 Orin CPU 上每次调用比 pybind 多约 10 μs，整层里 CPU 跑在 GPU 前面时被藏住了。</p>
         <p>注册本身和 <code>torch.compile</code> 无关：它用的是核心 dispatcher，Orin 的 torch 2.1 完全支持。Orin 缺的是 Triton。Dynamo 在 Orin 上能用，<code>backend="aot_eager"</code> 或 <code>torch._dynamo.explain</code> 可以检查图有没有被切断。</p>
-      </div>
-
-      <div class="blk"><h3>第八步：从 .cu 到 torch.ops 的完整过程</h3>
+        </section>
+        <section class="sub"><h4 class="subt">从 .cu 到 torch.ops</h4>
         <p>现在把编译、加载、调用串起来。编译只在代码变化时做一次，结果存在磁盘上；每个进程加载一次 <code>.so</code>，加载时自动注册；之后每次 forward 通过 dispatcher 调用。</p>
 <pre><code>【阶段 A：编译】一次性，结果存在磁盘上
   rmsnorm_ext.cu（#include rmsNormWarp.cu）
@@ -149,9 +148,8 @@ TORCH_LIBRARY_IMPL(ai_infra, Meta, m) {  // ③ 输入是 Meta / Fake 张量：�
           </tbody>
         </table></div>
         <p>编译和加载只是准备工作，<strong>注册才是让 PyTorch "认识"算子的关键</strong>：注册后它和 <code>aten::rsqrt</code> 在 dispatcher 里地位一样，eager、compile、导出都用同一套方式找它。</p>
-      </div>
-
-      <div class="blk"><h3>补充：load() 为什么要算源码哈希</h3>
+        </section>
+        <section class="sub"><h4 class="subt">源码哈希与重编</h4>
         <p>要解决的问题是：改了 kernel，程序却还在用旧版本，而且不报错。编译 <code>.so</code> 在 Orin 上约 40 秒，所以 <code>load()</code> 不会每次都编译，它只看两样东西有没有变：<code>sources</code> 里列出的文件和编译选项。我们的代码分在三个文件里，<code>load()</code> 不会跟着 <code>#include</code> 往里看：</p>
 <pre><code>ext.cu（列在 sources 里）
  └─ #include "../launch.cuh"（没列出）
@@ -168,16 +166,14 @@ load(..., extra_cuda_cflags=["-O2", "-lineinfo", f"-DRMSNORM_SRC_HASH={digest}"]
 第二次：文件没改，哈希不变 → 直接加载
 改一行 kernels.cu：哈希变成 9f8e7d6c5b4a → 选项变了 → 重新编译</code></pre>
         <p><code>-D名字=值</code> 相当于 <code>#define</code>，但代码里并不用这个宏，定义它只是为了让编译选项变化。以后新增被 include 的文件时要加进 <code>_DEPS</code>，否则又回到用旧 <code>.so</code> 的问题。CMake 会自动追踪 <code>#include</code> 依赖，所以 plugin 不用这样做。上面表格里的 <code>_DEPS</code> 是改名前的写法，现在是这三个文件。</p>
-      </div>
-
-      <div class="blk"><h3>补充：测试和 NVTX 具体是什么</h3>
+        </section>
+        <section class="sub"><h4 class="subt">测试与 NVTX</h4>
         <p><strong>23 形状 + 160 强制路径 + 5 输入检查</strong>是 <code>src/rmsnorm/torch/test.py</code> 的三组测试，都和 float64 的参考结果比。23 个形状测自动分档，让 <code>launchRMSNorm</code> 自己选，覆盖小 n、大 n、边界值、三维张量和空张量。</p>
         <p>160 个强制路径是因为自动分档时某个实现可能根本选不到，所以用 <code>impl</code> 强制指定：rows ∈ {1,3,4,5,64} × 10 种 n × 3 种实现 = 150 个，再加 5 种大 n × 2 种实现 = 10 个。</p>
         <p>5 个输入检查确保错误输入会报错，而不是算出错的结果：x 在 CPU 上、x 是 float16、weight 长度不对、非连续张量、强制 warp 版但 n &gt; 1024。</p>
         <p><strong>NVTX</strong> 是 NVIDIA 的打标签工具，在代码里标记"这段时间在做什么"，标签会显示在 nsys 时间线上。nsys 只能看到一堆 kernel，不知道它们属于模型哪一部分，所以 <code>profile_layer.py</code> 打上 <code>norm1</code>、<code>attn</code> 这样的标签，<code>analyze_nsys.py</code> 再归类：kernel → 用 correlationId 找到启动它的 CUDA 调用 → 看这个调用落在哪个 NVTX 范围里 → 算到对应模块。Orin 的 profiler 抓不到 GPU kernel，RMSNorm 占整层约 2% 就是这样统计出来的。</p>
-      </div>
-
-      <div class="blk"><h3>补充：nn.Parameter、rms_norm_op 和两条编译路</h3>
+        </section>
+        <section class="sub"><h4 class="subt">nn.Parameter 与两条编译路径</h4>
         <p>先看模块怎么定义。下面四行定义了一个 PyTorch 模块，并给它一个能被模型管理的权重：</p>
 <pre><code>class RMSNorm(nn.Module):                            # ① 继承 PyTorch 的模块基类，才有 .cuda()、.eval()、state_dict()
     def __init__(self, n):                           # ② RMSNorm(2048) 时运行，相当于 C++ 的构造函数
@@ -232,9 +228,8 @@ rms_norm_op()(x, self.weight, self.eps)   # 第一个括号拿到算子，第二
           </tbody>
         </table></div>
         <p>两条路共用 <code>kernels.cu</code> 和 <code>launch.cuh</code> 的源码，但各自编译出不同的 <code>.so</code>。<code>load()</code> 用 ninja，是因为 <code>.so</code> 必须和当前 PyTorch 的编译参数一致，这些参数由 PyTorch 自己生成，不用我们写 <code>CMakeLists.txt</code>。</p>
-      </div>
-
-      <div class="blk"><h3>第九步：排查 graph break</h3>
+        </section>
+        <section class="sub"><h4 class="subt">排查 graph break</h4>
         <p>注册之后，<code>graph_breaks.txt</code> 里还是显示 ours 被切成两段。这次排查的思路是：先确定问题在哪一层，再提出假设、验证，最后看实际影响。</p>
         <ol class="plain">
           <li><strong>现象</strong>：Quest 的 <code>graph_breaks.txt</code> 里 <code>impl=eager: graphs=1 graph_breaks=0 ops=20</code>，<code>impl=ours: graphs=2 graph_breaks=1 ops=14</code>，没有写原因。</li>
@@ -244,9 +239,11 @@ rms_norm_op()(x, self.weight, self.eps)   # 第一个括号拿到算子，第二
           <li><strong>影响范围</strong>：compile_layer.py 里第一次用到 ours 的是 explain，它顺带把扩展加载好了；之后计时的 compile+ours 抓图时已经加载，不会切断。所以之前"切断让 compile+ours 更慢、cg 要录两段"的说法不成立，已更正。</li>
           <li><strong>修法</strong>：在 <code>RMSNorm.__init__</code> 里 <code>if impl == "ours": rms_norm_op()</code>，先注册、再 compile、最后调用。新进程第 1 次 explain 就是 graphs=1；Quest 重跑耗时不变。</li>
         </ol>
+        </section>
       </div>
 
-      <div class="blk"><h3>最后：生产中怎么接入</h3>
+      <div class="blk ch" id="m7-ch4"><h3><span class="chn">4</span>生产接入</h3>
+        <section class="sub"><h4 class="subt">生产中的接入方式</h4>
         <p>回到工程上，同一个算子有三条接入路线，取决于上层系统：vLLM、SGLang 这类推理引擎走 eager 加自定义算子；PyTorch 程序走 <code>torch.compile</code>；边缘部署走 ONNX → TensorRT。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>路线</th><th>场景</th><th>需要做什么</th></tr></thead>
@@ -257,8 +254,11 @@ rms_norm_op()(x, self.weight, self.eps)   # 第一个括号拿到算子，第二
           </tbody>
         </table></div>
         <p>训练和推理一般分开：离线训练、整体替换模型；推荐系统通过参数服务器在线更新；大模型 RL 训练里，推理引擎和训练引擎交替运行并同步权重。</p>
+        </section>
       </div>
-      <div class="blk iv" id="m7-iv"><h3>面试要求</h3>
+
+      <div class="blk ch" id="m7-ch5"><h3><span class="chn">5</span>复习</h3>
+        <section class="sub iv" id="m7-iv"><h4 class="subt">面试要求</h4>
         <h4>必须会</h4>
         <ul class="plain">
           <li>PyTorch 调用一次算子走到 GPU 的路径：Python → dispatcher → 对应设备的实现 → kernel launch；CPU 开销从哪来。</li>
@@ -278,7 +278,9 @@ rms_norm_op()(x, self.weight, self.eps)   # 第一个括号拿到算子，第二
           <li>NVTX 标注、torch.profiler。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>nn.Module 的 forward 和扩展里注册的 forward 有什么区别？已经 m.def 注册了，为什么还要 ext()？</li>

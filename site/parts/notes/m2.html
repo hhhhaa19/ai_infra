@@ -2,27 +2,26 @@
       <div class="eyebrow">模块 2</div>
       <h2>环境与工程构建：Quest、Orin、CUDA、CMake</h2>
       <p class="why"><strong>这一模块讲什么</strong>：一段代码要变成能运行的程序，需要找到正确的编译器、头文件和库。下面按实际顺序走一遍：先准备环境，再写规则、生成构建文件、编译，最后运行。纯 C++ 推理不需要 PyTorch。</p>
-
-      <div class="blk"><h3>先分清几个软件各管什么</h3>
+      <div class="blk ch" id="m2-ch1"><h3><span class="chn">1</span>工具与环境</h3>
+        <section class="sub"><h4 class="subt">各软件的分工</h4>
         <p>GPU 驱动管理硬件；CUDA Toolkit 提供 <code>nvcc</code>、头文件和运行库；TensorRT 提供推理优化接口。<code>g++</code> 是 GCC 的 C++ 编译器。<code>.cu</code> 文件由 <code>nvcc</code> 处理，它在编译时也会调用主机的 C++ 编译器。</p>
-      </div>
-
-      <div class="blk"><h3>第一步：准备环境</h3>
+        </section>
+        <section class="sub"><h4 class="subt">准备环境</h4>
         <p>登录服务器后，shell 默认找不到我们需要的编译器和 SDK。<code>module load</code> 选择集群提供的工具，<code>source</code> 项目脚本设置自己安装的 SDK 路径。它们修改的是当前 shell 的环境变量，并没有安装软件。因为只影响当前 shell，所以 <code>source x.sh | tail</code> 这种写法没用：管道让脚本在子 shell 里执行，子 shell 结束后环境就没了。</p>
         <p>这些路径各有用途：<code>PATH</code> 用来找命令；include 目录用来找头文件；link 配置决定链接哪些库；<code>LD_LIBRARY_PATH</code> 是运行时找动态库的来源之一；<code>CUDA_ROOT</code> / <code>TENSORRT_ROOT</code> 是这个项目自己约定的变量。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>第二步：用 CMakeLists.txt 写规则</h3>
+      <div class="blk ch" id="m2-ch2"><h3><span class="chn">2</span>CMake 构建</h3>
+        <section class="sub"><h4 class="subt">CMakeLists.txt 规则</h4>
         <p>编译一个 TensorRT 程序要写很长的命令，文件多了很难手动维护，所以把规则写进 <code>CMakeLists.txt</code>：有哪些目标、用哪些源码、头文件在哪、链接哪些库。<code>add_executable</code> 只是登记一个目标，不会马上编译。<code>add_cuda_example</code> 是本项目写的辅助函数，不是 CUDA API。</p>
         <p>什么时候要改这个文件？只改函数内容时，不用动它，直接构建；新增一个独立程序时，要先加目标；换工具链时，用一个新的构建目录。</p>
-      </div>
-
-      <div class="blk"><h3>第三步：配置，生成构建规则</h3>
+        </section>
+        <section class="sub"><h4 class="subt">配置：生成构建规则</h4>
         <p>运行 <code>cmake -S . -B build-gcc</code>。CMake 读取 <code>CMakeLists.txt</code>，检查工具链，生成 Makefile，并把找到的路径缓存到 <code>CMakeCache.txt</code>。这一步不编译代码。<code>build-gcc</code> 只是目录名，不会因为名字里有 gcc 就选 GCC；实际用哪个编译器要看配置结果，所以 <code>g++ --version</code> 也不能证明 CMake 用的是它。</p>
         <p>GPU 架构也在这里决定：<code>CMAKE_CUDA_ARCHITECTURES=80</code> 对应 A100，<code>87</code> 对应 Orin。它选择的是设备代码的目标架构，和 Slurm 实际分到哪张卡是两回事。<code>-D</code> 只设置配置变量，也不会帮你安装 SDK。</p>
-      </div>
-
-      <div class="blk"><h3>第四步：编译和运行</h3>
+        </section>
+        <section class="sub"><h4 class="subt">编译和运行</h4>
         <p>运行 <code>cmake --build build-gcc --target X</code>，CMake 调用 Make，Make 再调用 <code>nvcc</code>、<code>g++</code> 和链接器，生成程序。如果只保存了源码却没有构建，运行的还是旧二进制。GPU 程序还要在分配到的 GPU 节点上运行，不能在登录节点上跑。</p>
 <pre><code>【Quest 作业】
 squeue -u "$USER"
@@ -33,9 +32,8 @@ srun --jobid=实际ID --overlap --ntasks=1 --pty bash -l     # 附加到已有�
 【Orin 锁频 / 恢复】
 sudo nvpmodel -m 0 &amp;&amp; sudo jetson_clocks       # 测前
 sudo jetson_clocks --restore                   # 测完</code></pre>
-      </div>
-
-      <div class="blk"><h3>把配置和构建再拆开看</h3>
+        </section>
+        <section class="sub"><h4 class="subt">配置与构建的分工</h4>
         <p>运行 <code>cmake -S . -B build</code> 时命令里不用写文件名：<code>-S</code> 给源码目录，CMake 自己在里面找固定名字的 <code>CMakeLists.txt</code>，大小写不能错；<code>-B</code> 给构建目录，不存在就创建。CMake 会把这个文件当脚本从头到尾执行一遍，主要做四件事：</p>
         <ol class="plain">
           <li><strong>检查编译环境</strong>：<code>project(... LANGUAGES CXX CUDA)</code> 去找 <code>g++</code> 和 <code>nvcc</code>，并试编译一个小程序。</li>
@@ -45,9 +43,8 @@ sudo jetson_clocks --restore                   # 测完</code></pre>
         </ol>
         <p>所以 <code>build/</code> 是第一条命令创建的，但里面还没有成品。<code>cmake --build build</code> 才调用 make / ninja，再由它们调用 <code>nvcc</code>、<code>g++</code>，这时才真正编译和链接。改了 <code>.cu</code> 或 <code>.cpp</code> 后只要再跑第二条，它只重编改动过的文件；改了 <code>CMakeLists.txt</code>，第二条通常也会自动重新配置。</p>
         <p>找到的路径缓存在 <code>build/CMakeCache.txt</code>，环境变了（比如换 CUDA 版本）却还用旧路径时，可以删掉 <code>build/</code> 重新配置。</p>
-      </div>
-
-      <div class="blk"><h3>库：.a、.so 和 dlopen</h3>
+        </section>
+        <section class="sub"><h4 class="subt">静态库、动态库与 dlopen</h4>
         <p>配置里声明的目标有两种：<code>add_executable(app main.cpp)</code> 生成可执行文件，<code>add_library</code> 生成库。库的类型由第二个参数决定，生成的文件名前缀 <code>lib</code> 和后缀是 CMake 按 Linux 惯例加的。不写类型时由 <code>BUILD_SHARED_LIBS</code> 决定，没设置就生成静态库。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>写法</th><th>文件</th><th>代码什么时候进入程序</th><th>改了库以后</th></tr></thead>
@@ -60,9 +57,11 @@ sudo jetson_clocks --restore                   # 测完</code></pre>
         <p>打开 <code>.so</code> 时，系统初始化里面的全局变量，<code>REGISTER_TENSORRT_PLUGIN</code> 定义的全局对象构造时把 creator 注册给 TensorRT，之后 Parser 才找得到它。所以 trtexec 一行代码没改，就能用上我们的算子。</p>
         <p><code>.a</code> 只是给链接器用的归档文件，不能用 dlopen 打开。<code>build_engine.cpp</code> 的源码在自己手里，所以链接时带上或 dlopen 都可以。</p>
 <pre><code>void* h = dlopen("./librmsnorm_plugin.so", RTLD_LAZY);   // 运行到这一行才打开文件，编译时不用知道这个库</code></pre>
+        </section>
       </div>
 
-      <div class="blk"><h3>三个平台的环境</h3>
+      <div class="blk ch" id="m2-ch3"><h3><span class="chn">3</span>平台、排错与同步</h3>
+        <section class="sub"><h4 class="subt">三个平台的环境</h4>
         <p>这些步骤在不同平台上都一样，只是环境入口不同。Quest 做 C++ / TensorRT 和 PyTorch 交叉验证，Orin 是主力平台。Orin 上的 torch 2.1 wheel 没有 Triton，所以 <code>torch.compile</code> 跑不了，profiler 也抓不到 GPU kernel。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>平台</th><th>怎么进入</th><th>要点</th></tr></thead>
@@ -71,9 +70,9 @@ sudo jetson_clocks --restore                   # 测完</code></pre>
             <tr><td>Quest（PyTorch）</td><td class="mono">source scripts/env_quest.sh</td><td>共享 conda 环境 aiIfa：torch 2.14.1+cu130、Triton 3.8.0；加载 cuda/13.0、gcc 12.4、ninja；不要往共享环境里 pip install</td></tr>
             <tr><td>Orin</td><td class="mono">source ~/venvs/ai_infra/bin/activate</td><td>JetPack 5.1.2、CUDA 11.4；NVIDIA 的 Jetson torch 2.1 wheel（无 Triton，profiler 抓不到 GPU kernel）；测性能前必须锁频</td></tr>
           </tbody>
-        </table></div></div>
-
-      <div class="blk"><h3>出错时怎么排查</h3>
+        </table></div>
+        </section>
+        <section class="sub"><h4 class="subt">排错方法</h4>
         <p>按这个流程想：先看是配置、编译、链接还是运行阶段报错，再对应查找。这些是实际踩过的问题：</p>
         <div class="tablewrap"><table>
           <thead><tr><th>现象</th><th>阶段</th><th>原因和处理</th></tr></thead>
@@ -84,13 +83,15 @@ sudo jetson_clocks --restore                   # 测完</code></pre>
             <tr><td>环境脚本好像没生效</td><td>环境</td><td><code>source x.sh | tail</code> 在子 shell 里执行，环境不会留下</td></tr>
             <tr><td>改了被 include 的 <code>.cu</code>，torch 扩展不重编</td><td>构建</td><td><code>load()</code> 只看列出的源文件，把依赖文件的哈希放进编译选项</td></tr>
           </tbody>
-        </table></div></div>
-
-      <div class="blk"><h3>代码怎么同步</h3>
+        </table></div>
+        </section>
+        <section class="sub"><h4 class="subt">代码同步</h4>
         <p>Orin 和 Quest 都不存 GitHub 凭据。流程是：在 Orin 提交，由你自己 <code>git push</code>，Quest 再用 <code>git pull --ff-only</code> 更新。提交身份用 <code>git config --global user.name / user.email</code> 设置，它只是署名，不等于远端认证。</p>
+        </section>
       </div>
 
-      <div class="blk iv" id="m2-iv"><h3>面试要求</h3>
+      <div class="blk ch" id="m2-ch4"><h3><span class="chn">4</span>复习</h3>
+        <section class="sub iv" id="m2-iv"><h4 class="subt">面试要求</h4>
         <h4>必须会</h4>
         <ul class="plain">
           <li>CMake 的"配置"和"构建"是两步：配置执行 CMakeLists.txt、找依赖、生成构建规则；构建才调用编译器和链接器。</li>
@@ -108,7 +109,9 @@ sudo jetson_clocks --restore                   # 测完</code></pre>
           <li>容器能换什么、不能换什么（换得了 Python / 库，换不了驱动和 JetPack）。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>配置、构建和运行分别做什么？为什么 g++ --version 不能证明 CMake 用的是 GCC？</li>

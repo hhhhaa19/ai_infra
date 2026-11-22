@@ -2,8 +2,8 @@
       <div class="eyebrow">模块 15</div>
       <h2>核心算子：Scan（前缀和）</h2>
       <p class="why"><strong>主线</strong>：scan 求每个位置的前缀和。reduction 只要最后一个总和，scan 要保留每一个中间结果。串行写法是一条长度 n 的依赖链，能并行是因为加法满足结合律、顺序可以重排：先在小范围里算局部前缀和，再把各段拼起来。和 softmax 一样是带宽问题，优化同样沿"分工"（一个 block / 一个 warp / 多个 block）和"算法"（读几遍、几个 kernel）两个方向走。</p>
-
-      <div class="blk" id="m15-s0"><h3>结果总览</h3>
+      <div class="blk ch" id="m15-ch1"><h3><span class="chn">1</span>概念</h3>
+        <section class="sub" id="m15-s0"><h4 class="subt">结果总览</h4>
         <p>计时长度 1M、16M、64M 个 int，参考是 CUB 的 <code>cub::DeviceScan::InclusiveSum</code> 和同样数据量的 copy（Orin，锁频 1300 MHz，GB/s，括号是占 copy 的比例）。① ② ③ 已完成；④ 只讲了思路，暂不写。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>版本</th><th>分工</th><th>做法</th><th>能处理的 n</th><th>结果</th></tr></thead>
@@ -15,22 +15,22 @@
             <tr><td>CUB（参考）</td><td>—</td><td>look-back + 每线程多个数</td><td>任意</td><td>1M 138（84%）、16M 159（82%）、64M 159（84%）</td></tr>
           </tbody>
         </table></div>
-      </div>
-
-      <div class="blk"><h3>定义：inclusive 和 exclusive</h3>
+        </section>
+        <section class="sub"><h4 class="subt">inclusive 与 exclusive</h4>
 <pre><code>输入：      [3, 1, 7,  0,  4,  1,  6,  3]
 inclusive： [3, 4, 11, 11, 15, 16, 22, 25]   第 i 个 = in[0] + … + in[i]，包含自己
 exclusive： [0, 3, 4,  11, 11, 15, 16, 22]   第 i 个 = in[0] + … + in[i-1]，不含自己，前面补 0</code></pre>
         <p>两者只差一位：exclusive 就是 inclusive 整体右移一格、前面补 0。reduction 的结果 25 就是 inclusive 的最后一个数。</p>
-      </div>
-
-      <div class="blk"><h3>为什么难并行，又为什么能并行</h3>
+        </section>
+        <section class="sub"><h4 class="subt">并行的前提：结合律</h4>
         <p>CPU 上只有一行：<code>out[i] = out[i-1] + in[i]</code>。每一步都要等上一步的结果，形成一条长度 n 的依赖链，看起来没法并行。</p>
         <p>但加法满足结合律：<code>(3 + 1) + (7 + 0)</code> 和 <code>((3 + 1) + 7) + 0</code> 一样。所以可以先让不同线程各算一小段的部分和，再把这些部分和拼起来——这和 reduction 用树形规约是同一个道理，区别只是 scan 要让<strong>每个位置</strong>都拿到"从头到自己"的和。</p>
         <p class="small muted">测试用 int 而不用 float：浮点加法换顺序结果会差一点，int 可以和 CPU 串行结果逐个精确比较。</p>
+        </section>
       </div>
 
-      <div class="blk" id="m15-s1"><h3>算法 1：Hillis-Steele（步数少，加法多一些）</h3>
+      <div class="blk ch" id="m15-ch2"><h3><span class="chn">2</span>算法</h3>
+        <section class="sub" id="m15-s1"><h4 class="subt">Hillis-Steele</h4>
         <p>每一步，每个位置加上它左边距离为 offset 的那个数，offset 依次是 1、2、4…：</p>
 <pre><code>初始：       3   1   7   0   4   1   6   3
 offset=1：   3   4   8   7   4   5   7   9    每个数加上左边第 1 个
@@ -100,18 +100,16 @@ for (int off = 1; off &lt; 32; off *= 2) {
     if (lane &gt;= off) x += y;                      // 所以要判断，不能无条件加
 }</code></pre>
         <p class="small muted">和 softmax 的区别：softmax 规约要每个 lane 都拿到同一个总和，用 <code>__shfl_xor_sync</code>；scan 要每个 lane 拿到不同的前缀和，用 <code>__shfl_up_sync</code>。</p>
-      </div>
-
-      <div class="blk"><h3>算法 2：Blelloch（加法少，但分两个阶段）</h3>
+        </section>
+        <section class="sub"><h4 class="subt">Blelloch</h4>
         <ul class="plain">
           <li><strong>up-sweep</strong>：就是一次树形 reduction，沿途把各级的部分和留在数组里（位置 1、3、5、7 存相邻两个的和，位置 3、7 存四个的和，位置 7 存总和）。</li>
           <li><strong>down-sweep</strong>：把根置 0，从根往下走：每个节点把自己的值交给左孩子，把"自己的值 + 左孩子原来的和"交给右孩子。走到底得到 exclusive scan。</li>
           <li><strong>代价</strong>：总加法约 2n，和串行同一量级（work-efficient）；但步数是 2·log n，实现也更复杂。</li>
           <li><strong>GPU 上怎么选</strong>：warp 内 32 个线程本来就同时在算，Hillis-Steele 多做的加法没有额外代价，步数少更快；Blelloch 在数据量大、线程不够用时省加法，教材里出现得多。（没有实测对比。）</li>
         </ul>
-      </div>
-
-      <div class="blk" id="m15-proof"><h3>为什么对：两种算法的证明</h3>
+        </section>
+        <section class="sub" id="m15-proof"><h4 class="subt">正确性证明</h4>
         <p>两个证明用同一个思路：找一个<strong>每一步结束后都成立的性质（不变式）</strong>，证明每一步都保持它，最后一步时它正好就是答案。记号：<code>S[a..b]</code> = x[a] + … + x[b]，下标小于 0 的部分截掉。</p>
         <p><strong>Hillis-Steele</strong>。不变式：offset = d 这一步开始前，<code>buf[i] = S[i−d+1 .. i]</code>，即"以 i 结尾、长度为 d 的一段"的和（不够 d 时从 0 开始）。</p>
         <ul class="plain">
@@ -136,9 +134,8 @@ down-sweep 块长 8：[3, 4, 7, 0, 4, 5, 6,11]
            块长 2：[0, 3, 4,11,11,15,16,22]    exclusive ✓</code></pre>
         <p>加法次数：up-sweep 和 down-sweep 各 n − 1 次，共约 2n；Hillis-Steele 是 n·log₂n（n = 1024 时约 1 万次，多 5～10 倍，但只有 10 步）。</p>
         <div class="note"><strong>两个证明的共同点</strong>：只用到结合律，没用交换律（左右两段的顺序始终不变）。所以把加法换成任何满足结合律的运算，scan 都成立：max、min、乘法、矩阵乘法，online softmax 的 (m, d) 合并、FlashAttention 的分块合并也是这一类，所以它们能分块并行。浮点加法不严格满足结合律，换顺序结果可能差最后一位，这也是测试用 int 的原因。</div>
-      </div>
-
-      <div class="blk" id="m15-s2"><h3>大数组：分三级，或者 decoupled look-back</h3>
+        </section>
+        <section class="sub" id="m15-s2"><h4 class="subt">大数组：三级与 look-back</h4>
         <p>一个 block 最多 1024 个线程，处理不了整个数组，要把数组分段，每个 block 一段：</p>
 <pre><code>① 每个 block 各自 scan 自己那一段，同时把这一段的总和（block sum）写到 work[blockIdx.x]
 ② 对 work[] 再做一次 exclusive scan → 得到每个 block 的"起始偏移"
@@ -154,9 +151,11 @@ down-sweep 块长 8：[3, 4, 7, 0, 4, 5, 6,11]
           <li><strong>decoupled look-back</strong>（CUB 的做法）：只用一个 kernel。每个 block 算完自己这段的和就公布出去；然后往前看前面的 block：前一个已经公布了"含前面所有的累计前缀"就直接用，只公布了"自己这段的和"就先加上、继续往前看。不用等前面所有 block 全部完成，数据只读一遍、写一遍。这是这个算子里最难的部分（要处理 block 的调度顺序和内存可见性），列为可选。</li>
         </ul>
         <p class="small muted">测试长度特意选了 1024、1025（刚好超过一个 block）、4097、100003、5000011（block 和多到需要再分一层）。出错时打印第一个错的位置：比如第一个错在 i = 1024，基本就能确定是 block 之间的衔接（② 或 ③）出了问题。</p>
+        </section>
       </div>
 
-      <div class="blk" id="m15-s3"><h3>实测：① block 和 ② multi</h3>
+      <div class="blk ch" id="m15-ch3"><h3><span class="chn">3</span>实现与实测</h3>
+        <section class="sub" id="m15-s3"><h4 class="subt">① block 与 ② multi</h4>
         <p><strong>① block</strong>（一个 block，1024 个线程，shared memory 里 Hillis-Steele）。写 block 版时常见的 6 处错误：</p>
         <ul class="plain">
           <li><code>__shared__ float [BLOCK] buf;</code> → <code>__shared__ int buf[BLOCK];</code>（类型是 int，方括号在变量名后）。</li>
@@ -201,9 +200,8 @@ down-sweep 块长 8：[3, 4, 7, 0, 4, 5, 6,11]
           <li>每个线程只处理 1 个数，却要做约 10 次 shared 读写，Hillis-Steele 的 n·log n 次加法在这里体现出来。</li>
         </ol>
         <p>64M 比 16M 更慢（12% 对 16%），可能和多一层递归有关，没有查。CUB 到 84% 是因为 look-back 只读一遍写一遍、每个线程处理很多个数（先在寄存器里串行累加）、warp 内用 shuffle 基本不用 <code>__syncthreads()</code>。</p>
-      </div>
-
-      <div class="blk" id="m15-s4"><h3>③ warp 版：设计和实测</h3>
+        </section>
+        <section class="sub" id="m15-s4"><h4 class="subt">③ warp 版</h4>
         <p>目标是修好 scan_local 自己慢的问题。三步结构不变，显存仍是 4n 次访问，上限还是 copy 的约 50%；剩下一半留给 ④ look-back。参数：BLOCK = 256 个线程，每线程 ITEMS = 4 个数，每个 block 负责 1024 个数。block 内部 5 步（下面的例子假设一个 warp 只有 4 个 lane）：</p>
 <pre><code>第 0 步  每个线程用 int4 读连续 4 个数
          lane 0 [3,1,7,0]   lane 1 [4,1,6,3]   lane 2 [2,5,1,1]   lane 3 [0,2,2,4]
@@ -256,9 +254,8 @@ off = 4：    3   4  11  11  15  16  22  25     lane ≥ 4 加上左边第 4 个
           <li><strong>为什么快</strong>：② 的瓶颈在 scan_local 自己（同步多、每 SM 只能放 1 个 1024 线程的 block、n·log n 次 shared 读写），③ 把这几项都去掉了。</li>
           <li><strong>数字</strong>：16M 时 31.6 → 68.6 GB/s（2.2×）。三步结构读写 4n 次，上限约 copy 的 50%，16M 理想约 1.4 ms、实际 1.96 ms，已到上限的约 70%。剩下的差距推测在 ③ <code>add_offset</code>（还是每线程 1 个数、普通 int 读写），<strong>要把三个 kernel 分开计时才能确认</strong>。64M 两个版本都掉到 27% / 12%，copy 没掉；转置 8192²（同为 256 MB）也只有 80%，可能同一原因（猜测 TLB），没查。</li>
         </ol>
-      </div>
-
-      <div class="blk" id="m15-s5"><h3>④ decoupled look-back 的思路（暂不写）</h3>
+        </section>
+        <section class="sub" id="m15-s5"><h4 class="subt">④ decoupled look-back（未实现）</h4>
         <p><strong>要解决的问题</strong>：三级方案里 ③ 必须等所有 block 的 ① 做完，block 之间不能在一个 kernel 里互相等，只好拆成 3 个 kernel，Y 写完还要再读一遍、改一遍。如果一个 block 在写出结果之前就能知道"前面所有 block 的总和"，就只需要读一遍、写一遍。</p>
         <p><strong>想法 1：接力</strong>。block b 等 block b−1 公布"到它为止的前缀和"，加上自己的再公布。这是一条串行链：64M 时 6 万多个 block 依次接力，每一棒都要经过一次显存，加起来比三级方案还慢。</p>
         <p><strong>想法 2：解耦</strong>。关键是一个 block 自己这段的总和不需要等任何人就能算出来。所以每个 block 公布两种信息：</p>
@@ -289,17 +286,18 @@ block 3 往前看：30（A）→ 20（A）→ 10（P，停），excl = 60，公�
         <p><strong>和 double buffering 不是一回事</strong>：double buffering 在一个 block 内部，让搬下一块和算这一块重叠；look-back 是 block 之间的通信协议，省掉的是一整个 kernel 和一遍读写。</p>
         <p>更贴切的类比是加法器：接力像逐位进位，look-back 像跳跃进位。一句话：把"自己的部分"和"依赖别人的部分"拆开，自己的部分先公布，依赖别人的部分往前查到第一个已确定的结果就停。CUB 还让一个 warp 同时往前看 32 个 block、再用 shuffle 加起来。</p>
         <p class="small muted">决定先不写 ④：思路已经讲清，难点在内存可见性和调度细节，调试耗时，而之后的卷积和 attention 用不上它。scan 在 ③ 收尾。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>推理里用在哪</h3>
+      <div class="blk ch" id="m15-ch4"><h3><span class="chn">4</span>复习</h3>
+        <section class="sub"><h4 class="subt">推理中的用途</h4>
         <ul class="plain">
           <li><strong>top-p 采样</strong>：概率从大到小排序后求累计和，找到第一个超过 p 的位置，只在它之前的词里采样。</li>
           <li><strong>MoE 分发</strong>：先统计每个专家分到几个 token，再做一次 exclusive scan，就得到每个专家在连续缓冲区里的起始位置，每个 token 知道自己该写到哪里。</li>
           <li><strong>stream compaction / radix sort</strong>：每个元素标 0 / 1（留不留、这一位是 0 还是 1），对标记做 exclusive scan，结果就是它该写到的下标。</li>
         </ul>
-      </div>
-
-      <div class="blk iv" id="m15-iv"><h3>面试要求</h3>
+        </section>
+        <section class="sub iv" id="m15-iv"><h4 class="subt">面试要求</h4>
         <p>scan 是 reduction 的延伸，常和 reduction、softmax 一起考；三级方案也是"多 block 之间怎么协作"的典型例子。</p>
         <h4>必须会</h4>
         <ul class="plain">
@@ -322,7 +320,9 @@ block 3 往前看：30（A）→ 20（A）→ 10（P，停），excl = 60，公�
           <li>测试设计：用 int 精确比较、打印第一个错的位置来定位 block 衔接问题、选刚好跨越 block 边界的长度。</li>
         </ul>
         <p class="small muted">三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>[3, 1, 7, 0, 4, 1, 6, 3] 的 inclusive 和 exclusive scan 各是什么？两者什么关系？</li>

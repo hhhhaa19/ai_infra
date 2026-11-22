@@ -2,24 +2,24 @@
       <div class="eyebrow">模块 6</div>
       <h2>性能测量：基线、对照与轮次波动</h2>
       <p class="why"><strong>这一模块讲什么</strong>：结果正确后，怎样测量性能、定位瓶颈。先定义测的是什么，再排除干扰，然后看实验结果，最后总结成规则。</p>
-
-      <div class="blk"><h3>第一步：先想清楚测的是哪段时间</h3>
+      <div class="blk ch" id="m6-ch1"><h3><span class="chn">1</span>测量方法</h3>
+        <section class="sub"><h4 class="subt">确定计时区间</h4>
         <p>性能数字要先说清楚测的是什么。<code>enqueueV3</code> 只是把任务提交给 GPU，CPU 很快就返回，所以不能只计 CPU 调用耗时。我们用 CUDA event：在 stream 上放两个事件，测它们之间的区间，也就是 GPU 这一段。这段时间可能包含提交不足造成的空隙。</p>
         <p>测 kernel 时有两种方式。<strong>single</strong> 用事件包住一次 kernel 并等待；<strong>batch</strong> 包住连续 N 次同流 launch，再除以 N。batch 是均摊值，它的 P95 不是单次的 P95，所以两者不能直接比。nearest-rank P95 的取法是：200 个样本排序后取第 190 个（索引 189）。</p>
-      </div>
-
-      <div class="blk"><h3>第二步：排除干扰</h3>
+        </section>
+        <section class="sub"><h4 class="subt">排除干扰</h4>
         <p>只测一次的数字不可靠，所以要多层重复，每一层防一种干扰：每个样本连续 N 次前向再除以 N，减少计时点误差；30 个样本取中位数，防止偶发打断；3 轮交替顺序，防止先测的吃亏；3 个独立进程，防止整次运行偏快或偏慢。保留全部轮次，报告稳定区间和异常，不只挑最快值。</p>
         <p>还要分清几种状态。重复用同一份输入会享受硬件缓存，构建、启动、稳态耗时要分开报告。Timing Cache 是构建 engine 时的实现计时信息，不是推理结果缓存。</p>
-      </div>
-
-      <div class="blk"><h3>第三步：看工具时别误读</h3>
+        </section>
+        <section class="sub"><h4 class="subt">工具读数的误区</h4>
         <p>GPU-Util 和 occupancy 都不等于有效算力效率。时间线上 <code>cudaStreamSynchronize</code> 的长条表示 CPU 在等 GPU；GPU 上的空档也可能是 GPU 在等 CPU。</p>
         <p>nsys 的数据要分开看：kernel 执行时间由 GPU 记录，可信，可以用来算占比；整层墙钟时间被每次发射的拦截开销拉长，不能用来报加速比。所以 nsys 用来找瓶颈，计时用 CUDA event。</p>
         <p>下面按时间顺序看实际结果：先是 ResNet-50 部署基线，再到 CUDA benchmark、shared / warp 归约和 RMSNorm。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>ResNet-50 推理（A100-PCIE-40GB，Batch=1）</h3>
+      <div class="blk ch" id="m6-ch2"><h3><span class="chn">2</span>实测记录</h3>
+        <section class="sub"><h4 class="subt">ResNet-50 推理</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>实验</th><th>结果（Median，ms）</th><th>说明</th></tr></thead>
           <tbody>
@@ -27,12 +27,12 @@
             <tr><td>pageable vs pinned 同步拷贝，三轮</td><td class="num">1.959/1.837；1.962/1.848；1.956/1.846</td><td>pinned 中位数低约 5.6～6.2%</td></tr>
             <tr><td>pinned 同步 vs 单流异步，三轮</td><td class="num">1.843/1.830；1.835/1.831；1.836/1.826</td><td>差异小，不能推断通用加速；第一轮同步 P95 3.143</td></tr>
           </tbody>
-        </table></div></div>
-
-      <div class="blk"><h3>CUDA benchmark 与预热</h3>
-        <p>百万元素 128 线程首轮 single Mean 18.78 μs、batch 14.35 μs，后两轮约 11 μs、8.58 μs。预热对照（72 组 PASS）：原预热 18.60 / 14.42，加长预热 10.96 / 8.40，再加长 10.98 / 8.45，最后恢复原预热 11.11 / 8.57 μs。支持"初始状态影响测量"，但顺序和残留热状态没有独立控制。</p></div>
-
-      <div class="blk"><h3>shared vs warp 规约（A100，四轮中位数，μs）</h3>
+        </table></div>
+        </section>
+        <section class="sub"><h4 class="subt">benchmark 与预热</h4>
+        <p>百万元素 128 线程首轮 single Mean 18.78 μs、batch 14.35 μs，后两轮约 11 μs、8.58 μs。预热对照（72 组 PASS）：原预热 18.60 / 14.42，加长预热 10.96 / 8.40，再加长 10.98 / 8.45，最后恢复原预热 11.11 / 8.57 μs。支持"初始状态影响测量"，但顺序和残留热状态没有独立控制。</p>
+        </section>
+        <section class="sub"><h4 class="subt">shared 与 warp 规约</h4>
         <div class="tablewrap"><table>
           <thead><tr><th class="num">N</th><th>模式</th><th class="num">shared</th><th class="num">warp</th><th class="num">下降</th></tr></thead>
           <tbody>
@@ -44,9 +44,9 @@
             <tr><td class="num">16000003</td><td>batch</td><td class="num">131.092</td><td class="num">99.471</td><td class="num win">24.12%</td></tr>
           </tbody>
         </table></div>
-        <p class="small muted">小数组 single 两版都约 5.12 μs。大数组包含 3 个 kernel 阶段。机制假设：shared 读写减少、block 屏障从 9 次减为 4 次；未用 ncu 证实。</p></div>
-
-      <div class="blk"><h3>RMSNorm 测量记录</h3>
+        <p class="small muted">小数组 single 两版都约 5.12 μs。大数组包含 3 个 kernel 阶段。机制假设：shared 读写减少、block 屏障从 9 次减为 4 次；未用 ncu 证实。</p>
+        </section>
+        <section class="sub"><h4 class="subt">RMSNorm 测量</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>A100 可变行宽</th><th class="num">128 线程</th><th class="num">256</th><th class="num">512</th></tr></thead>
           <tbody>
@@ -86,9 +86,12 @@
             <tr><td class="mono">4096, 4096, 512</td><td class="num">915.4</td><td class="num">696.8</td><td class="num">696.9</td></tr>
           </tbody>
         </table></div>
-        <p class="small">之后的 own_reg、padding、L2 扫描、PyTorch 单算子和 decoder layer 结果见 <a href="#data">RMSNorm · 实测数据</a>。</p></div>
+        <p class="small">之后的 own_reg、padding、L2 扫描、PyTorch 单算子和 decoder layer 结果见 <a href="#data">RMSNorm · 实测数据</a>。</p>
+        </section>
+      </div>
 
-      <div class="blk"><h3>四层工具怎么配合</h3>
+      <div class="blk ch" id="m6-ch3"><h3><span class="chn">3</span>工具与规则</h3>
+        <section class="sub"><h4 class="subt">四层工具的配合</h4>
         <p>前面实验用到的工具分别回答不同的问题。一般顺序是：先用 CUDA event 确认差距有多大，再用 nsys 找瓶颈在哪；问题在 kernel 内部时用 ncu 看原因，最后看 SASS 确认编译器到底生成了什么，改完再用 CUDA event 验证。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>工具</th><th>回答什么</th><th>典型用法</th><th>不能用来做什么</th></tr></thead>
@@ -148,13 +151,15 @@ PyTorch 里实际要多久            → torch.cuda.Event
           </tbody>
         </table></div>
         <p>所以 Quest 做 compile 对比，用 profiler 数 kernel、CUDA event 计时；Orin 做开发和 TensorRT，用 nsys + NVTX 把 kernel 归到模块、CUDA event 计时、ncu 看 kernel 内部。</p>
-      </div>
-
-      <div class="blk"><h3>最后：从这些实验里总结的规则</h3>
+        </section>
+        <section class="sub"><h4 class="subt">测量规则总结</h4>
         <p>每次实验都按这个顺序做。先保证正确，再测性能：用 float64 做参考，输出先写 NaN，再逐元素比对，这样漏写和算错都能发现。测量时 Orin 要锁频，并记录开始和结束频率；比较要在同一次运行内进行，关键结论再用 3 个独立进程确认。</p>
         <p>结果出来后算有效带宽和峰值比。超过峰值说明数据还在 L2（Orin 约 3.5 MiB），这类形状要单独列出来。解释时要记住工具条件不同：bench 是热缓存、最高频率；ncu 默认冷缓存、基础频率，kernel replay 还会打乱 L2；nsys 会放大发射开销。最后，静态指令条数不是动态执行次数，加载指令少也不代表读的字节少。</p>
+        </section>
       </div>
-      <div class="blk iv" id="m6-iv"><h3>面试要求</h3>
+
+      <div class="blk ch" id="m6-ch4"><h3><span class="chn">4</span>复习</h3>
+        <section class="sub iv" id="m6-iv"><h4 class="subt">面试要求</h4>
         <p>这是区分"做过"和"跑过"的关键模块，面试官很喜欢追问"你怎么测的"。</p>
         <h4>必须会</h4>
         <ul class="plain">
@@ -175,7 +180,9 @@ PyTorch 里实际要多久            → torch.cuda.Event
           <li>统计意义：波动多大时结论才可信、要报几次运行。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>为什么不能只计 enqueueV3 的 CPU 调用耗时？batch 的 P95 为什么不能和 single 的 P95 比？</li>

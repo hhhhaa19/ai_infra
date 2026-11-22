@@ -2,8 +2,8 @@
       <div class="eyebrow">模块 12</div>
       <h2>核心算子：矩阵转置，把"跳着访问"挪进 shared memory</h2>
       <p class="why"><strong>主线</strong>：转置没有计算，纯搬数据，是带宽问题。难点是读和写的方向不一致：读 A 连续，写 B 就要跳着写。优化分两段：先让读写全局内存都连续（①～③），再让同时在路上的读请求变多（④⑤）。衡量标准是有效带宽 GB/s，天花板是同样数据量的 copy。</p>
-
-      <div class="blk"><h3>结果总览</h3>
+      <div class="blk ch" id="m12-ch1"><h3><span class="chn">1</span>概览</h3>
+        <section class="sub"><h4 class="subt">结果总览</h4>
         <p>Orin，锁频 1300 MHz，4096 × 4096，FP32；GB/s = 2·M·N·4 / 时间。所有版本和 CPU 结果逐元素按位相等。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>版本</th><th>改了什么</th><th class="num">GB/s</th><th class="num">占 copy</th></tr></thead>
@@ -20,9 +20,8 @@
           <li>2048 × 8192 转置是 copy 的 97%；8192 × 8192 只有 80%（原因未查，可能和 TLB / DRAM 分页有关）。</li>
           <li>③ 的 bank conflict 是按公式推的，没有用 ncu 实测确认。</li>
         </ul>
-      </div>
-
-      <div class="blk"><h3>两条规则：全局内存要连续，shared memory 要分散</h3>
+        </section>
+        <section class="sub"><h4 class="subt">两条访存规则</h4>
         <div class="tablewrap"><table>
           <thead><tr><th></th><th>全局内存</th><th>shared memory</th></tr></thead>
           <tbody>
@@ -36,9 +35,11 @@
           <li><strong>判断方法都是"竖着看一条指令"</strong>：一个 warp 的 32 个地址，看连不连续（全局）、% 32 有没有重复（shared）。</li>
           <li><strong>一个 warp 是哪 32 个线程</strong>：tid = x + y × blockDim.x，每 32 个一组。block 宽 32 时一个 warp 正好是一行。</li>
         </ul>
+        </section>
       </div>
 
-      <div class="blk"><h3>① naive：读连续，写跳着（37.3 GB/s）</h3>
+      <div class="blk ch" id="m12-ch2"><h3><span class="chn">2</span>优化步骤</h3>
+        <section class="sub"><h4 class="subt">① naive</h4>
 <pre><code>int x = blockIdx.x * blockDim.x + threadIdx.x;   // A 的列
 int y = blockIdx.y * blockDim.y + threadIdx.y;   // A 的行
 if (y &lt; M &amp;&amp; x &lt; N) B[x*M + y] = A[y*N + x];    // A 是 M×N，B 是 N×M，行优先</code></pre>
@@ -101,9 +102,8 @@ $('play').onclick=()=>{stop();st=-1;draw();const n=steps().length;tm=setInterval
 draw();
 })();
 </script>
-      </div>
-
-      <div class="blk"><h3>② shared memory 中转：读写全局都连续（61.9 GB/s）</h3>
+        </section>
+        <section class="sub"><h4 class="subt">② shared memory 中转</h4>
 <pre><code>__shared__ float tile[32][32];
 int tx = threadIdx.x, ty = threadIdx.y;          // 块内坐标，只用来访问 tile
 int bx = blockIdx.x * 32, by = blockIdx.y * 32;  // 小块在 A 里的起点
@@ -117,9 +117,8 @@ if (bx+ty &lt; N &amp;&amp; by+tx &lt; M) B[(bx+ty)*M + by+tx] = tile[tx][ty];  
           <li><strong>边界</strong>：读 A 查行 &lt; M、列 &lt; N；写 B 查行 &lt; N、列 &lt; M。B 每行 M 个数，方阵测不出乘错，测试要用非方阵、非 32 倍数的形状。</li>
           <li><strong>代价</strong>：第二步一个 warp 读 <code>tile[0..31][ty]</code>，同一列都在同一个 bank → 32 路冲突。</li>
         </ul>
-      </div>
-
-      <div class="blk"><h3>③ padding：tile[32][33]（91.1 GB/s，copy 的 89%）</h3>
+        </section>
+        <section class="sub"><h4 class="subt">③ padding</h4>
         <ul class="plain">
           <li>只改一行：<code>__shared__ float tile[32][33];</code>。bank = (r × 33 + c) % 32 = (r + c) % 32，竖着取一列时 32 行正好落在 32 个 bank。</li>
           <li>只改 tile 的宽度：线程数、块大小、A 和 B 的下标都不变，块的起点仍是 <code>blockIdx.y * 32</code>。</li>
@@ -163,9 +162,8 @@ $('c').oninput=()=>{c=+$('c').value;$('co').textContent=c;draw()};
 draw();
 })();
 </script>
-      </div>
-
-      <div class="blk" id="m12-s4"><h3>④ 每个线程搬 4 个数（padding 版 90.7 → 184.3 GB/s）</h3>
+        </section>
+        <section class="sub" id="m12-s4"><h4 class="subt">④ 每线程搬 4 个数</h4>
         <ul class="plain">
           <li><strong>瓶颈</strong>：③ 已是 copy 的 89%，但 copy 自己只有约 100 GB/s，是 Orin 上限的一半。每个线程只发 1 个读请求就得等它回来，同时在路上的请求太少。</li>
           <li><strong>改法</strong>：block 32×32 → 32×8，一个 block 仍负责 32×32 的小块，每个线程循环 4 次，第 i 次处理第 <code>ty + i*8</code> 行。</li>
@@ -182,9 +180,8 @@ for (int i = 0; i &lt; 4; ++i)
           <li>结果：copy 101.7 → 170.5，padding 版 90.7 → 184.3 GB/s；naive 只到 38.2（它的瓶颈是跳着写，不是请求太少）。</li>
         </ul>
         <div class="note"><strong>易错</strong>：① 块的起点要写 <code>blockIdx.y * 32</code>，写成 <code>blockIdx.y * blockDim.y</code> 后 blockDim.y 变成 8，相邻 block 重叠、大部分行没人管；② 边界要判断实际访问的那一行（<code>ar + i*8</code>），只查 <code>ar</code> 会越界，而且测试不一定报错；③ 改分工要同时改 launch 的 block 形状。</div>
-      </div>
-
-      <div class="blk" id="m12-s5"><h3>⑤ <code>__restrict__</code>：让 copy 也能一次发多个读（170.5 → 187.8 GB/s）</h3>
+        </section>
+        <section class="sub" id="m12-s5"><h4 class="subt">⑤ __restrict__</h4>
         <ul class="plain">
           <li><strong>现象</strong>：④ 之后转置 184.3 比 copy 170.5 还快，工作量不比 copy 少，说明 copy 没写到最快。</li>
           <li><strong>SASS</strong>：copy 是 <code>LDG STG LDG STG…</code>，读一个写一个；转置是 4 个 <code>LDG</code> 连着发出。</li>
@@ -228,9 +225,11 @@ draw();
 # 确认 bank conflict（需要 sudo）
 sudo .../ncu -k regex:transpose_shared --metrics \
   l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum ./build-orin/transpose_bench 4096 4096</code></pre>
+        </section>
       </div>
 
-      <div class="blk iv" id="m12-iv"><h3>面试要求</h3>
+      <div class="blk ch" id="m12-ch3"><h3><span class="chn">3</span>复习</h3>
+        <section class="sub iv" id="m12-iv"><h4 class="subt">面试要求</h4>
         <p>转置是手写 CUDA 题里最常见的"shared memory + bank conflict"题，也是 padding 的标准例子。</p>
         <h4>必须会</h4>
         <ul class="plain">
@@ -255,7 +254,9 @@ sudo .../ncu -k regex:transpose_shared --metrics \
           <li>原地转置（in-place）为什么难并行；非方阵的处理。</li>
         </ul>
         <p class="small muted">三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>A 是 M × N，<code>B[j][i]</code> 在一维数组的哪？为什么乘的是 M？</li>

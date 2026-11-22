@@ -2,8 +2,8 @@
       <div class="eyebrow">模块 10</div>
       <h2>策略模型上机：ACT 部署到 Orin</h2>
       <p class="why"><strong>主线</strong>：把公开的 ACT 策略模型（LeRobot <code>act_aloha_sim_transfer_cube_human</code>）从 PyTorch 部署到 Orin 的 TensorRT。每一步只看三件事：<strong>做了什么、为什么、结果是多少</strong>。数字都是实测，误差目前只用了随机输入。</p>
-
-      <div class="blk" id="act"><h3>结果总览</h3>
+      <div class="blk ch" id="m10-ch1"><h3><span class="chn">1</span>ACT 部署</h3>
+        <section class="sub" id="act"><h4 class="subt">结果总览</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>步骤</th><th>在哪</th><th>结果</th></tr></thead>
           <tbody>
@@ -20,9 +20,8 @@
 <pre><code>Quest（或 Mac / 其他 x86 机器）：LeRobot 加载 ACT → 保存输入和 PyTorch 输出 → 导出 ONNX
                  ↓ 拷贝 ONNX 和输入输出样例
 Orin：TensorRT FP32 / FP16 / INT8 → C++ 推理 → 和 PyTorch 输出比误差、测延迟</code></pre>
-      </div>
-
-      <div class="blk"><h3>模型长什么样</h3>
+        </section>
+        <section class="sub"><h4 class="subt">模型结构</h4>
         <ul class="plain">
           <li>模仿学习模型：输入相机图像 + 14 维关节状态，一次输出接下来 100 步动作（action chunking，一次预测一段，减少误差累积和抖动）。</li>
           <li>约 5170 万参数；推理时潜变量 z = 0，不需要 VAE encoder。</li>
@@ -85,9 +84,8 @@ draw();
             <tr><td>Squeeze 602、Unsqueeze 610</td><td>导出副作用</td><td>不做计算</td><td>层数变多，发射开销变大</td></tr>
           </tbody>
         </table></div>
-      </div>
-
-      <div class="blk"><h3>① 定边界：归一化放进 ONNX</h3>
+        </section>
+        <section class="sub"><h4 class="subt">① 归一化放进 ONNX</h4>
         <ul class="plain">
           <li><strong>做了什么</strong>：包一层 <code>ActForExport</code>，只取 <code>policy.model</code>，把图像、状态、动作的 6 个均值 / 标准差用 <code>register_buffer</code> 登记；forward 里先归一化 → ACT → 取动作 → 反归一化。</li>
           <li><strong>为什么</strong>：部署程序只喂原始数据，不会漏步骤或用错参数；训练和部署的预处理必须完全一致。</li>
@@ -95,9 +93,8 @@ draw();
           <li>buffer 和 parameter 都会导出（buffer 作为常量），但 buffer 训练时不更新，正适合放统计量。</li>
           <li>不需要 TORCH_LIBRARY 注册：里面全是 PyTorch 已有算子，直接翻译成标准 ONNX 节点。只有换成自己的 CUDA kernel 时才要注册和写 plugin。</li>
         </ul>
-      </div>
-
-      <div class="blk"><h3>② 导出 + 两层验收</h3>
+        </section>
+        <section class="sub"><h4 class="subt">② 导出与两层验收</h4>
 <pre><code>输入：image [1,3,480,640]（[0,1]）、state [1,14]      输出：action [1,100,14]（已反归一化）
 ONNX 131.4 MiB（官方 checkpoint 约 207 MB：VAE encoder 推理用不到所以没导出；BatchNorm 被常量折叠进卷积，只剩 21 个 Conv）
 ONNX Runtime vs PyTorch：最大绝对误差 2.4e-7～3.6e-7，rel L2 8e-8～1e-7（FP32 数值误差范围内）
@@ -107,9 +104,8 @@ ONNX Runtime vs PyTorch：最大绝对误差 2.4e-7～3.6e-7，rel L2 8e-8～1e-
           <li>两层检查：PyTorch vs ONNX Runtime 查导出；PyTorch vs TensorRT 查部署。</li>
           <li>engine 绑定 GPU 型号和 TensorRT 版本，Quest 上建的不能拿到 Orin 用，所以 engine 必须在 Orin 上建。</li>
         </ul>
-      </div>
-
-      <div class="blk"><h3>③ 建 engine：opset 17 → 16，看 TensorRT 怎么融合</h3>
+        </section>
+        <section class="sub"><h4 class="subt">③ 建 engine 与融合</h4>
         <ul class="plain">
           <li><strong>问题</strong>：opset 17 把 LayerNorm 导出成 1 个 <code>LayerNormalization</code> 节点，Orin 的 TensorRT 8.5 不认识。</li>
           <li><strong>改法</strong>：只改 <code>OPSET = 16</code>，LayerNorm 被拆成 9 个基础节点；重新导出后 ORT 误差仍约 1e-7。</li>
@@ -159,9 +155,8 @@ $('tog').onclick=()=>{fused=!fused;draw()};
 draw();
 })();
 </script>
-      </div>
-
-      <div class="blk"><h3>④ FP16：17.04 → 5.56 ms</h3>
+        </section>
+        <section class="sub"><h4 class="subt">④ FP16</h4>
         <ul class="plain">
           <li><strong>做了什么</strong>：同一个 FP32 ONNX，<code>trtexec --fp16 --noTF32</code>。精度在建 engine 时决定，导出时不用改。</li>
           <li><strong>不要导出 FP16 ONNX</strong>：TensorRT 能按层选精度，敏感层留 FP32；直接导出 FP16 会强制所有层 FP16。</li>
@@ -183,9 +178,8 @@ FP16：651 层；同一个 Myelin 节点 2.57 ms；卷积大多约 0.07 ms（用
           <li>FP16 最大误差 2.2e-3 rad ≈ 0.13°（动作是关节角）。</li>
         </ul>
         <div class="note">误差是 4 组<strong>随机噪声输入</strong>算的，只说明 engine 没把数算错；真实画面下动作对不对，要靠数据集回放和仿真闭环。随机输入也不能用来做 INT8 校准。</div>
-      </div>
-
-      <div class="blk"><h3>⑤ CUDA Graph：发射开销有多大</h3>
+        </section>
+        <section class="sub"><h4 class="subt">⑤ CUDA Graph</h4>
         <ul class="plain">
           <li>FP32 17.04 → 12.52 ms，FP16 5.56 → 3.70 ms：CPU 逐个发射 kernel 的开销不小。</li>
           <li>原因是层太多：导出带来 1206 个 Squeeze / Unsqueeze；逐层 profile 加起来 13.5 ms，远大于正常的 5.56 ms（每层都有额外开销）。</li>
@@ -228,9 +222,11 @@ $('play').onclick=()=>{stop();tnow=0;draw();tm=setInterval(()=>{tnow+=1;draw();i
 tnow=56;draw();
 })();
 </script>
+        </section>
       </div>
 
-      <div class="blk"><h3>下一步优化（按顺序）</h3>
+      <div class="blk ch" id="m10-ch2"><h3><span class="chn">2</span>部署方法</h3>
+        <section class="sub"><h4 class="subt">后续优化顺序</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>步</th><th>做什么</th><th>为什么</th></tr></thead>
           <tbody>
@@ -241,9 +237,8 @@ tnow=56;draw();
           </tbody>
         </table></div>
         <div class="note good"><strong>现在不给 LayerNorm 写 plugin</strong>：它不是瓶颈，而且已经在 Myelin 里融合；plugin 是黑盒，会把 Myelin 切开、打断融合（RMSNorm plugin 时切成了 17 段）。只有 TensorRT 不支持、或某个算子在 profile 里明显很慢时才写。</div>
-      </div>
-
-      <div class="blk" id="act-trt"><h3>怎么判断部署效果：三层指标</h3>
+        </section>
+        <section class="sub" id="act-trt"><h4 class="subt">部署效果的三层指标</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>层次</th><th>测什么</th><th>证明什么</th></tr></thead>
           <tbody>
@@ -257,9 +252,8 @@ tnow=56;draw();
           <li><strong>成功率要带次数和区间</strong>：19/20 和 18/20 的 95% 区间大幅重叠，20 次分不出谁好。</li>
           <li><strong>误差小 ≠ 任务一定成功</strong>：闭环里误差会累积，所以要三层都看。</li>
         </ul>
-      </div>
-
-      <div class="blk" id="m10-job"><h3>部署工程师在流水线里做什么</h3>
+        </section>
+        <section class="sub" id="m10-job"><h4 class="subt">部署工程的职责</h4>
         <p>流水线：定任务 → 采数据 → 训练 → 仿真验证 → <strong>模型部署</strong> → 系统集成 → 真机测试 → 迭代。部署这一环负责让模型在真实硬件上跑得够快、够准、够稳。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>工作</th><th>内容</th><th>ACT 里对应</th></tr></thead>
@@ -283,9 +277,8 @@ tnow=56;draw();
           </tbody>
         </table></div>
         <p class="small muted">掉点时的顺序：FP16 → INT8 PTQ → 敏感层回退 FP16 → QAT → 换小模型 / 蒸馏，把训练成本放到最后。</p>
-      </div>
-
-      <div class="blk"><h3>真机效果差：分层排查</h3>
+        </section>
+        <section class="sub"><h4 class="subt">真机问题的分层排查</h4>
 <pre><code>排查梯子：从最简单的环境开始，哪一步开始变差，问题就大概率在新加的那一层
 1. 桌面 GPU + PyTorch + 数据集          第 1 步就不好        → 模型或数据
 2. Orin + TensorRT + 同一批数据         1 好、2 差           → 导出或量化
@@ -299,9 +292,8 @@ tnow=56;draw();
           <li><strong>回放对比</strong>：同一份真机日志在 PyTorch 和 Orin 上各跑一遍，动作近似相同就说明部署层大概率没问题。</li>
           <li>sim-to-real 里和部署最相关的是<strong>延迟对齐</strong>：把实测的端到端延迟及其波动告诉训练端，在仿真里加进去。</li>
         </ul>
-      </div>
-
-      <div class="blk"><h3>推理程序怎么分层</h3>
+        </section>
+        <section class="sub"><h4 class="subt">推理程序的分层</h4>
 <pre><code>应用和任务
   ↓
 机器人接口层：相机、状态、动作        ← ROS 2 消息和节点隔离；URDF 和配置文件描述关节、相机位置
@@ -312,9 +304,11 @@ tnow=56;draw();
   ↓
 硬件：Orin / Thor / x86 GPU            ← Docker 或固定 JetPack、CUDA 版本；保留 ONNX，到目标机器重建 engine</code></pre>
         <p>不要写死模型形状和路径：模型 / plugin 路径、输入输出名称和形状、图像尺寸和归一化参数、控制频率、关节顺序放进配置文件，换模型或换机器人时只改配置。</p>
+        </section>
       </div>
 
-      <div class="blk" id="m10-smolvla"><h3>下一个模型：SmolVLA</h3>
+      <div class="blk ch" id="m10-ch3"><h3><span class="chn">3</span>SmolVLA</h3>
+        <section class="sub" id="m10-smolvla"><h4 class="subt">拆分、导出与 FP16</h4>
         <p><strong>为什么换</strong>：ACT 做到 FP16 engine 跑通、和 PyTorch 对上误差就停了（INT8 和仿真闭环都没做）。ACT 一次前向就出结果，部署上没有难点；SmolVLA 是"VLM 主干 + 动作生成头"的结构（π0、GR00T 也是这一类），约 4.5 亿参数，Orin 能跑，LeRobot 原生支持。更重要的是它的一次推理和 LLM 推理几乎一样：</p>
 <pre><code>前缀：VLM 跑一遍（类似 prefill），得到 KV cache
   ↓
@@ -444,9 +438,11 @@ tnow=56;draw();
           <li><strong>下一步看哪</strong>（<strong>没做逐层 profile</strong>）：C 跑 10 步共约 38 ms，是最大的一块；每步约 10 GFLOP 却要 3.78 ms，只有约 2.6 TFLOPS，大概率卡在 kernel 启动和小矩阵乘上。可做的：把 10 步整个录成一个 CUDA Graph；cross-attn 层的 K/V 投影只依赖 B 的输出、10 步里都一样，可以挪进 B 只算一次。A 的 48 ms 排第二。</li>
         </ol>
         <p class="small muted">还没做：选 FP32 节点的脚本是临时的，还没做成可复用的构建脚本。</p>
+        </section>
       </div>
 
-      <div class="blk iv" id="m10-iv"><h3>面试要求</h3>
+      <div class="blk ch" id="m10-ch4"><h3><span class="chn">4</span>复习</h3>
+        <section class="sub iv" id="m10-iv"><h4 class="subt">面试要求</h4>
         <p>这是部署线的核心项目，追问会最深。</p>
         <h4>必须会</h4>
         <ul class="plain">
@@ -469,7 +465,9 @@ tnow=56;draw();
           <li>硬件不统一时的软件分层（接口层 + 配置）。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>一个策略模型上线要经过哪几个阶段？部署工程师负责哪一段，交付什么？</li>

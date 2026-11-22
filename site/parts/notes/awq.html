@@ -2,35 +2,36 @@
       <div class="eyebrow">论文</div>
       <h2>AWQ：从权重到 INT4 量化</h2>
       <p class="why"><strong>这篇论文讲什么</strong>：大模型权重太占显存，想把它压成 INT4，又不想效果变差太多。AWQ 的思路是：先看哪些输入通道重要，调整权重的数值分布，再量化。这里只学了原理，没有做量化实验。</p>
-
-      <div class="blk"><h3>1. 先分清权重和 activation</h3>
+      <div class="blk ch" id="awq-ch1"><h3><span class="chn">1</span>量化基础</h3>
+        <section class="sub"><h4 class="subt">权重与 activation</h4>
         <p>一层线性计算写成 <code>y = Wx</code>。W 是权重，固定不变；x 是 activation，随输入变化。一个输入通道对应 x 的一个分量，也对应 W 的一列；一个输出通道对应 W 的一行。量化的是 W，但后面会看到，决定误差影响的是 x。</p>
-      </div>
-
-      <div class="blk"><h3>2. INT4 怎么表示一个权重</h3>
+        </section>
+        <section class="sub"><h4 class="subt">INT4 表示</h4>
         <p>INT4 只有 16 种编码，所以要用步长 Δ 和零点 z 把编码还原成实数：<code>ŵ = (q − z)Δ</code>。例如 Δ=0.1、z=6、q=9，还原值是 0.3；如果原值是 0.32，差出来的 0.02 就是量化误差。</p>
         <p>整层共用一组 Δ、z 太粗糙，所以沿 W 的每一行分组，组内共享 Δ 和 z。这里的 group 是一组输入通道对应的权重，不是一组 token。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>3. 为什么要看 activation</h3>
+      <div class="blk ch" id="awq-ch2"><h3><span class="chn">2</span>AWQ 方法</h3>
+        <section class="sub"><h4 class="subt">为什么看 activation</h4>
         <p>同样的权重误差 ε，对输出的影响是 ε·x<sub>j</sub>。x<sub>j</sub> 大的通道，误差会被放大，所以更重要。AWQ 用少量校准文本统计各通道的幅度，这属于训练后量化（PTQ）。</p>
-      </div>
-
-      <div class="blk"><h3>4. 通道缩放：让重要通道的误差变小</h3>
+        </section>
+        <section class="sub"><h4 class="subt">通道缩放</h4>
         <p>知道哪些通道重要后，怎么保护它们？可以把 W 的第 j 列乘 s<sub>j</sub>，同时把 x<sub>j</sub> 除以 s<sub>j</sub>。两者相乘的结果不变，这是量化前的等价变换。然后量化调整后的 W′。</p>
 <pre><code>W′ = WS,  x′ = S⁻¹x,  W′x′ = Wx            // 量化前的等价变换
 ŷ = Q(WS) S⁻¹ x                            // Q 为量化后还原的近似权重
 ŵ = (q − z)Δ                               // group 内反量化</code></pre>
         <p>放大某列后，这一列的量化误差在还原时被除以 s<sub>j</sub>，相对变小了。但放大也可能让组内数值范围变大，Δ 跟着变大，反而增加误差。所以 s 不能直接取大，要通过搜索来定。</p>
         <p>这里有两个尺度：s<sub>j</sub> 作用于一列，Δ<sub>g</sub> 作用于一行里的一个 group。s 改变分布后，Δ 要重新计算。</p>
-      </div>
-
-      <div class="blk"><h3>5. 推理时怎么用</h3>
+        </section>
+        <section class="sub"><h4 class="subt">推理时的用法</h4>
         <p>常见配置是 W4A16：权重用 INT4 存储，activation 用 16 位，kernel 按需反量化。所以 W4A16 不代表所有计算都是 INT4。量化后必须评测完整模型，不能只看某一层的误差。</p>
+          <p class="small"><a href="https://arxiv.org/html/2306.00978v5">论文：arxiv 2306.00978</a></p>
+        </section>
       </div>
 
-      <p class="small"><a href="https://arxiv.org/html/2306.00978v5">论文：arxiv 2306.00978</a></p>
-      <div class="blk iv" id="awq-iv"><h3>面试要求</h3>
+      <div class="blk ch" id="awq-ch3"><h3><span class="chn">3</span>复习</h3>
+        <section class="sub iv" id="awq-iv"><h4 class="subt">面试要求</h4>
         <p>LLM 推理岗位的量化必问内容，端侧大模型也会用到。</p>
         <h4>必须会</h4>
         <ul class="plain">
@@ -50,7 +51,9 @@
           <li>KV cache 量化。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>输入通道为什么对应 W 的一列？group 为什么不是 token 分组？s<sub>j</sub> 与 Δ<sub>g</sub> 的作用范围有何不同？</li>

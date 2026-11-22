@@ -2,7 +2,8 @@
       <div class="eyebrow">模块 3</div>
       <h2>C++ 必备：对象、所有权、引用与文件</h2>
       <p class="why"><strong>解决什么问题</strong>：读懂 SDK 接口并正确管理资源。ILogger 是接口，Logger 实现日志回调；unique_ptr 管理独占所有权，其他指针和引用可以借用，但不延长生命周期。下面先走一遍最常用的部分，再按仓库代码细讲。</p>
-      <div class="blk"><h3>先从 SDK 接口和资源管理讲起</h3>
+      <div class="blk ch" id="m3-ch1"><h3><span class="chn">1</span>从项目代码入门</h3>
+        <section class="sub"><h4 class="subt">SDK 接口与资源管理</h4>
         <p>写 TensorRT 程序时，最先碰到的是接口类。<code>ILogger</code> 是 TensorRT 定义的接口，我们写 <code>Logger</code> 实现它的 <code>log</code> 函数，TensorRT 需要打印日志时就回调它。这里用到虚函数：调用方只知道基类，实际运行子类的实现。基类的析构函数要写成 virtual，这样经基类指针释放对象时才能正确析构。<code>explicit</code> 用来限制隐式转换。</p>
         <p>接着是对象归谁管。函数参数写 <code>T</code> 通常会复制；写 <code>T&amp;</code> 是引用，可以修改原对象；写 <code>const T&amp;</code> 就不能通过它修改成员。<code>unique_ptr</code> 独占所有权，离开作用域时自动释放；普通指针和引用只是借用，不会延长对象的生命周期。</p>
 <pre><code>T value;  T&amp; ref = value;  T* ptr = &amp;value;
@@ -13,20 +14,20 @@ unique_ptr&lt;T&gt; owner{factory()};  owner.get() → 普通指针；*owner →
 stream 后声明先析构：等待 GPU → 释放 buffer → context → engine → runtime</code></pre>
         <p>出错时也要保证资源释放。<code>CHECK_CUDA(call)</code> 执行一次调用，判断错误码，失败时 return 1。宏里的 return 退出的是所在函数，局部对象会正常析构。而 <code>std::exit</code> 不展开栈上局部对象的析构，所以不适合这里。析构函数不能返回错误码，所以里面不能用含 <code>return 1</code> 的宏。</p>
         <p>解析命令行参数时也要检查。<code>std::stoi(s, &amp;used)</code> 返回数值，并写出解析了多少个字符。检查 used 是否等于字符串长度，就能拒绝 <code>256abc</code> 这样的输入。</p>
-      </div>
-
-      <div class="blk"><h3>读取 engine 文件</h3>
+        </section>
+        <section class="sub"><h4 class="subt">读取 engine 文件</h4>
         <p>engine 要先从文件读进内存。<code>ifstream</code> 用来读，<code>ofstream</code> 用来写。打开时可以加选项：<code>binary</code> 按字节处理，<code>ate</code> 打开后定位到末尾，<code>trunc</code> 清空原文件。读取过程是：用 <code>ate</code> 打开，<code>tellg</code> 得到文件大小，<code>seekg</code> 回到开头，用 <code>vector&lt;char&gt;</code> 分配内存，再 <code>read</code> 读入。</p>
         <p><code>deserializeCudaEngine(data, size)</code> 接收的是内容地址和长度，不是 <code>&amp;file</code>：<code>file</code> 是流对象，它的地址不是文件内容。类型转换上，<code>reinterpret_cast&lt;char*&gt;</code> 把同一地址当字节缓冲区；<code>static_cast</code> 转换长度类型；<code>1ULL</code> 让乘法从宽类型开始，避免溢出。</p>
-      </div>
-
-      <div class="blk"><h3>写 kernel 时用到的模板</h3>
+        </section>
+        <section class="sub"><h4 class="subt">kernel 中的模板</h4>
         <p>kernel 里常用模板 <code>template&lt;int BLOCK_THREADS&gt;</code>，它提供编译期整数，不是默认线程数。<code>rmsNormCub&lt;256&gt;&lt;&lt;&lt;rows,256&gt;&gt;&gt;</code> 里两个 256 含义不同：前者决定编译出的代码，后者决定运行时启动的线程数，两者要匹配。</p>
         <p>用 CUB 时，<code>using Reduce = ...</code> 只是类型别名，不创建对象，也不分配空间。<code>typename Reduce::TempStorage</code> 是依赖模板参数的嵌套类型，所以要写 <code>typename</code>；用它定义的 <code>temp</code> 才是对象。lambda 的 <code>[&amp;]</code> 按引用捕获，同样不延长对象生命周期。</p>
         <p>下面第 1～11 节按仓库代码把这些语法细讲一遍，第 12 节是项目里还没用到、面试常问的内容。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>1. 头文件、编译单元和链接</h3>
+      <div class="blk ch" id="m3-ch2"><h3><span class="chn">2</span>编译与类型</h3>
+        <section class="sub"><h4 class="subt">头文件、编译单元与链接</h4>
         <p>每个 <code>.cpp</code> / <code>.cu</code> 单独编译成一个目标文件，这个范围叫<strong>编译单元</strong>。链接器再把多个目标文件和库接起来。<code>#include</code> 只是把文件内容原样粘贴进来。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>语法</th><th>含义</th><th>仓库里的例子</th></tr></thead>
@@ -51,9 +52,8 @@ launchReg&lt;BLOCK&gt; 不是一个现成函数，用到 launchReg&lt;512&gt; �
 它 include 了 kernels.cu，里面有非模板 kernel。
 所以同一个 .so 只能有一个 .cu 包含它，否则同一函数会被定义多次。</code></pre>
         <p class="small muted">对应模块 2：编译产生目标文件，链接产生 <code>.so</code> 或可执行程序。</p>
-      </div>
-
-      <div class="blk"><h3>2. 指针、const 和看懂长类型</h3>
+        </section>
+        <section class="sub"><h4 class="subt">指针、const 与长类型</h4>
         <p>长类型从变量名开始，<strong>从右往左读</strong>。<code>*</code> 读作"指向……的指针"。<code>const</code> 修饰它左边的东西；如果左边没有东西，就修饰右边。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>写法</th><th>读法</th><th>能改什么</th></tr></thead>
@@ -78,9 +78,11 @@ SDK 要接收任意类型的数据，所以接口写成 void*，由调用方自�
 【引用和指针】
 Dims const&amp; d = inputDesc[0].dims;   // d 是别名，不拷贝，不能重新绑定
 指针可以为空、可以改指向；引用一定绑定一个对象，绑定后不能换。</code></pre>
+        </section>
       </div>
 
-      <div class="blk"><h3>3. 类、继承和 plugin 接口</h3>
+      <div class="blk ch" id="m3-ch3"><h3><span class="chn">3</span>对象与所有权</h3>
+        <section class="sub"><h4 class="subt">类、继承与 plugin 接口</h4>
         <p><code>plugin.cu</code> 是 C++ 面向对象语法最集中的文件。TensorRT 只认识基类接口，手里拿的是基类指针；调用时通过虚函数跳到 <code>RmsNormPlugin</code> 的实现。这就是<strong>动态分派</strong>。</p>
 <pre><code>class RmsNormPlugin : public IPluginV2DynamicExt { ... };
 
@@ -119,9 +121,8 @@ using IPluginV2::getOutputDimensions;
 void destroy() noexcept override { delete this; }
 对象在 plugin 的 .so 里 new，所以也由同一个 .so 里的代码 delete。
 delete this 之后不能再访问任何成员。</code></pre>
-      </div>
-
-      <div class="blk"><h3>4. 三种内存和"谁申请谁释放"</h3>
+        </section>
+        <section class="sub"><h4 class="subt">三种内存与资源归属</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>位置</th><th>怎么来</th><th>怎么释放</th><th>例子</th></tr></thead>
           <tbody>
@@ -155,9 +156,8 @@ vector 空间不够时会换一块内存，之前的 data() 指针全部失效�
 【值复制 vs 引用】
 const auto shape = input-&gt;getDimensions();  // 得到一份副本
 Dims const&amp; d = inputDesc[0].dims;           // 只是别名，没有复制</code></pre>
-      </div>
-
-      <div class="blk"><h3>5. 拷贝、移动和 RAII 类怎么写</h3>
+        </section>
+        <section class="sub"><h4 class="subt">拷贝、移动与 RAII</h4>
         <p>持有资源的类默认被拷贝时，只会拷贝指针值，两个对象就指向同一块资源，最后释放两次。所以 <code>DeviceBuffer</code> 删除了拷贝。</p>
 <pre><code>struct DeviceBuffer {
     void* ptr = nullptr;
@@ -183,9 +183,11 @@ DeviceBuffer(DeviceBuffer&amp;&amp; o) noexcept : ptr(o.ptr) { o.ptr = nullptr; 
 析构、拷贝构造、拷贝赋值、移动构造、移动赋值里，自定义了一个，就要考虑其余四个。
 只有一块资源时，优先直接用 unique_ptr 管理，这样往往都不用手写。</code></pre>
         <p class="small muted"><code>struct</code> 和 <code>class</code> 只有一个语法区别：<code>struct</code> 默认 public，<code>class</code> 默认 private。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>6. 模板：把运行时的数变成编译期常量</h3>
+      <div class="blk ch" id="m3-ch4"><h3><span class="chn">4</span>模板、lambda 与宏</h3>
+        <section class="sub"><h4 class="subt">模板与编译期常量</h4>
         <p>这是 RMSNorm 项目最核心的 C++ 技巧。kernel 的线程数是模板参数，编译时就要确定，这样编译器才能做特化优化；但 <code>b</code> 是运行时算出来的，不能直接写成 <code>launchReg&lt;b&gt;</code>。</p>
 <pre><code>【问题】
 const int b = chooseBlock(n, rows);    // 运行时才知道
@@ -227,9 +229,8 @@ typename Reduce::TempStorage  // 告诉编译器这个依赖模板的名字是�
 constexpr char const* kName   // 编译期常量
 decltype(x)                   // 取表达式的类型，不计算它
 auto* p = new T(...);         // 自动推导类型，p 是 T*</code></pre>
-      </div>
-
-      <div class="blk"><h3>7. lambda 的完整写法</h3>
+        </section>
+        <section class="sub"><h4 class="subt">lambda</h4>
 <pre><code>[捕获](参数) { 函数体 }
 
 []      不捕获
@@ -251,9 +252,8 @@ static const int sms = [] {            // 定义一个 lambda
 【捕获引用的风险】
 lambda 活得比被捕获的变量更久，就会悬空，比如存起来稍后再调用。
 withBlock 里是当场调用，所以 [&amp;] 安全。</code></pre>
-      </div>
-
-      <div class="blk"><h3>8. 宏：文本替换</h3>
+        </section>
+        <section class="sub"><h4 class="subt">宏</h4>
         <p>宏由预处理器在编译前做文本替换，不懂类型和作用域。能用函数或模板就不用宏，但下面两种情况宏更方便。</p>
 <pre><code>【CHECK_CUDA：需要 return 和当前行号】
 #define CHECK_CUDA(call)\
@@ -281,9 +281,11 @@ return 1        是宏的关键：普通函数没法让调用者 return
 #define SQ(x) x * x
 SQ(1 + 2)   → 1 + 2 * 1 + 2 = 5，不是 9
 参数要加括号，整个宏也要加括号。</code></pre>
+        </section>
       </div>
 
-      <div class="blk"><h3>9. 类型转换、数据大小和对齐</h3>
+      <div class="blk ch" id="m3-ch5"><h3><span class="chn">5</span>底层细节与错误处理</h3>
+        <section class="sub"><h4 class="subt">类型转换、大小与对齐</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>转换</th><th>用途</th><th>仓库里的例子</th></tr></thead>
           <tbody>
@@ -322,9 +324,8 @@ int bytes = rows * n * 4;               // 可能超过 int 范围
 enum class 的值不会隐式转成 int，所以要显式转换：
 static_cast&lt;int&gt;(nvinfer1::ILogger::Severity::kWARNING)
 Severity 的数值越小越严重，所以 severity &lt;= kWARNING 表示"警告及更严重"。</code></pre>
-      </div>
-
-      <div class="blk"><h3>10. 错误处理：为什么 SDK 接口不用异常</h3>
+        </section>
+        <section class="sub"><h4 class="subt">错误处理：为什么不用异常</h4>
         <p>C++ 能用异常，但我们的代码跨越 CUDA、TensorRT 和 <code>.so</code> 边界，主要靠返回值报告错误。TensorRT 接口都带 <code>noexcept</code>：如果异常从这种函数里跑出来，程序直接调用 <code>std::terminate</code> 结束。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>方式</th><th>含义</th><th>例子</th></tr></thead>
@@ -349,9 +350,8 @@ cudaGetLastError()      // 取错误，并清除
 【文件流的错误】
 流对象可以直接判断：if (!file) { ... }
 file.close() 之后再检查一次 if (!file)，才知道写入是否完整。</code></pre>
-      </div>
-
-      <div class="blk"><h3>11. 逐行读一遍：RmsNormPluginCreator</h3>
+        </section>
+        <section class="sub"><h4 class="subt">逐行读 RmsNormPluginCreator</h4>
 <pre><code>class RmsNormPluginCreator : public IPluginCreator {     // 继承 TensorRT 的工厂接口
 public:
     RmsNormPluginCreator() {
@@ -381,9 +381,11 @@ REGISTER_TENSORRT_PLUGIN(RmsNormPluginCreator);
 // 展开后定义一个全局对象。全局对象在 main 之前构造，.so 被加载时也会构造，
 // 它的构造函数把 creator 登记到注册表。这是 C++ 静态初始化的常见用法，
 // TORCH_LIBRARY 用的是同样的思路。</code></pre>
+        </section>
       </div>
 
-      <div class="blk" id="m3-faq"><h3>12. 面试常问，但项目里还没用到</h3>
+      <div class="blk ch" id="m3-ch6"><h3><span class="chn">6</span>复习</h3>
+        <section class="sub" id="m3-faq"><h4 class="subt">项目外的高频考点</h4>
         <p class="small muted">以下是通用 C++ 知识，仓库里基本没有对应代码，用来准备八股，不代表已经实践过。</p>
 <pre><code>【智能指针】
 unique_ptr  独占，不能拷贝，只能移动，几乎没有额外开销
@@ -430,18 +432,16 @@ struct S { char a; int b; };   // 通常 sizeof(S) == 8，a 后面补 3 字节
 【未定义行为（UB）】
 越界访问、使用已释放内存、空指针解引用、有符号整数溢出。
 程序可能看起来正常，换编译选项后才出错。</code></pre>
-      </div>
-
-      <div class="blk"><h3>对应源码</h3>
+        </section>
+        <section class="sub"><h4 class="subt">对应源码</h4>
         <ul class="plain">
           <li><a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/992fce75dd0e040e3ae7b107b8b4ca136c15f1c8/src/rmsnorm/launch.cuh#L15">launch.cuh：static、lambda、模板、宏</a></li>
           <li><a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/992fce75dd0e040e3ae7b107b8b4ca136c15f1c8/src/rmsnorm/tensorrt/plugin.cu#L20">plugin.cu：继承、虚函数、工厂、生命周期</a></li>
           <li><a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/992fce75dd0e040e3ae7b107b8b4ca136c15f1c8/src/tensorrt_intro/build_engine.cpp#L27">build_engine.cpp：unique_ptr、错误检查、文件写入</a></li>
           <li><a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/992fce75dd0e040e3ae7b107b8b4ca136c15f1c8/src/tensorrt_intro/infer_async.cpp#L12">infer_async.cpp：CHECK_CUDA、RAII 包装</a></li>
         </ul>
-      </div>
-
-      <div class="blk iv" id="m3-iv"><h3>面试要求</h3>
+        </section>
+        <section class="sub iv" id="m3-iv"><h4 class="subt">面试要求</h4>
         <p>C++ 是推理岗位的硬门槛，八股题比例很高。</p>
         <h4>必须会</h4>
         <ul class="plain">
@@ -464,7 +464,9 @@ struct S { char a; int b; };   // 通常 sizeof(S) == 8，a 后面补 3 字节
           <li>能逐行读懂 <code>RmsNormPluginCreator</code> 这类代码（第 11 节）。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>为什么默认复制 GPU 资源对象会重复释放？引用和指针在重新绑定上有什么不同？</li>

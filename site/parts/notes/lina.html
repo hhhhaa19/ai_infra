@@ -2,26 +2,25 @@
       <div class="eyebrow">论文</div>
       <h2>Lina：大模型架构、分布式通信与 MoE</h2>
       <p class="why"><strong>这篇论文讲什么</strong>：MoE 模型分布到多张 GPU 后，训练时通信互相抢带宽，推理时部分专家过热。Lina（USENIX ATC 2023）分别解决这两个问题。笔记先补基础，再看论文的方案。已核对关键机制和数字，未复现。</p>
-
-      <div class="blk"><h3>1. 基础：Attention、FFN 和 MoE</h3>
+      <div class="blk ch" id="lina-ch1"><h3><span class="chn">1</span>基础</h3>
+        <section class="sub"><h4 class="subt">Attention、FFN 与 MoE</h4>
         <p>Transformer 层里，Attention 负责 token 之间的上下文交互，KV Cache 保存历史的 K / V。FFN 对每个位置做共享参数的变换，不维护这类缓存。残差 <code>x + SubLayer(x)</code> 把增量加回去，也给梯度提供通路。</p>
         <p>MoE（专家混合）用多个专家 FFN 替换部分 FFN，由 router 为每个 token 选 Top-k 个专家。专家变多时总参数量增大，但每个 token 只经过少数专家，计算量增长不大。代价是 router、通信、显存和负载不均。</p>
-      </div>
-
-      <div class="blk"><h3>2. 基础：批处理和 KV Cache</h3>
+        </section>
+        <section class="sub"><h4 class="subt">批处理与 KV cache</h4>
         <p>单请求 decode 每步 token 很少，专家的矩阵运算规模也小。KV 容量随 batch 和上下文长度近似按 O(B×L) 增长。PagedAttention 用逻辑块到物理块的映射减少浪费。</p>
-      </div>
-
-      <div class="blk"><h3>3. 基础：两种分布式通信</h3>
+        </section>
+        <section class="sub"><h4 class="subt">两种分布式通信</h4>
         <p><strong>AllReduce</strong>：各 rank 做归约，每个 rank 都拿到结果。它常用于数据并行的梯度同步，可以和反向计算重叠，但没被隐藏的部分仍在关键路径上。</p>
         <p><strong>All-to-All</strong>：每个 rank 向其他 rank 发分片。专家并行用它把 token 发给专家（dispatch），再收回结果（combine）。它通常有直接的数据依赖，下一步计算要等它完成。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>4. 训练的问题和 Lina 的办法</h3>
+      <div class="blk ch" id="lina-ch2"><h3><span class="chn">2</span>Lina 论文</h3>
+        <section class="sub"><h4 class="subt">训练：问题与方法</h4>
         <p>分布式 MoE 训练时，AllReduce 和 All-to-All 会抢带宽，而 All-to-All 又卡着下一步计算。Lina 把张量切成 micro-op，在调度边界优先发 All-to-All，再结合流水线和 expert packing。</p>
-      </div>
-
-      <div class="blk"><h3>5. 推理的问题和 Lina 的办法</h3>
+        </section>
+        <section class="sub"><h4 class="subt">推理：问题与方法</h4>
         <p>推理时专家热度不均，少数专家负载很重。Lina 利用跨层的专家选择路径估计热度。阶段一复制热专家、把冷专家装箱到一起；阶段二按真实路由检查偏差，偏差显著时再纠正。复制专家能分担负载，但也要付出额外成本。</p>
 <pre><code>分布式 MoE
 ├─ 训练：AllReduce / All-to-All 带宽竞争
@@ -29,13 +28,14 @@
 └─ 推理：专家热度偏斜
    ├─ 阶段一：跨层路径预测 → 热专家复制 / 冷专家装箱
    └─ 阶段二：检查真实路由 → 偏差显著时纠偏</code></pre>
-      </div>
-
-      <div class="blk"><h3>6. 论文结果</h3>
+        </section>
+        <section class="sub"><h4 class="subt">论文结果</h4>
         <p>实验环境最多 16 张 A100 40GB、100 Gbps IB。训练 step 最多快 1.73×（平均 1.57×）；推理中位延迟改善 1.45×，P95 平均改善 1.63×（新延迟约为旧值的 61%）。这些是论文环境里的结果，不能当作自己项目的加速比。</p>
+        </section>
       </div>
 
-      <div class="blk" id="lina-nccl"><h3>7. 实测：Quest 上的 NCCL all-to-all 基线（课程项目）</h3>
+      <div class="blk ch" id="lina-ch3"><h3><span class="chn">3</span>FAST 复现</h3>
+        <section class="sub" id="lina-nccl"><h4 class="subt">NCCL all-to-all 基线</h4>
         <p><strong>为什么测</strong>：课程项目要复现 FAST（论文说它能让 MoE 的 all-to-all 更快：先在服务器内用快的 NVLink 把数据分匀，再让每张网卡均匀往外发，不让热门专家所在那张卡的网卡被挤爆）。要比较，先得知道不用 FAST、只用通用的 NCCL 时 Quest 上有多快，这就是基线。</p>
         <p><strong>拓扑</strong>（2 台节点，配置相同）：</p>
         <div class="tablewrap"><table>
@@ -76,9 +76,8 @@
         </table></div>
         <p><strong>结论</strong>：在 Quest 上 GPU 直连网卡这条路反而比"先拷到 CPU 内存再发"慢，原因还没查清（注意到没有加载 <code>nvidia_peermem</code>，GPUDirect 走的是 DMA-BUF）。对项目的影响：① NCCL 基线改用关掉 GPUDirect 的设置，这是 NCCL 在 Quest 上能跑出的最好成绩，比较才公平；② 服务器内外的实际带宽比从约 22～24 : 1 修正为约 15～17 : 1；③ 作者的 NVSHMEM 版本依赖 GPU 直接发起 RDMA，正好走慢的那条路，在 Quest 上用 NCCL send/recv 按 FAST 的调度一轮一轮发更合适；④ "论文默认 GPUDirect 跑满线速"在实际集群上不一定成立，写进报告的隐含条件。</p>
         <p><strong>下一步（已写好、还没结果）</strong>：nccl-tests 不能设定流量矩阵，所以写了一个小程序：按模拟器同一套 Zipf 公式生成每对 GPU 之间的数据量（不均衡度 0.5～0.99，另有均匀对照），用两种方式发送——<code>nccl</code>（一次性同时发给所有目标，相当于 alltoallv）和 <code>spreadout</code>（分 7 轮，第 k 轮每张卡只发给"自己编号 + k"），每次都校验收到的数据，并输出最忙那张网卡要发多少数据，用来算理论最优时间。以后加一个 <code>fast</code> 模式就能直接比。</p>
-      </div>
-
-      <div class="blk" id="lina-skew"><h3>8. 实测：不均衡流量下的 NCCL 基线、PXN 和 FAST 的提升上限</h3>
+        </section>
+        <section class="sub" id="lina-skew"><h4 class="subt">不均衡流量、PXN 与提升上限</h4>
         <p><strong>为什么测</strong>：nccl-tests 只能测均匀流量，而 FAST 要解决的正是不均匀（热门专家所在 GPU 要收发多得多）。所以自己写测试程序：按 FAST 模拟器同一套 Zipf 公式生成每对 GPU 之间的数据量（不均衡度越高，少数几对 GPU 之间数据越多），用 <code>nccl</code>（所有 send/recv 放在一个 ncclGroup 里一次发完，相当于 alltoallv）和 <code>spreadout</code>（分 7 轮，第 k 轮只发给"自己编号 + k"）两种方式执行，每次都校验收到的数据，并记下"最忙那张卡要跨机发多少"和"每台服务器总共要跨机发多少"，用来算两个时间下限：</p>
         <ul class="plain">
           <li><strong>最忙网卡下限</strong> = 最忙那张 GPU 的跨机数据量 / 单张网卡带宽：如果每张 GPU 只能用自己的网卡，最少要这么久。</li>
@@ -121,9 +120,8 @@
         </ol>
         <p><strong>接下来写 FAST</strong>：在同一个测试程序里加 <code>fast</code> 模式（作者代码不动，自己按 NCCL send/recv 重写调度）：① 本机所有要跨机发出的数据加起来平均分给 4 张卡，多的卡经 NVLink 交给少的卡，尽量让数据少绕路；② 第 k 张卡只发给对面第 k 张卡，各走各的网卡；③ 到达后如果落在不该收的卡上，再经 NVLink 转交。</p>
         <p>正确性检查从每段抽查 3 个字节改成逐字节校验（FAST 会把一段切成几块分开走，抽查可能漏错）；还会记录调度用时和 NVLink 额外搬运量。局限：只有 2 台机器、跨机只有一种配对，所以不需要 BvN 分解（4 台以上要补）；三步依次执行，没有像论文那样切小块流水线重叠，可能比论文的 FAST 慢。结果见<a href="#lina-fast">第 9 节</a>。</p>
-      </div>
-
-      <div class="blk" id="lina-fast"><h3>9. 实测：FAST 第一版比 NCCL 慢，问题在实现</h3>
+        </section>
+        <section class="sub" id="lina-fast"><h4 class="subt">第一版：慢在实现</h4>
         <p>设置同第 8 节：每卡平均 256 MB，每种分布 3 个矩阵取平均，单位 ms；每个结果都<strong>逐字节校验通过</strong>。"最强 NCCL"是每种分布下最快的那个 NCCL 设置（见第 8 节的四种设置）。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>流量</th><th class="num">最强 NCCL</th><th class="num">FAST 第一版</th><th class="num">FAST 相对 NCCL 的速度</th><th class="num">FAST 理论最快</th></tr></thead>
@@ -150,9 +148,8 @@
           <li><strong>诊断方法</strong>（结果见<a href="#lina-fast2">第 10 节</a>）：① 三步分别计时，看时间耗在哪一步；② 新加 <code>fastpack</code> 模式，先把要跨机发的数据在 GPU 上打包成一整块、一次发出去，对比"切碎"的影响；③ 给每个对端多开几个通道，看网卡能不能跑满。如果瓶颈是三步串行，下一步就是做流水线。</li>
         </ol>
         <div class="note"><strong>方法上的要点</strong>：新实现比基线慢时，先找一个"新方法理论上不该有任何优势也不该有任何劣势"的输入（这里是均匀流量），在这个输入上的差距就是纯实现开销；把它和方法本身的收益分开，才知道该改实现还是该怀疑方法。</div>
-      </div>
-
-      <div class="blk" id="lina-fast2"><h3>10. 实测：找到慢的原因，再做流水线</h3>
+        </section>
+        <section class="sub" id="lina-fast2"><h4 class="subt">定位原因与流水线</h4>
         <p><strong>第一步：三步分开计时</strong>（256 MB，Zipf 0.99，第一个矩阵，ms）：</p>
         <div class="tablewrap"><table>
           <thead><tr><th>版本</th><th class="num">① 机内匀开（NVLink）</th><th class="num">② 跨机传输（网卡）</th><th class="num">③ 到达后分发（NVLink）</th><th class="num">总时间</th></tr></thead>
@@ -184,9 +181,8 @@
           <li><strong>其他</strong>：调度计算约 5 µs（论文报告 32 卡约 25 µs），可以忽略。和论文相比提升更小，一部分原因是只有 2 台、8 张卡。4 台 × 2 卡的结果见第 11 节。</li>
         </ol>
         <div class="note good"><strong>这一节的方法</strong>：先把总时间拆到每一步，找到真正慢的一步（跨机网卡跑不满）；改完后检查比较是否公平（对手也给同样的设置）；最后才做流水线。流水线要真正重叠，两种硬件上的工作要放在不同的 stream（这里还要不同的 communicator）上，靠 event 只约束必要的先后关系。</div>
-      </div>
-
-      <div class="blk" id="lina-fast3"><h3>11. 实测：4 台 × 每台 2 卡，以及 BvN 到底帮了多少</h3>
+        </section>
+        <section class="sub" id="lina-fast3"><h4 class="subt">4 台 × 2 卡与 BvN</h4>
         <p><strong>为什么要做</strong>：2 台机器时服务器之间只有一种配对方式，论文最复杂的 BvN 分解没起作用。换成 4 台、每台 2 卡，需要补完整的 BvN：把每台机器之间要传的量汇总成 4×4 矩阵，不够整齐的地方用"空数据"补齐，再拆成若干轮"一对一配对"，每轮每台机器只和另一台传，所有轮的总时间就是理论最短。</p>
         <p>对照组是"简单轮流配对"（第 s 轮机器 A 发给 A+s），这样能单独看出 BvN 的贡献。流水线改成支持多轮，NVLink 和网卡仍分两个 communicator / stream。</p>
         <div class="tablewrap"><table>
@@ -210,9 +206,8 @@
         <p><strong>和原文对照</strong>（NSDI 2026 正式版）：原文两个真机平台都是 4 台 × 8 卡，模拟也假设每台 8 卡，只改变了机器数和 NVLink / 网卡带宽比，<strong>没有改变每台卡数</strong>；原文只和 SpreadOut（既不做机内平衡也不做 BvN）比，<strong>没有拆开测</strong>机内平衡和 BvN 各自的贡献，只在 §4.1 提到机内平衡后机器间流量会"更均匀"；均匀流量时原文说 FAST 和 NCCL 打平或略慢（58 vs 58 GBps），我们测到慢 14～21%。</p>
         <p>原文也承认开了 PXN 的 NCCL 在轻度不均匀时能接近 FAST，和第 8 节一致。原文 4 台 × 8 张 H200 上是 1.2～1.3×，我们 2 台 × 4 卡是 1.33～1.96×，更高的一个可能原因是 Quest 上 NCCL 默认的 GPUDirect 路径偏慢、对照组更弱，不能说"复现出比原文更大的提升"。</p>
         <div class="note"><strong>结论（可写进 critique）</strong>：FAST 的收益几乎全部来自"机内的卡互相分担"，大小取决于每台有几张卡、各卡流量有多不均；BvN 在我们的流量下只贡献几个百分点；流量均匀时 FAST 比 NCCL 慢，机器越多越明显。拆开机内平衡、分开机器数和每台卡数、小数据三组补充实验见第 12 节。</div>
-      </div>
-
-      <div class="blk" id="lina-fast4"><h3>12. 补充实验：拆开机内平衡、每台卡数、小数据</h3>
+        </section>
+        <section class="sub" id="lina-fast4"><h4 class="subt">拆分实验</h4>
         <p><strong>为什么要做</strong>：第 11 节说"收益几乎全来自机内平衡"，但只测了去掉 BvN 那一半；4 台 × 2 卡和 2 台 × 4 卡同时改了机器数和每台卡数，说不清是哪个因素；论文只测 100 MB 以上，推理 decode 每次传的数据小得多。</p>
         <p>于是加了一个"不做机内平衡"的版本（每张卡只用自己的网卡发自己的数据，其余照旧：仍用 BvN 分轮、到达后再分发），测了三组：2 台 × 4 卡（去掉机内平衡，外加 1 / 4 / 16 MB 小数据）、4 台 × 2 卡（完整 / 不做机内平衡 / 不做 BvN）、2 台 × 2 卡（完整对比 + 小数据）。每组先用小数据查正确性，结果全部逐字节正确；NCCL 每次都试遍 GDR 开 / 关 × 通道默认 / 8 条取最快。</p>
         <div class="tablewrap"><table>
@@ -278,9 +273,8 @@
         <p><strong>我们测的是模拟流量，不是真的 MoE</strong>：每次先按 Zipf 随机生成"谁给谁发多少"的表，让所有 GPU 照表互发、计时、逐字节校验。0.5 是轻微不均，0.99 是少数几对 GPU 承担大部分数据，模仿"热门专家"，但不是真模型产生的。</p>
         <p>原文主实验也是 Zipf 模拟流量，所以这一层可以直接对比。按对原文 §5.1.3 / §5.2 的阅读（<strong>没有逐句核对</strong>）：原文在真实 MoE 预训练中测的不均程度约 0.4～0.8，我们的 0.9、0.99 比真实情况更极端，报告应以 0.5～0.8 的数字为准（2 台 × 4 卡约 1.33～1.6×）；原文接入 Megatron-LM 的端到端训练实验只在 AMD 平台上做，NVIDIA 上没有端到端结果。</p>
         <p>我们也没测端到端：通信快了不等于训练整体快同样多。更接近真实的折中是用小 MoE 路由器 + 真实 token 分布生成流量表，目前没做。</p>
-      </div>
-
-      <div class="blk" id="lina-fast5"><h3>13. 修复 bug 后重跑：最终结果</h3>
+        </section>
+        <section class="sub" id="lina-fast5"><h4 class="subt">修复后的最终结果</h4>
         <p><strong>要解决的问题</strong>：第 12 节的数字来自有 bug 的版本（机内直传被并进第一块的准备步骤，NVLink 和网卡从并行变成先后）。修好这个 bug 后，第 12 节的三组实验（拆开机内平衡、每台卡数 / 机器数、小数据）全部用修复后的版本重跑，结果全部逐字节校验正确。</p>
         <p><strong>第一步：确认修复有效</strong>。在同一对机器上、每卡 256 MB、Zipf 0.99，依次跑三个版本的程序，排除换机器带来的差别：</p>
         <div class="tablewrap"><table>
@@ -348,10 +342,12 @@
           </tbody>
         </table></div>
         <div class="note"><strong>报告里要写明的局限</strong>：① 用的是 Zipf 模拟流量，没有跑真实 MoE 训练；② 最多 4 台机器、每台最多 4 卡，比论文规模小；③ Quest 上 NCCL 的 GPUDirect 路径偏慢，可能让 NCCL 显得比在论文机器上更弱，这可能是我们测到的提速高于论文 1.2～1.3× 的原因之一（推测）。</div>
+          <p class="small"><a href="https://www.usenix.org/conference/atc23/presentation/li-jiamin">USENIX ATC 23</a> · <a href="https://arxiv.org/html/2210.17223v2">arxiv 2210.17223v2</a></p>
+        </section>
       </div>
 
-      <p class="small"><a href="https://www.usenix.org/conference/atc23/presentation/li-jiamin">USENIX ATC 23</a> · <a href="https://arxiv.org/html/2210.17223v2">arxiv 2210.17223v2</a></p>
-      <div class="blk iv" id="lina-iv"><h3>面试要求</h3>
+      <div class="blk ch" id="lina-ch4"><h3><span class="chn">4</span>复习</h3>
+        <section class="sub iv" id="lina-iv"><h4 class="subt">面试要求</h4>
         <h4>必须会</h4>
         <ul class="plain">
           <li>Transformer 的 Attention 和 FFN 各自的计算量和访存特点；MoE 是什么（多个专家 FFN + 路由，每个 token 只激活少数专家）。</li>
@@ -372,7 +368,9 @@
           <li>复现论文时怎么做消融：把方法拆成几部分分别开关（机内平衡 / BvN），改变论文没改变的条件（每台卡数），并检查对照组是否被削弱（第 11 节）。</li>
         </ul>
         <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>训练与推理的 All-to-All 瓶颈分别是什么？AllReduce 为什么不能无限延后？</li>
