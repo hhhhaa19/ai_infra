@@ -11,6 +11,10 @@ src/rmsnorm/    src/rmsnorm/torch/                       src/llama/             
 - **Orin**（Jetson AGX Orin，sm_87，CUDA 11.4，TensorRT 8.5，torch 2.1）：日常开发和测试。
 - **Quest**（A100，sm_80，torch 2.x + Triton）：torch.compile 相关对比，通过 Slurm 跑。
 
+## 复习笔记
+
+[docs/notes/](docs/notes/README.md)：每个算子和部署步骤按"瓶颈在哪 → 怎么查 → 改了什么 → 快了多少"整理的复习笔记，包括 GEMM、转置、Softmax、Scan、卷积、FlashAttention、TensorRT 部署（ACT、SmolVLA）、LLM 推理和 RMSNorm 专题。
+
 ## 目录
 
 ```
