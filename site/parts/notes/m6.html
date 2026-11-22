@@ -86,7 +86,7 @@
             <tr><td class="mono">4096, 4096, 512</td><td class="num">915.4</td><td class="num">696.8</td><td class="num">696.9</td></tr>
           </tbody>
         </table></div>
-        <p class="small">之后的 own_reg、padding、L2 扫描、PyTorch 单算子和 decoder layer 结果见 <a href="#data">RMSNorm 专题 · 实测数据</a>。</p></div>
+        <p class="small">之后的 own_reg、padding、L2 扫描、PyTorch 单算子和 decoder layer 结果见 <a href="#data">RMSNorm · 实测数据</a>。</p></div>
 
       <div class="blk"><h3>四层工具怎么配合</h3>
         <p>前面实验用到的工具分别回答不同的问题。一般顺序是：先用 CUDA event 确认差距有多大，再用 nsys 找瓶颈在哪；问题在 kernel 内部时用 ncu 看原因，最后看 SASS 确认编译器到底生成了什么，改完再用 CUDA event 验证。</p>
