@@ -24,7 +24,7 @@
     var art = document.getElementById(id), btn = document.querySelector('.mod-list button[data-mod="' + id + '"]');
     if (!art || !btn) return;
     var title = art.querySelector("h2");
-    var heads = Array.prototype.filter.call(art.querySelectorAll(".blk > h3, section > h2"), function (h) { return h !== title; });
+    var heads = Array.prototype.filter.call(art.querySelectorAll(".blk > h3, section > h2, .blk.ch > .sub > h4.subt"), function (h) { return h !== title; });
     if (heads.length < 2) return;
     var nav = document.createElement("nav"); nav.className = "mod-toc"; nav.setAttribute("aria-label", "本模块小节");
     heads.forEach(function (h, k) {
@@ -32,7 +32,11 @@
       var target = box.id ? box : h;
       if (!target.id) target.id = id + "-t" + k;
       var a = document.createElement("a"); a.href = "#" + target.id;
-      a.textContent = h.textContent.replace(/\s+/g, " ").trim();
+      if (h.classList.contains("subt")) a.className = "sub";
+      else if (box.classList.contains("ch")) a.className = "ch";
+      var chn = h.querySelector(".chn");
+      var label = chn ? chn.textContent + "  " + h.textContent.slice(chn.textContent.length) : h.textContent;
+      a.textContent = label.replace(/\s+/g, " ").trim();
       nav.appendChild(a);
     });
     btn.insertAdjacentElement("afterend", nav);

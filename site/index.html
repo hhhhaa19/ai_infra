@@ -249,6 +249,15 @@ article.mod p > strong:first-child { color: var(--accent); }
 article.mod ul.plain, article.mod ol.plain { gap: 10px; }
 article.mod .selftest { margin-top: 6px; }
 @media (max-width: 900px) { .mod-toc { display: none; } }
+
+/* 章 → 节 结构 */
+article.mod .blk.ch { gap: 22px; }
+article.mod .blk.ch > h3 { border-left: 0; padding-left: 0; font-family: var(--f-display); font-size: 22px; font-weight: 600; display: flex; gap: 12px; align-items: baseline; }
+article.mod .blk.ch > h3 .chn { font-family: var(--f-mono); font-size: 14px; color: var(--accent); background: var(--accent-soft); border-radius: 6px; padding: 1px 8px; }
+article.mod .sub { display: grid; gap: 12px; min-width: 0; scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 72px); }
+article.mod .sub > h4.subt { font-size: 17px; padding-left: 10px; border-left: 3px solid var(--accent); color: var(--ink); margin-top: 6px; }
+.mod-toc a.ch { color: var(--ink); font-weight: 600; margin-top: 6px; }
+.mod-toc a.sub { padding-left: 18px; font-size: 12px; }
 </style>
 
 <header class="top">

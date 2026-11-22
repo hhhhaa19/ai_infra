@@ -3,8 +3,8 @@
       <h2>RMSNorm：从一个 kernel 到整层追平编译器</h2>
       <p class="why"><strong>主线</strong>：RMSNorm 是 LLaMA 每层都有的归一化。每行先求平方和（一次规约），再逐元素缩放，计算很少、读写很多，是<strong>带宽问题</strong>，目标是 x 只读一次、y 只写一次。优化分两段：先把单个 kernel 写快（①～④，瓶颈在 kernel 内部），再把它放进真实推理路径（⑤～⑪，瓶颈依次变成 Amdahl 和 CPU 发射、和编译器的融合边界、真实形状、TensorRT 挑的矩阵乘 kernel）。</p>
       <div class="formula">y[r][i] = x[r][i] · rsqrt( (1/n)·Σ<sub>j</sub> x[r][j]² + ε ) · w[i]</div>
-
-      <div class="blk" id="mainline"><h3>结果总览</h3>
+      <div class="blk ch" id="rms-ch1"><h3><span class="chn">1</span>概览</h3>
+        <section class="sub" id="mainline"><h4 class="subt">各步结果</h4>
         <div class="tablewrap"><table>
           <thead><tr><th>步骤</th><th>改了什么</th><th>结果</th></tr></thead>
           <tbody>
@@ -32,9 +32,8 @@
         <tr><td>单 kernel：1 行 add + RMSNorm</td><td class="num">—</td><td class="num">12.9</td><td class="num">5.9</td><td class="num">4.4</td><td class="num">2.7</td></tr>
       </tbody>
     </table></div>
-      </div>
-
-      <div class="blk" id="rms-basics"><h3>公式、瓶颈和每个版本共用的骨架</h3>
+        </section>
+        <section class="sub" id="rms-basics"><h4 class="subt">公式、瓶颈与 kernel 骨架</h4>
         <p><strong>为什么要手写</strong>：PyTorch eager 写法要启动 6 个 kernel，每个单独看都接近带宽上限，但中间结果来回写显存。Orin 上 [4096, 4096] 总共搬了 448 MiB、用 2887 μs，而 x 读一次、y 写一次只需要 128 MiB。手写一个 kernel 的目标就是只搬这 128 MiB。</p>
         <p><strong>和 LayerNorm 的区别</strong>：RMSNorm 不减均值、没有 bias，只要一次规约（平方和）；LayerNorm 要均值和方差两样。</p>
         <p><strong>骨架</strong>：下面每个版本都是这四步，区别只在"一行交给多少线程、每个线程拿几个数、怎么规约"。</p>
@@ -49,9 +48,11 @@ sum = 规约(sum);                                          // 3. warp 版 xor 5
 scale = rsqrtf(sum / n + eps);                           // 4. 除以 n，不是线程数
 for (…) if (idx &lt; n) y[rowOffset + idx] = v[i] * scale * w[idx];</code></pre>
         <div class="note">检查五件事：下标用 size_t；读时越界补 0、写时越界跳过；规约后谁拿到结果（down 只有 lane 0，xor 全部 lane）；除数是 n；cuobjdump 确认 LOCAL 为 0。</div>
+        </section>
       </div>
 
-      <div class="blk" id="rms-s1"><h3>① own：一个 block 一行（比 CUB 慢 15～36%）</h3>
+      <div class="blk ch" id="rms-ch2"><h3><span class="chn">2</span>单个 kernel 的优化</h3>
+        <section class="sub" id="rms-s1"><h4 class="subt">① own：一个 block 一行</h4>
         <p><strong>做法</strong>：一个 block 负责一行，线程跨步循环读这一行，先在 warp 内用 5 轮 <code>__shfl_down_sync</code> 合并，每个 warp 的 lane 0 把部分和写进 shared memory，再合并成一个数。</p>
         <p><strong>正确性</strong>：和 float64 参考逐元素比较，输出先填 NaN 查漏写，15 组形状全部 PASS（最大误差 2.38e-7）。</p>
         <p><strong>问题</strong>：和 CUB 的 BlockReduce 版对比，128 × 4096 上 CUB 快 15～36%。</p>
@@ -65,16 +66,14 @@ for (…) if (idx &lt; n) y[rowOffset + idx] = v[i] * scale * w[idx];</code></pr
       </tbody>
     </table></div>
         <p class="small muted">这张表的耗时来自单独的规约练习，不是 RMSNorm 的整体提速；own → own_t → own_reg 的主要收益来自读请求和展开，不是规约。</p>
-      </div>
-
-      <div class="blk" id="rms-s2"><h3>② own_t：线程数改成编译期常量（追平 CUB）</h3>
+        </section>
+        <section class="sub" id="rms-s2"><h4 class="subt">② own_t：编译期线程数</h4>
         <p><strong>怎么查</strong>：先猜"CUB 让更多 warp 处于就绪状态"，ncu 显示 CUB 的 eligible warp 反而更低，猜测被推翻。再看 SASS：own 只有 3 条 <code>LDG</code>，CUB 有 39～105 条。</p>
         <p><strong>原因</strong>：CUB 的线程数是模板参数，编译器知道循环次数，能把循环展开，一次发出很多个读请求，等待只付一次；own 的线程数是运行时值，循环展不开，每次只有一个读请求在路上。</p>
         <p><strong>改法</strong>：把 own 的线程数也改成模板参数（own_t），和 CUB 差距缩到 4% 以内，说明差别和 BlockReduce 本身无关。</p>
         <p><strong>结论</strong>：带宽受限的 kernel 要让足够多的读请求同时在路上；高占用率、高发射率本身不是目标。</p>
-      </div>
-
-      <div class="blk" id="rms-s3"><h3>③ own_reg：x 存寄存器、去掉零头分支（比 own 快 15～33%）</h3>
+        </section>
+        <section class="sub" id="rms-s3"><h4 class="subt">③ own_reg：x 存寄存器</h4>
         <p><strong>问题</strong>：n 除不尽时 own_t 变慢。ncu 显示两个原因。</p>
         <ol class="plain">
           <li><strong>零头分支</strong>：展开后最后一段只有部分线程有数，最后一个 warp 分叉，其他 warp 在 <code>__syncthreads()</code> 等它：barrier stall 约 7 倍，活跃线程 31.6 → 27.7。</li>
@@ -83,9 +82,8 @@ for (…) if (idx &lt; n) y[rowOffset + idx] = v[i] * scale * w[idx];</code></pr
         <p><strong>改法</strong>：每个线程固定处理 PER_THREAD 个元素（模板参数），循环完全展开，越界用 <code>col &lt; n</code> 屏蔽，不再有零头分支；读进来的 x 存在寄存器 <code>v[PER_THREAD]</code> 里，算完 scale 直接用，x 只读一遍。</p>
         <p><strong>结果</strong>：18 个配置里 15 个最快，比 own 快 15～33%。<code>cuobjdump</code> 确认 LOCAL:0（数组没有掉进 local memory）。</p>
         <p><strong>易错</strong>：数组下标必须是编译期能确定的（固定次数循环 + <code>#pragma unroll</code>），否则 <code>v[]</code> 会被放进 local memory，比寄存器慢很多。</p>
-      </div>
-
-      <div class="blk" id="design"><h3>④ 按 n 分档：一行交给多少线程</h3>
+        </section>
+        <section class="sub" id="design"><h4 class="subt">④ 按 n 分档</h4>
         <p><strong>问题</strong>：n 很小时一个 block 一行会闲置大部分线程，还要付 shared memory 和屏障的代价；n 很大时寄存器放不下。一个 kernel 管不了所有 n。</p>
         <div class="tablewrap"><table>
       <thead><tr><th>n 的范围</th><th>一行交给谁</th><th>规约</th><th>模板参数</th><th>为什么</th></tr></thead>
@@ -109,28 +107,27 @@ for (…) if (idx &lt; n) y[rowOffset + idx] = v[i] * scale * w[idx];</code></pr
         <li>switch 加宏把运行时的 n 映射到编译好的模板实例。</li>
       </ul>
         <p><strong>易错</strong>：一个 warp 一行最多能放下 n = 1024（每个 lane 32 个数），但"能放下"不等于"更快"。实测 n ≥ 320 时 own_reg 更快，所以阈值是 256，不是最初猜的 1024。</p>
-      </div>
-
-      <div class="blk" id="rms-l2"><h3>测量陷阱：L2 容量悬崖</h3>
+        </section>
+        <section class="sub" id="rms-l2"><h4 class="subt">测量陷阱：L2 容量悬崖</h4>
         <p><strong>现象</strong>：有一次 n = 3840 比 n = 4096 快一倍。</p>
         <p><strong>原因</strong>：工作集小于约 3.5 MiB 时，数据在两次计时之间留在 L2 里，有效带宽 240～253 GB/s，超过了显存峰值 204.8 GB/s。那次只是恰好在 L2 里，不是 kernel 更快。</p>
         <p><strong>做法</strong>：带宽类 kernel 用远大于 L2 的数据量测；ncu 的 kernel replay 会打乱 L2，不能用来看"热缓存"下的表现。</p>
+        </section>
       </div>
 
-      <div class="blk" id="rms-s5"><h3>⑤ 接进 PyTorch：单算子比 eager 快约 4 倍</h3>
+      <div class="blk ch" id="rms-ch3"><h3><span class="chn">3</span>接入 PyTorch 与 torch.compile</h3>
+        <section class="sub" id="rms-s5"><h4 class="subt">⑤ PyTorch 扩展</h4>
         <p><strong>做法</strong>：写成 CUDA 扩展。<code>TORCH_CHECK</code> 检查设备、dtype、形状、连续；<code>empty_like</code> 分配输出；在 PyTorch 的当前 stream 上启动 kernel（否则和前后的 PyTorch 操作没有顺序保证）；<code>load()</code> 编译时把被 include 的 kernel 文件哈希加进编译选项，改了 kernel 才会重编。</p>
         <p><strong>测试</strong>：23 个形状、160 个强制走某条路径的用例、5 个非法输入检查，全部通过。</p>
         <p><strong>结果</strong>：Orin 上 4096 × 8192 是 1396 μs，比 eager 快 4.1 倍，约 192 GB/s（峰值的 94%）。A100 上和 torch.compile 生成的 Triton kernel 打平：Inductor 在 n ≤ 1024 时用 persistent reduction（一行整个放进一个 block），n ≥ 4096 时用循环规约（读两遍，第二遍靠 L2）。</p>
-      </div>
-
-      <div class="blk" id="rms-s6"><h3>⑥ 放进 decoder layer：算子快 4 倍，整层快多少</h3>
+        </section>
+        <section class="sub" id="rms-s6"><h4 class="subt">⑥ 整层收益与 Amdahl</h4>
         <p><strong>做法</strong>：写一个 LLaMA 风格的单层（hidden 2048），RMSNorm 可以切换成 eager / ours，用 NVTX 标记各模块，nsys 按模块统计 kernel 时间，再不开工具用 CUDA event 计时。</p>
         <p><strong>结果</strong>：RMSNorm 只占整层约 2%。prefill 整层快 1.5%（按 Amdahl 预测 1.4%）；decode batch 1 快 10%、batch 8 快 2%。</p>
         <p><strong>为什么 decode 收益大</strong>：decode 每次只算 1 个 token，GPU 很快就算完，时间有一部分花在等 CPU 发 kernel 上。每个 eager RMSNorm 是 6 个 kernel，换成 1 个，每层少发 10 个 kernel，每个约 15 μs 的 CPU 开销。batch 越大 GPU 越忙，这部分占比越小。</p>
         <p><strong>易错</strong>：一开始在 nsys 下测到 decode 快 20%，不开工具复测只有 10%。nsys 会放大每次发 kernel 的开销，结论要用不带工具的计时确认。</p>
-      </div>
-
-      <div class="blk" id="rms-s7"><h3>⑦ 注册进 torch.compile：黑盒挡住了融合</h3>
+        </section>
+        <section class="sub" id="rms-s7"><h4 class="subt">⑦ TORCH_LIBRARY 与融合边界</h4>
         <p><strong>为什么要注册</strong>：pybind 只是把 C++ 函数交给 Python，PyTorch 不知道这个算子，compile 遇到它只能切断图。用 <code>TORCH_LIBRARY</code> 注册成 <code>torch.ops.ai_infra.rms_norm</code>，提供 schema、CUDA 实现和 Meta 实现（只推形状，compile 抓图时用）。</p>
         <p><strong>compile 怎么处理它</strong>：</p>
         <ol class="plain">
@@ -141,9 +138,8 @@ for (…) if (idx &lt; n) y[rowOffset + idx] = v[i] * scale * w[idx];</code></pr
     </ol>
         <p><strong>结果</strong>：A100 整层 decode b1，eager+ours −29%，compile −30%，但 compile+ours 只有 −23%，比只用 compile 还慢。读 inductor_cache 生成的代码发现，Inductor 会把"残差相加 + norm2"融成一个 kernel；我们的算子是黑盒，这次融合做不了，kernel 从 14 个变成 15 个。</p>
         <p><strong>易错</strong>：explain 报过一次 graph break，原因是扩展在 forward 里第一次调用时才加载。改成在 <code>__init__</code> 里加载（先注册、再 compile、最后调用）后切断消失，但计时不变，变慢的真正原因是少了一次融合。</p>
-      </div>
-
-      <div class="blk" id="rms-s8"><h3>⑧ fused add + RMSNorm：把被挡住的融合补上</h3>
+        </section>
+        <section class="sub" id="rms-s8"><h4 class="subt">⑧ fused add + RMSNorm</h4>
         <p><strong>做法</strong>：h = x + residual 只写一次，归一化直接用寄存器里的值，不再从显存读回 h。</p>
         <pre><code>// 和 rmsNormReg 只差第一个循环；h = x + r 只写一次，归一化直接用寄存器里的 v[i]
 for (int i = 0; i &lt; PER_THREAD; ++i) {
@@ -160,24 +156,24 @@ for (int i = 0; i &lt; PER_THREAD; ++i) {
       <li><strong>自己写 TODO 时踩的坑</strong>：<code>x[...] + r</code> 加的是指针；<code>h = …</code> 是改指针变量本身，要写 <code>h[下标]</code>；<code>if (h = col &lt; n)</code> 把 bool 赋给指针；<code>h = v[rowOffset+col]</code> 下标放反——h 是显存里所有行（下标 rowOffset + col），v 是这个线程自己的 PER_THREAD 个寄存器（下标 i）。条件里只放判断，赋值放在后面。</li>
     </ul>
         <p><strong>结果</strong>：kernel 数追平（14 对 14），eager+fused 334.6 μs 已接近 compile 的 332.0 μs；但 compile+fused 是 362.9 μs，GPU kernel 时间还多 26 μs。kernel 数一样以后，比的是 kernel 本身。</p>
-      </div>
-
-      <div class="blk" id="rms-s9"><h3>⑨ 按行数分档：decode 只有 1 行（26 → 5 μs）</h3>
+        </section>
+        <section class="sub" id="rms-s9"><h4 class="subt">⑨ 按行数分档</h4>
         <p><strong>怎么查</strong>：Inductor 生成的 kernel 用 <code>num_warps=16</code>，每行 512 个线程。单 kernel 扫描（CUDA Graph 重放计时，n = 2048）：1 行时 128 × 16 在所有切法里最慢（升频前测得 8.25 μs，预热后复测 4.52 μs），Triton 3.24 μs；512 行时 256 × 8 最好。</p>
         <p><strong>原因</strong>：之前的分档只看 n，是按几千行调的，那时 GPU 上有很多 block，追求吞吐。decode 只有 1～8 行，GPU 上只有几个 block，看的是延迟：每行要更多线程，每个线程少拿几个数。</p>
         <p><strong>改法</strong>：<code>chooseBlock(n, rows)</code>：行数 &lt; 2 × SM 数（A100 216 行、Orin 32 行）时每线程 4 个元素，否则 8 个。rms_norm 和 fused 版共用这条规则。</p>
         <p><strong>结果</strong>：整层 GPU 差距 26 → 5 μs，CUDA Graph 下 b1 只差 2.4%、b8 差 1.0%。</p>
         <p class="small muted">这条规则是按 A100 的数据定的，Orin 上还没复测。</p>
-      </div>
-
-      <div class="blk" id="rms-s10"><h3>⑩ float4：一条指令读 4 个 float</h3>
+        </section>
+        <section class="sub" id="rms-s10"><h4 class="subt">⑩ float4 向量化</h4>
         <p><strong>怎么查</strong>：Triton 生成代码里有 <code>tt.divisibility 16</code>，说明它知道地址 16 字节对齐，用的是 128 位读取。</p>
         <p><strong>改法</strong>：n % 4 == 0 且指针 16 字节对齐时用 <code>LDG.E.128</code> 一次读 4 个 float，否则退回标量版。指令少了，等待的轮数也少。</p>
         <p><strong>结果</strong>：1 行 norm 2.28 μs（Triton 3.25），add + norm 4.43 μs（Triton 2.71）。整层 GPU kernel 时间 278.0 vs Inductor 276.4 μs；CUDA Graph 下 decode b1 只慢 0.6%，b8 打平。</p>
         <p><strong>易错</strong>：计时前要先让 GPU 升频（预热）。有一次扫描在升频前测，1 行 128 × 16 测成了 8.25 μs，预热后实为 4.52 μs。</p>
+        </section>
       </div>
 
-      <div class="blk" id="routes"><h3>⑪ 进 TensorRT：同一份 kernel 写成 plugin</h3>
+      <div class="blk ch" id="rms-ch4"><h3><span class="chn">4</span>接入 TensorRT</h3>
+        <section class="sub" id="routes"><h4 class="subt">⑪ TensorRT plugin</h4>
         <p><strong>先看基线</strong>：eager 整层导出 ONNX、建 FP32 engine，TensorRT 的 Myelin 自己把 RMSNorm 的 7 个节点融成 1 个 kernel（<code>MulMeaAddSqrDivMulMul</code>，b1 约 7 μs）。所以在 TensorRT 里手写 norm 本身没多少可省的，这一步的价值是走通"自定义算子进 TensorRT"的流程。</p>
         <p><strong>两条路共用一份 kernel</strong>：选档和启动代码搬进只依赖 CUDA 的 <code>launch.cuh</code>，PyTorch 扩展和 TensorRT plugin 都 include 它。</p>
         <pre><code>                 kernels.cu + launch.cuh（kernel 和选档，只依赖 CUDA）
@@ -221,9 +217,11 @@ for (int i = 0; i &lt; PER_THREAD; ++i) {
     </table></div>
         <p>有两点要分清。第一，trtexec 用随机输入，所以它的时间能看，但不能证明结果正确；正确性由第 6 步证明。第二，b8 从 8.92 ms 降到 3.98 ms，只看总时间会以为是 norm 变快了。第 5 步的逐层数据显示，norm 只有几 μs，真正的变化是 plugin 把 Myelin 切开后，MLP 三个矩阵乘改走普通矩阵乘层：eager engine 里它们各约 2.4 ms，ours 里三个合计 0.87 ms。</p>
         <p><strong>易错</strong>：plugin 在 TensorRT 里也是黑盒，Myelin 只能在它前后分段融合，整层被切成 17 段。插入黑盒会改变编译器的整体决策，看总时间要拆开到逐层。</p>
+        </section>
       </div>
 
-      <div class="blk" id="rms-wrong"><h3>被实测推翻的猜测</h3>
+      <div class="blk ch" id="rms-ch5"><h3><span class="chn">5</span>复习</h3>
+        <section class="sub" id="rms-wrong"><h4 class="subt">易错与被推翻的猜测</h4>
         <ul class="plain">
         <li>"CUB 让更多 warp 就绪"：ncu 显示 CUB 的 eligible 反而更低。</li>
         <li>"256 线程不受零头影响"：错，只是 rows=512 时被"不对齐反而更快"抵消。</li>
@@ -248,9 +246,8 @@ for (int i = 0; i &lt; PER_THREAD; ++i) {
           <li>torch.compile 和导出 ONNX 是两条路，导出不是 compile 的下一步。</li>
           <li>TensorRT 没有 schema 和 Meta，对应的是 ONNX 节点 + creator 和 <code>getOutputDimensions</code>。</li>
         </ul>
-      </div>
-
-      <div class="blk" id="rms-todo"><h3>还没解决的问题</h3>
+        </section>
+        <section class="sub" id="rms-todo"><h4 class="subt">未解决的问题</h4>
         <ul class="plain">
         <li>不用 CUDA Graph 时 compile+fused 比 compile 多约 30 μs CPU 时间，是不是 torch.ops 调用路径（待测）。</li>
         <li>float4 之后，1 行 add+norm 仍比 Triton 慢 1.7 μs（4.43 vs 2.71），而 1 行 norm 我们更快：候选是 warp 间规约改成只同步 1 次，未验证。</li>
@@ -263,9 +260,99 @@ for (int i = 0; i &lt; PER_THREAD; ++i) {
         <li>n=3840 的 L2 悬崖更早、更不稳定（猜测组冲突或物理页分配）。</li>
         <li>warp 版在 n 较大时变慢（候选：每线程 56 个寄存器）。</li>
       </ul>
+        </section>
+        <section class="sub iv" id="rms-iv"><h4 class="subt">面试要求</h4>
+        <h4>必须会</h4>
+        <ul class="plain">
+          <li>写出公式，说清为什么受带宽限制、理论最短时间怎么算（搬的字节 ÷ 带宽）。</li>
+          <li>手写一个 block 一行的版本：warp shuffle + shared 两级规约、越界补 0、除以 n。</li>
+          <li>讲清 CUB 为什么快（编译期线程数 → 展开 → 多个读请求在路上），以及证据。</li>
+          <li>算子快 4 倍、整层只快 1.5% / 10% 的原因（Amdahl、decode 时 GPU 等 CPU）。</li>
+        </ul>
+        <h4>应该会</h4>
+        <ul class="plain">
+          <li>按 n 和按行数分档各解决什么问题，边界怎么测出来的。</li>
+          <li>TORCH_LIBRARY + Meta 实现的作用；黑盒为什么会挡住 Inductor 的融合，fused add + RMSNorm 怎么补。</li>
+          <li>plugin 的几个接口和 PyTorch 注册的对应关系；为什么插 plugin 后 b8 变快不是 norm 的功劳。</li>
+        </ul>
+        <h4>加分</h4>
+        <ul class="plain">
+          <li>float4 的对齐条件；L2 容量悬崖、预热、nsys 放大发射开销这几个测量陷阱。</li>
+        </ul>
+        <h4>讲述顺序（约 2 分钟）</h4>
+        <ol class="plain">
+          <li>问题：受带宽限制，eager 6 个 kernel 来回写显存。</li>
+          <li>手写 own 比 CUB 慢 → SASS 找到原因 → own_t 追平 → own_reg 去掉零头分支、x 存寄存器。</li>
+          <li>按 n 分档：n ≤ 256 一个 warp 一行，阈值靠扫描定。</li>
+          <li>接进 PyTorch：单算子 4 倍，整层 prefill 1.5%、decode 10%，原因是 Amdahl 和 CPU 发射。</li>
+          <li>进 compile：黑盒挡住融合 → fused add + RMSNorm → 按行数分档 → float4，CUDA Graph 下追平 Inductor。</li>
+          <li>进 TensorRT：同一份 kernel 写成 plugin，结果一致；b8 变快来自 Myelin 被切开。</li>
+          <li>结论：要按真实数据流设计融合边界、按真实形状分档；手写的价值在没有编译器的平台、plugin 和编译器做不好的算子。</li>
+        </ol>
+        </section>
+        <section class="sub" id="qa"><h4 class="subt">面试追问</h4>
+        
+    <div class="log-tools" role="group" aria-label="按主题筛选">
+      <button class="chip qf" type="button" data-f="all" aria-pressed="true">全部</button>
+      <button class="chip qf" type="button" data-f="kernel" aria-pressed="false">kernel</button>
+      <button class="chip qf" type="button" data-f="hw" aria-pressed="false">硬件</button>
+      <button class="chip qf" type="button" data-f="torch" aria-pressed="false">PyTorch</button>
+      <button class="chip qf" type="button" data-f="sys" aria-pressed="false">端到端</button>
+      <button class="chip qf" type="button" data-f="method" aria-pressed="false">测量</button>
+      <button class="chip qf" type="button" data-f="todo" aria-pressed="false">未掌握</button>
+      <span class="count" id="qa-count"></span>
+    </div>
+    <div class="qa-list">
+      <details class="qa" data-t="kernel" id="q1"><summary><span class="topic">kernel</span><span class="q">RMSNorm 和 LayerNorm 有什么区别？</span><span class="mark"></span></summary><div class="a"><p>RMSNorm 不减均值、没有 bias，只用均方根缩放，只需一次规约（平方和）；LayerNorm 要算均值和方差。计算更少，在 LLM 里效果接近，所以 LLaMA 等模型都用它。</p><label><input type="checkbox" id="m-q1"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q2"><summary><span class="topic">kernel</span><span class="q">为什么说它受带宽限制？理论上限怎么算？</span><span class="mark"></span></summary><div class="a"><p>每个元素只做几次乘加，却要读 4 字节、写 4 字节。理论最短时间 = 必须搬的字节数 ÷ 带宽。rows=4096、n=8192 时 x+y 共 256 MiB ≈ 268 MB，÷ 204.8 GB/s ≈ 1.31 ms；实测 1.396 ms，约峰值的 94%（有效字节口径，不含权重读取）。</p><label><input type="checkbox" id="m-q2"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q3"><summary><span class="topic">kernel</span><span class="q">CUB 为什么比你最初的版本快？</span><span class="mark"></span></summary><div class="a"><p>不是因为 BlockReduce。CUB 的线程数是模板参数，编译器能展开循环、一次发多个读请求、指令更少；SASS 里 own 3 条 LDG，CUB 39～105 条。把自己的线程数也改成模板参数（own_t）后速度一致。结论限定在已测配置。</p><label><input type="checkbox" id="m-q3"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q4"><summary><span class="topic">kernel</span><span class="q">n 除不尽时为什么变慢？怎么解决？</span><span class="mark"></span></summary><div class="a"><p>展开后的零头分段让最后一个 warp 分叉，其他 warp 在 <code>__syncthreads()</code> 等：barrier stall 约 7 倍，活跃线程 31.6 → 27.7。另外 n 不是 32 的倍数时行起点不对齐，sector / 请求从 4 变 4.44。own_reg 每线程固定元素数、用 <code>col &lt; n</code> 屏蔽，没有零头分支；padding 解决对齐。</p><label><input type="checkbox" id="m-q4"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q5"><summary><span class="topic">kernel</span><span class="q">为什么把 x 存在寄存器里？有什么风险？</span><span class="mark"></span></summary><div class="a"><p>求平方和读一遍、算输出又读一遍；存寄存器就只读一次。风险是寄存器不够溢出到 local memory（实际在显存）反而更慢，寄存器多也降低 occupancy。所以 PER_THREAD 有上限，并用 cuobjdump 确认 LOCAL:0。</p><label><input type="checkbox" id="m-q5"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q6"><summary><span class="topic">kernel</span><span class="q">shfl_down 和 shfl_xor 有什么区别？</span><span class="mark"></span></summary><div class="a"><p>down 规约完只有 lane 0 有总和，要再广播；xor 是蝶形交换，5 轮后 32 个 lane 都有总和，每个 lane 可以直接算 scale 写自己的输出。</p><label><input type="checkbox" id="m-q6"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q7"><summary><span class="topic">kernel</span><span class="q">为什么要按 n 分档？阈值怎么定的？</span><span class="mark"></span></summary><div class="a"><p>n 小用整个 block 会闲置线程并付 shared memory 和 barrier 的代价；n 大要更多线程才读得快；寄存器放不下只能循环。阈值靠扫描：强制两种实现，rows 4096 / 16384，n 从 32 扫到 384，找时间比交叉点，结果定为 256。</p><label><input type="checkbox" id="m-q7"> 已掌握</label></div></details>
+      <details class="qa" data-t="hw" id="q8"><summary><span class="topic">硬件</span><span class="q">warp 版为什么每个 block 放 4 个 warp？</span><span class="mark"></span></summary><div class="a"><p>Orin 每 SM 最多 16 个 block、48 个 warp。每 block 1 个 warp 最多 16 个 warp，占用率只有三分之一；4 个 warp 时 16 个 block 就有 64 个，能填满 48 个。</p><label><input type="checkbox" id="m-q8"> 已掌握</label></div></details>
+      <details class="qa" data-t="hw" id="q9"><summary><span class="topic">硬件</span><span class="q">occupancy 由什么决定？</span><span class="mark"></span></summary><div class="a"><p>每 SM 能驻留的 block 数取最小值：硬件 block 上限（Orin 16、A100 32）；SM 线程上限 ÷ 每 block 线程数；65536 寄存器 ÷ 每 block 寄存器（按分配粒度）；shared memory ÷ 每 block 用量。occupancy 高不一定更快。</p><label><input type="checkbox" id="m-q9"> 已掌握</label></div></details>
+      <details class="qa" data-t="hw" id="q10"><summary><span class="topic">硬件</span><span class="q">为什么有些形状的有效带宽超过显存峰值？</span><span class="mark"></span></summary><div class="a"><p>数据留在了 L2。连续运行时 x+y 小于 L2（Orin 实际约 3.5 MiB，A100 40 MB），下一次直接从 L2 读。这类形状不能用来评价 kernel。A100 的大 L2 也让"读两遍"代价很小，所以 own_reg 只读一次的优势在那里体现不出来。</p><label><input type="checkbox" id="m-q10"> 已掌握</label></div></details>
+      <details class="qa" data-t="torch" id="q11"><summary><span class="topic">PyTorch</span><span class="q">怎么把 CUDA kernel 接进 PyTorch？</span><span class="mark"></span></summary><div class="a"><ul><li>TORCH_CHECK：GPU、float32、weight 形状 [n]、连续；</li><li>empty_like 分配输出，data_ptr 取指针；</li><li>在 getCurrentCUDAStream() 上启动，保证顺序；</li><li>C10_CUDA_KERNEL_LAUNCH_CHECK 检查启动错误；</li><li>导出：最初用 PYBIND11，后来改为 TORCH_LIBRARY 注册 CUDA + Meta 实现，调用 <code>torch.ops.ai_infra.rms_norm</code>；load() 只看列出的源文件，所以把被 include 的 kernel 文件哈希加进编译选项。</li></ul><label><input type="checkbox" id="m-q11"> 已掌握</label></div></details>
+      <details class="qa" data-t="torch" id="q12"><summary><span class="topic">PyTorch</span><span class="q">eager 写法为什么慢？4 倍从哪来？</span><span class="mark"></span></summary><div class="a"><p>6 个 kernel 单独看都接近带宽上限，但中间结果都要写回显存再读出，总搬运 448 MiB 对 128 MiB；广播乘法没向量化；小形状还要付 6 次调用开销。4 倍主要来自融合，和 kernel 内部优化（own → own_reg）要分开说。</p><label><input type="checkbox" id="m-q12"> 已掌握</label></div></details>
+      <details class="qa" data-t="torch" id="q13"><summary><span class="topic">PyTorch</span><span class="q">torch.compile 生成的 kernel 是什么样的？</span><span class="mark"></span></summary><div class="a"><p>Dynamo 记录图，Inductor 融合后生成 Triton。n ≤ 1024：persistent reduction，一个 program 处理 XBLOCK 行，整行进寄存器，tl.sum 规约，思路同 own_reg。n ≥ 4096：循环规约，第一遍带 evict_last 求平方和，第二遍再读 x。A100 上和我们打平。</p><label><input type="checkbox" id="m-q13"> 已掌握</label></div></details>
+      <details class="qa" data-t="torch" id="q14"><summary><span class="topic">PyTorch</span><span class="q">有了 torch.compile 还需要手写 kernel 吗？</span><span class="mark"></span></summary><div class="a"><p>简单融合编译器已能做到同样水平，整层编译时还能把残差加法和下一个 norm 融合。实测：只替换 RMSNorm，compile 下反而慢（decode b1 341 → 378 μs）；写了 fused add + RMSNorm 并按行数分档后，CUDA Graph 下只差 2.4%。</p>
+      <p>所以只做单个算子赢不了编译器的融合，要按真实数据流设计融合边界、按真实形状分档。手写的价值在：没有 Triton 的平台（Orin 的 torch 2.1，eager+fused 已接近 compile）、eager + CUDA Graph 的推理引擎（vLLM 式）、TensorRT plugin、编译器做不好的复杂算子（FlashAttention、量化 GEMM）。</p><label><input type="checkbox" id="m-q14"> 已掌握</label></div></details>
+      <details class="qa" data-t="torch" id="q15"><summary><span class="topic">PyTorch</span><span class="q">自定义算子直接放进 torch.compile 会怎样？怎么支持训练和多卡？</span><span class="mark"></span></summary><div class="a"><p>pybind 导出的函数 Dynamo 不认识，会切断计算图。要用 TORCH_LIBRARY 注册成 torch.ops.xxx 并提供只推形状的 Meta 实现，vLLM 就是这样做的；已完成，explain 确认整层 1 张图。</p>
+      <p>注意扩展要在 compile 之前加载，否则加载代码本身会造成 graph break。即使不切断，自定义算子在 Inductor 眼里仍是黑盒，不能和前后融合。训练需要反向 kernel + autograd；多卡需要 device guard 和同设备检查，目前都没有。</p><label><input type="checkbox" id="m-q15"> 已掌握</label></div></details>
+      <details class="qa" data-t="sys" id="q16"><summary><span class="topic">端到端</span><span class="q">算子快了 4 倍，整个模型快了多少？</span><span class="mark"></span></summary><div class="a"><p>decoder layer 里 RMSNorm 只占约 2%，矩阵乘法 95% 以上。prefill 整层快约 1.5%（Amdahl 预测 1.4%，p=2%，s=3.5）；decode batch 1 快约 10%、batch 8 约 2%，原因是少发射 10 个 kernel，而不是 kernel 时间。最初在 nsys 下测到 20%，不开工具复测后更正。</p><label><input type="checkbox" id="m-q16"> 已掌握</label></div></details>
+      <details class="qa" data-t="sys" id="q17"><summary><span class="topic">端到端</span><span class="q">decode 时 GPU 为什么会空闲？</span><span class="mark"></span></summary><div class="a"><p>CPU 把 kernel 放进队列、GPU 按顺序执行，两者异步。decode 每个 kernel 只要几 μs，CPU 发射一个要几十 μs，GPU 做完只能等。不开 nsys 时，Orin 上 eager decode b1 每层 1436 μs，kernel 合计约 1264 μs，GPU 约 12% 时间空闲；ours 只多约 30 μs。batch 8 时 kernel 变大，几乎不空闲。判断方法：比较实际耗时和 kernel 合计。</p><label><input type="checkbox" id="m-q17"> 已掌握</label></div></details>
+      <details class="qa" data-t="sys" id="q18"><summary><span class="topic">端到端</span><span class="q">CUDA Graphs 是什么？有什么限制？</span><span class="mark"></span></summary><div class="a"><p>把一串 kernel 录成图，之后一次 cudaGraphLaunch 重放。kernel 不变快，只去掉 CPU 发射开销，所以 decode 收益大、prefill 几乎没用。限制：地址固定（新输入要拷进录制时的缓冲区）、形状固定（vLLM 为常见 batch 各录一张）、没有 CPU 分支。</p><label><input type="checkbox" id="m-q18"> 已掌握</label></div></details>
+      <details class="qa" data-t="sys" id="q19"><summary><span class="topic">端到端</span><span class="q">decode 为什么 batch 8 的 kernel 时间只比 batch 1 多一点？</span><span class="mark"></span></summary><div class="a"><p>decode 的 kernel 时间主要在读权重：一层 205 MB，按约 190 GB/s 读一遍约 1.08 ms，实测 1.26 ms。batch 8 仍只读一遍权重，8 个 token 共用，所以只到 1.73 ms。这就是推理服务要批处理的原因。</p><label><input type="checkbox" id="m-q19"> 已掌握</label></div></details>
+      <details class="qa" data-t="method" id="q20"><summary><span class="topic">测量</span><span class="q">你怎么保证性能数据可信？</span><span class="mark"></span></summary><div class="a"><ul><li>先验证正确性；</li><li>Orin 锁频并记录频率；</li><li>预热，CUDA event 包住多次调用，多样本取中位数，多轮交替；</li><li>关键结论 3 个独立进程确认；</li><li>算有效带宽和峰值比，超过峰值说明在 L2；</li><li>知道工具偏差：ncu 冷缓存基础频率，nsys 放大发射开销。</li></ul><label><input type="checkbox" id="m-q20"> 已掌握</label></div></details>
+      <details class="qa" data-t="method" id="q21"><summary><span class="topic">测量</span><span class="q">举一个你被数据推翻的猜测。</span><span class="mark"></span></summary><div class="a"><p>曾看到 n=3840 比 4096 快一倍，以为和 n 有关。3 个独立进程重复扫描后只有部分运行出现，原因是那次工作集刚好留在 L2。之后把"避开接近 L2 大小的形状"作为规则。warp 版阈值 1024 → 256 也是类似例子。</p><label><input type="checkbox" id="m-q21"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q22"><summary><span class="topic">kernel</span><span class="q">如果继续优化，你会做什么？</span><span class="mark"></span></summary><div class="a"><ul><li>FP16 / BF16（实际推理精度，搬运减半）；</li><li>warp 间规约改成一次同步：部分和放进 shared，再用一个 warp shuffle；</li><li>查清不用 CUDA Graph 时调用自定义算子的 CPU 开销；</li><li>层间也融合（上一层最后的 add + 下一层 norm1）、silu * mul 融合；</li><li>TensorRT 这条线：FP16（half 读写、float 累加）、fused 版 plugin、INT8。</li></ul><p class="small muted">已完成：残差加法 + RMSNorm 融合、TORCH_LIBRARY 注册并接入 compile 和 CUDA Graphs、按行数分档、float4 向量化、TensorRT plugin FP32。</p><label><input type="checkbox" id="m-q22"> 已掌握</label></div></details>
+      <details class="qa" data-t="torch" id="q23"><summary><span class="topic">PyTorch</span><span class="q">你的算子在 torch.compile 下为什么反而变慢？后来怎么追回来的？</span><span class="mark"></span></summary><div class="a"><ul><li>Inductor 把"残差相加 + norm2"融合成一个 Triton kernel；我们的算子是黑盒，残差只能单独一个 kernel，kernel 14 → 15，decode b1 341 → 378 μs。</li><li>写 fused add + RMSNorm 后 kernel 数持平，但 GPU 时间还多 26 μs，说明问题变成 kernel 本身。</li><li>读 inductor_cache：Triton 每行 512 线程（num_warps=16），我们 128；单 kernel 扫描证实 1 行时 128×16 最慢。分档加行数维度后，GPU 差距 26 → 5 μs，CUDA Graph 下整层只差 2.4%；再加 float4 后 GPU 时间 278.0 vs 276.4 μs，CUDA Graph 下 b1 只差 0.6%、b8 打平。</li><li>排除频率：同作业交替测、三次独立作业差距稳定、只多在 RMSNorm 部分（间接证据）。</li></ul><label><input type="checkbox" id="m-q23"> 已掌握</label></div></details>
+      <details class="qa" data-t="torch" id="q24"><summary><span class="topic">PyTorch</span><span class="q">torch.compile 从调用到执行经过哪几步？融合发生在哪？</span><span class="mark"></span></summary><div class="a"><p>torch.compile 只包一层；第一次调用时 Dynamo 用 FakeTensor 逐行读 forward 抓 FX 图和 guards（自定义算子靠 Meta 推形状，非张量代码会 graph break）→ AOTAutograd 翻译成核心 aten 算子 → Inductor lowering、scheduler（融合在这里）、codegen 出 Triton，矩阵乘交给 cuBLAS → reduce-overhead 时再录 CUDA Graph。</p>
+      <p>缓存按 guards 存多份，默认上限 8。Dynamo 管图完不完整，Inductor 管 kernel 少不少，CUDA Graph 管 CPU 发射开销。</p><label><input type="checkbox" id="m-q24"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q25"><summary><span class="topic">kernel</span><span class="q">为什么分档不能只看 n，还要看行数？</span><span class="mark"></span></summary><div class="a"><p>行数 = batch × seq，决定一次启动多少 block。decode b1 只有 1 行、整张 A100 只有 1 个 block，速度由延迟决定：128 线程每个串行读 16 个数，比不过 512 线程每个读 4 个（8.25 vs 5.01 μs）。</p>
+      <p>行多时 GPU 已满，block 小一点能让一个 SM 同时放几个、更好地藏延迟（512 行时 256×8 最好）。同一模型 hidden 固定，行数每一步都在变，所以两个维度都要看。之前单算子测试都是几千行，看不出来，放进整层测 decode 才暴露。</p><label><input type="checkbox" id="m-q25"> 已掌握</label></div></details>
+      <details class="qa" data-t="sys" id="q26"><summary><span class="topic">端到端</span><span class="q">eager+ours、compile、compile_cg 在 decode 下的收益分别来自哪？</span><span class="mark"></span></summary><div class="a"><p>都是在减少 CPU 发 kernel 的开销。eager+ours：RMSNorm 从约 5 个 kernel 变 1 个，一层少 10 个，每个约 14 μs，−29%；compile：Inductor 自动融合，约 14 个 kernel，−30%；compile_cg：再加 CUDA Graph，整串一次重放，CPU 开销基本消失，−57%。prefill 时 GPU 被矩阵乘占满、CPU 发射和计算重叠，所有写法差距 ≤2%。</p><label><input type="checkbox" id="m-q26"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q27"><summary><span class="topic">kernel</span><span class="q">float4 向量化是什么？有什么前提？</span><span class="mark"></span></summary><div class="a"><p>把指针当 float4* 读，一条 LDG.E.128 读 16 字节（4 个 float）进寄存器：数据量不变，读指令变成四分之一，延迟受限和带宽受限时都有帮助。线程按 float4 跨步，一个 warp 一条指令读连续 512 字节，仍是合并访问。</p>
+      <p>前提：地址 16 字节对齐（n % 4 == 0 才能保证每行开头对齐，切片可能不对齐），否则 misaligned address；所以 C++ 先检查，不满足就退回标量版。用 cuobjdump 看 SASS 确认有 LDG.E.128。</p>
+      <p>实测 1 行 add+norm 5.91 → 4.43 μs，整层 GPU 时间追平 Inductor。Triton 从 tt.divisibility=16 知道对齐，自动就做了。</p><label><input type="checkbox" id="m-q27"> 已掌握</label></div></details>
+      <details class="qa" data-t="method" id="q28"><summary><span class="topic">测量</span><span class="q">你怎么判断时间花在 GPU 还是 CPU？举个例子。</span><span class="mark"></span></summary><div class="a"><p>同时看实际耗时和 GPU kernel 总时间（profiler / nsys 的 kernel 时间可信）。float4 之后 compile+fused 和 compile：实际 397.8 vs 363.9 μs，kernel 总时间 278.0 vs 276.4 μs——GPU 只差 1.6，剩下约 32 μs 在 CPU。</p>
+      <p>再用 CUDA Graph 去掉 CPU 发射：cg+fused 212.4 vs 211.2，差距几乎消失，印证了这一点。单 kernel 比较则把同一个 kernel 录进 CUDA Graph 连续 100 次，彻底排除 CPU；计时前先让 GPU 升频（有一次扫描就因为没预热，把第一组数测大了近一倍）。</p><label><input type="checkbox" id="m-q28"> 已掌握</label></div></details>
+      <details class="qa" data-t="sys" id="q29"><summary><span class="topic">端到端</span><span class="q">你是怎么把自己的算子接进 TensorRT 的？</span><span class="mark"></span></summary><div class="a"><ul><li>先把选档和启动代码从 PyTorch 扩展里剥出来，放进只依赖 CUDA 的 launch.cuh，PyTorch 扩展和 plugin 共用（不带 PyTorch 路径单独 nvcc 编译验证）；</li><li>导出时写 symbolic：<code>ai_infra::rms_norm</code> → ONNX 自定义节点 RmsNorm，eps 作属性；老导出器追踪时真的跑 CUDA kernel，所以在 GPU 上导出；</li><li>plugin（IPluginV2DynamicExt）：getOutputDimensions 对应 Meta，supportsFormatCombination 声明只要 FP32 + 连续，enqueue 里调 launchRMSNorm，serialize 存 eps；creator 是工厂，REGISTER_TENSORRT_PLUGIN 让 .so 一加载就登记；</li><li>CMake 编成只链接 CUDA 和 TensorRT 的 .so，trtexec <code>--plugins=</code> 建 engine；用导出时存的同一个输入对 PyTorch 结果，误差约 1e-6。</li></ul><label><input type="checkbox" id="m-q29"> 已掌握</label></div></details>
+      <details class="qa" data-t="sys" id="q30"><summary><span class="topic">端到端</span><span class="q">加了 plugin 以后 b8 快了一倍，是你的 kernel 快吗？</span><span class="mark"></span></summary><div class="a"><p>不是。逐层看 norm 只有几 μs，和 Myelin 自己生成的差 1 μs 左右。原来 Myelin 把整层包成一个节点，在 FP32、禁 TF32、M=8 下给 MLP 矩阵乘选了 sliced1x4 sgemm，每个 2.4 ms；plugin 是黑盒，Myelin 被切成 17 段，MLP 矩阵乘交给普通矩阵乘层后只要 0.87 ms。</p>
+      <p>代价是多了独立的 Add 和 reshape 拷贝（各约 6 μs）。而且两个 engine 在 b8 都比 PyTorch eager（1.80 ms）慢，真正的问题是矩阵乘的 kernel 选择（推测，待开 TF32 / FP16 验证）。这和 compile 下"我们的算子挡住融合"是同一类现象：插入黑盒会改变编译器的整体决策。</p><label><input type="checkbox" id="m-q30"> 已掌握</label></div></details>
+      <details class="qa" data-t="kernel" id="q31"><summary><span class="topic">kernel</span><span class="q">标量版每个线程也读 4 个 float，为什么 float4 还有收益？</span><span class="mark"></span></summary><div class="a"><p>标量版是一个线程发 4 条 <code>LDG.E</code>、分 4 次读（线程 0 读 x[0]、x[512]、x[1024]、x[1536]）；float4 是一条 <code>LDG.E.128</code> 一次读 x[0..3]。数据量一样，读指令差 4 倍；一个 warp 一条指令从 128 字节变成 512 字节。</p>
+      <p>每条读指令都有发出、追踪、等数据的固定开销：1 行时速度看延迟，指令少等待轮数就少；行多时每条指令带更多数据，更容易用满带宽。Quest n=2048、1 行 add+norm：标量 512×4 5.91 μs，float4 512×4 4.43 μs。</p>
+      <p>它和 sector 对齐是两件事：对齐决定这段数据跨几个 32 字节块，float4 决定读这段数据要发几条指令；float4 还要求 16 字节对齐。</p><label><input type="checkbox" id="m-q31"> 已掌握</label></div></details>
+      <details class="qa" data-t="sys" id="q32"><summary><span class="topic">端到端</span><span class="q">导出那边和 plugin 那边怎么对上？写错会怎样？</span><span class="mark"></span></summary><div class="a"><p>两段代码互不调用，只靠 ONNX 里两个字符串：节点名 <code>RmsNorm</code>（symbolic 写 <code>g.op("ai_infra::RmsNorm", …)</code>，plugin 的 <code>getPluginName()</code> 返回 "RmsNorm"、版本 "1"）和属性名 <code>eps</code>（导出写 <code>eps_f</code>，creator 按 "eps" 读）。</p>
+      <p>加载 .so 时 creator 登记；Parser 遇到不认识的 RmsNorm 就按名字查注册表、调 <code>createPlugin</code>；engine 里只存 plugin 名字、版本和 eps。节点名写错：导出成功，建 engine 时报找不到 plugin；没加载 .so：建或加载 engine 时失败；属性名写成 epsilon：可能不报错，悄悄用默认值 1e-6，结果只差一点，所以必须和 PyTorch 输出比误差。</p><label><input type="checkbox" id="m-q32"> 已掌握</label></div></details>
+      <details class="qa" data-t="sys" id="q33"><summary><span class="topic">端到端</span><span class="q">TensorRT 给矩阵乘挑了慢的 kernel，你能怎么办？</span><span class="mark"></span></summary><div class="a"><ul><li>先证明问题在哪：<code>--exportLayerInfo</code>、<code>--dumpProfile</code>、nsys 看实际 kernel；b8 下 PyTorch eager（cuBLAS）1.80 ms，说明硬件本身没问题；</li><li>验证原因：FP16 或开 TF32 重建，看 kernel 和时间变不变。用 eager ONNX 开 FP16 重建：矩阵乘换成 Tensor Core 的 h16816gemm，b8 8.92 → 2.44 ms，说明和 kernel 选择有关（TF32 没测）；</li><li>调整模型结构，比如改 ONNX 图、切分节点，影响 Myelin 分组；换 TensorRT 版本或平台比较；</li><li>某个矩阵乘特别值得时自己写 plugin；或用 ONNX Runtime CUDA EP 跑同一个 ONNX 作开源对照，隔离问题是否在 TensorRT。</li></ul><p>之前 b8 变快恰好是 plugin 切开了 Myelin，不是主动设计，不能当成稳定方法，真实项目里要把这种依赖写进风险。</p><label><input type="checkbox" id="m-q33"> 已掌握</label></div></details>
+    </div>
+        </section>
       </div>
 
-      <div class="blk" id="data"><h3>实测数据（完整表）</h3>
+      <div class="blk ch" id="rms-ch6"><h3><span class="chn">附</span>数据与源码</h3>
+        <section class="sub" id="data"><h4 class="subt">实测数据</h4>
         
     <h4>kernel 演进（Orin，rows=512，128 线程，μs）</h4>
     <div class="tablewrap"><table>
@@ -423,106 +510,15 @@ for (int i = 0; i &lt; PER_THREAD; ++i) {
       </tbody>
     </table></div>
     <p class="small">这是 TensorRT 自己融合的 eager engine，RMSNorm 仍由 Myelin 生成（b8 FP16 下约 6.0 / 5.5 μs），不是我们的 plugin；plugin 只接受 kFLOAT，FP16 版还没写。误差和 kernel 名单见 <a href="#fp16">模块 9 · FP16 基线</a>。</p>
-  
-      </div>
-
-      <div class="blk"><h3>对应源码</h3>
+        </section>
+        <section class="sub"><h4 class="subt">对应源码</h4>
         <ul class="plain">
           <li>kernel：<a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/kernels.cu#L56">kernels.cu:56 own</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/kernels.cu#L113">:113 own_t</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/kernels.cu#L171">:171 own_reg</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/kernels.cu#L233">:233 warp 一行</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/kernels.cu#L273">:273 fused</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/kernels.cu#L340">:340 float4</a></li>
           <li>选档和启动：<a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/launch.cuh#L15">launch.cuh:15 chooseBlock</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/launch.cuh#L84">:84 launchRMSNorm</a></li>
           <li>PyTorch：<a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/torch/ext.cu#L34">ext.cu:34 Meta 实现</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/torch/ext.cu#L76">:76 TORCH_LIBRARY</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/llama/decoder_layer.py#L87">decoder_layer.py:87</a></li>
           <li>TensorRT：<a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/tensorrt/plugin.cu#L20">plugin.cu:20 RmsNormPlugin</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/ec061b76e37dc58e171f3e8f047de23547d0566a/src/rmsnorm/tensorrt/plugin.cu#L89">:89 Creator</a></li>
         </ul>
+        </section>
       </div>
 
-      <div class="blk iv" id="rms-iv"><h3>面试要求</h3>
-        <h4>必须会</h4>
-        <ul class="plain">
-          <li>写出公式，说清为什么受带宽限制、理论最短时间怎么算（搬的字节 ÷ 带宽）。</li>
-          <li>手写一个 block 一行的版本：warp shuffle + shared 两级规约、越界补 0、除以 n。</li>
-          <li>讲清 CUB 为什么快（编译期线程数 → 展开 → 多个读请求在路上），以及证据。</li>
-          <li>算子快 4 倍、整层只快 1.5% / 10% 的原因（Amdahl、decode 时 GPU 等 CPU）。</li>
-        </ul>
-        <h4>应该会</h4>
-        <ul class="plain">
-          <li>按 n 和按行数分档各解决什么问题，边界怎么测出来的。</li>
-          <li>TORCH_LIBRARY + Meta 实现的作用；黑盒为什么会挡住 Inductor 的融合，fused add + RMSNorm 怎么补。</li>
-          <li>plugin 的几个接口和 PyTorch 注册的对应关系；为什么插 plugin 后 b8 变快不是 norm 的功劳。</li>
-        </ul>
-        <h4>加分</h4>
-        <ul class="plain">
-          <li>float4 的对齐条件；L2 容量悬崖、预热、nsys 放大发射开销这几个测量陷阱。</li>
-        </ul>
-        <h4>讲述顺序（约 2 分钟）</h4>
-        <ol class="plain">
-          <li>问题：受带宽限制，eager 6 个 kernel 来回写显存。</li>
-          <li>手写 own 比 CUB 慢 → SASS 找到原因 → own_t 追平 → own_reg 去掉零头分支、x 存寄存器。</li>
-          <li>按 n 分档：n ≤ 256 一个 warp 一行，阈值靠扫描定。</li>
-          <li>接进 PyTorch：单算子 4 倍，整层 prefill 1.5%、decode 10%，原因是 Amdahl 和 CPU 发射。</li>
-          <li>进 compile：黑盒挡住融合 → fused add + RMSNorm → 按行数分档 → float4，CUDA Graph 下追平 Inductor。</li>
-          <li>进 TensorRT：同一份 kernel 写成 plugin，结果一致；b8 变快来自 Myelin 被切开。</li>
-          <li>结论：要按真实数据流设计融合边界、按真实形状分档；手写的价值在没有编译器的平台、plugin 和编译器做不好的算子。</li>
-        </ol>
-      </div>
-
-      <div class="blk" id="qa"><h3>自测：面试追问</h3>
-        
-    <div class="log-tools" role="group" aria-label="按主题筛选">
-      <button class="chip qf" type="button" data-f="all" aria-pressed="true">全部</button>
-      <button class="chip qf" type="button" data-f="kernel" aria-pressed="false">kernel</button>
-      <button class="chip qf" type="button" data-f="hw" aria-pressed="false">硬件</button>
-      <button class="chip qf" type="button" data-f="torch" aria-pressed="false">PyTorch</button>
-      <button class="chip qf" type="button" data-f="sys" aria-pressed="false">端到端</button>
-      <button class="chip qf" type="button" data-f="method" aria-pressed="false">测量</button>
-      <button class="chip qf" type="button" data-f="todo" aria-pressed="false">未掌握</button>
-      <span class="count" id="qa-count"></span>
-    </div>
-    <div class="qa-list">
-      <details class="qa" data-t="kernel" id="q1"><summary><span class="topic">kernel</span><span class="q">RMSNorm 和 LayerNorm 有什么区别？</span><span class="mark"></span></summary><div class="a"><p>RMSNorm 不减均值、没有 bias，只用均方根缩放，只需一次规约（平方和）；LayerNorm 要算均值和方差。计算更少，在 LLM 里效果接近，所以 LLaMA 等模型都用它。</p><label><input type="checkbox" id="m-q1"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q2"><summary><span class="topic">kernel</span><span class="q">为什么说它受带宽限制？理论上限怎么算？</span><span class="mark"></span></summary><div class="a"><p>每个元素只做几次乘加，却要读 4 字节、写 4 字节。理论最短时间 = 必须搬的字节数 ÷ 带宽。rows=4096、n=8192 时 x+y 共 256 MiB ≈ 268 MB，÷ 204.8 GB/s ≈ 1.31 ms；实测 1.396 ms，约峰值的 94%（有效字节口径，不含权重读取）。</p><label><input type="checkbox" id="m-q2"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q3"><summary><span class="topic">kernel</span><span class="q">CUB 为什么比你最初的版本快？</span><span class="mark"></span></summary><div class="a"><p>不是因为 BlockReduce。CUB 的线程数是模板参数，编译器能展开循环、一次发多个读请求、指令更少；SASS 里 own 3 条 LDG，CUB 39～105 条。把自己的线程数也改成模板参数（own_t）后速度一致。结论限定在已测配置。</p><label><input type="checkbox" id="m-q3"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q4"><summary><span class="topic">kernel</span><span class="q">n 除不尽时为什么变慢？怎么解决？</span><span class="mark"></span></summary><div class="a"><p>展开后的零头分段让最后一个 warp 分叉，其他 warp 在 <code>__syncthreads()</code> 等：barrier stall 约 7 倍，活跃线程 31.6 → 27.7。另外 n 不是 32 的倍数时行起点不对齐，sector / 请求从 4 变 4.44。own_reg 每线程固定元素数、用 <code>col &lt; n</code> 屏蔽，没有零头分支；padding 解决对齐。</p><label><input type="checkbox" id="m-q4"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q5"><summary><span class="topic">kernel</span><span class="q">为什么把 x 存在寄存器里？有什么风险？</span><span class="mark"></span></summary><div class="a"><p>求平方和读一遍、算输出又读一遍；存寄存器就只读一次。风险是寄存器不够溢出到 local memory（实际在显存）反而更慢，寄存器多也降低 occupancy。所以 PER_THREAD 有上限，并用 cuobjdump 确认 LOCAL:0。</p><label><input type="checkbox" id="m-q5"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q6"><summary><span class="topic">kernel</span><span class="q">shfl_down 和 shfl_xor 有什么区别？</span><span class="mark"></span></summary><div class="a"><p>down 规约完只有 lane 0 有总和，要再广播；xor 是蝶形交换，5 轮后 32 个 lane 都有总和，每个 lane 可以直接算 scale 写自己的输出。</p><label><input type="checkbox" id="m-q6"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q7"><summary><span class="topic">kernel</span><span class="q">为什么要按 n 分档？阈值怎么定的？</span><span class="mark"></span></summary><div class="a"><p>n 小用整个 block 会闲置线程并付 shared memory 和 barrier 的代价；n 大要更多线程才读得快；寄存器放不下只能循环。阈值靠扫描：强制两种实现，rows 4096 / 16384，n 从 32 扫到 384，找时间比交叉点，结果定为 256。</p><label><input type="checkbox" id="m-q7"> 已掌握</label></div></details>
-      <details class="qa" data-t="hw" id="q8"><summary><span class="topic">硬件</span><span class="q">warp 版为什么每个 block 放 4 个 warp？</span><span class="mark"></span></summary><div class="a"><p>Orin 每 SM 最多 16 个 block、48 个 warp。每 block 1 个 warp 最多 16 个 warp，占用率只有三分之一；4 个 warp 时 16 个 block 就有 64 个，能填满 48 个。</p><label><input type="checkbox" id="m-q8"> 已掌握</label></div></details>
-      <details class="qa" data-t="hw" id="q9"><summary><span class="topic">硬件</span><span class="q">occupancy 由什么决定？</span><span class="mark"></span></summary><div class="a"><p>每 SM 能驻留的 block 数取最小值：硬件 block 上限（Orin 16、A100 32）；SM 线程上限 ÷ 每 block 线程数；65536 寄存器 ÷ 每 block 寄存器（按分配粒度）；shared memory ÷ 每 block 用量。occupancy 高不一定更快。</p><label><input type="checkbox" id="m-q9"> 已掌握</label></div></details>
-      <details class="qa" data-t="hw" id="q10"><summary><span class="topic">硬件</span><span class="q">为什么有些形状的有效带宽超过显存峰值？</span><span class="mark"></span></summary><div class="a"><p>数据留在了 L2。连续运行时 x+y 小于 L2（Orin 实际约 3.5 MiB，A100 40 MB），下一次直接从 L2 读。这类形状不能用来评价 kernel。A100 的大 L2 也让"读两遍"代价很小，所以 own_reg 只读一次的优势在那里体现不出来。</p><label><input type="checkbox" id="m-q10"> 已掌握</label></div></details>
-      <details class="qa" data-t="torch" id="q11"><summary><span class="topic">PyTorch</span><span class="q">怎么把 CUDA kernel 接进 PyTorch？</span><span class="mark"></span></summary><div class="a"><ul><li>TORCH_CHECK：GPU、float32、weight 形状 [n]、连续；</li><li>empty_like 分配输出，data_ptr 取指针；</li><li>在 getCurrentCUDAStream() 上启动，保证顺序；</li><li>C10_CUDA_KERNEL_LAUNCH_CHECK 检查启动错误；</li><li>导出：最初用 PYBIND11，后来改为 TORCH_LIBRARY 注册 CUDA + Meta 实现，调用 <code>torch.ops.ai_infra.rms_norm</code>；load() 只看列出的源文件，所以把被 include 的 kernel 文件哈希加进编译选项。</li></ul><label><input type="checkbox" id="m-q11"> 已掌握</label></div></details>
-      <details class="qa" data-t="torch" id="q12"><summary><span class="topic">PyTorch</span><span class="q">eager 写法为什么慢？4 倍从哪来？</span><span class="mark"></span></summary><div class="a"><p>6 个 kernel 单独看都接近带宽上限，但中间结果都要写回显存再读出，总搬运 448 MiB 对 128 MiB；广播乘法没向量化；小形状还要付 6 次调用开销。4 倍主要来自融合，和 kernel 内部优化（own → own_reg）要分开说。</p><label><input type="checkbox" id="m-q12"> 已掌握</label></div></details>
-      <details class="qa" data-t="torch" id="q13"><summary><span class="topic">PyTorch</span><span class="q">torch.compile 生成的 kernel 是什么样的？</span><span class="mark"></span></summary><div class="a"><p>Dynamo 记录图，Inductor 融合后生成 Triton。n ≤ 1024：persistent reduction，一个 program 处理 XBLOCK 行，整行进寄存器，tl.sum 规约，思路同 own_reg。n ≥ 4096：循环规约，第一遍带 evict_last 求平方和，第二遍再读 x。A100 上和我们打平。</p><label><input type="checkbox" id="m-q13"> 已掌握</label></div></details>
-      <details class="qa" data-t="torch" id="q14"><summary><span class="topic">PyTorch</span><span class="q">有了 torch.compile 还需要手写 kernel 吗？</span><span class="mark"></span></summary><div class="a"><p>简单融合编译器已能做到同样水平，整层编译时还能把残差加法和下一个 norm 融合。实测：只替换 RMSNorm，compile 下反而慢（decode b1 341 → 378 μs）；写了 fused add + RMSNorm 并按行数分档后，CUDA Graph 下只差 2.4%。</p>
-      <p>所以只做单个算子赢不了编译器的融合，要按真实数据流设计融合边界、按真实形状分档。手写的价值在：没有 Triton 的平台（Orin 的 torch 2.1，eager+fused 已接近 compile）、eager + CUDA Graph 的推理引擎（vLLM 式）、TensorRT plugin、编译器做不好的复杂算子（FlashAttention、量化 GEMM）。</p><label><input type="checkbox" id="m-q14"> 已掌握</label></div></details>
-      <details class="qa" data-t="torch" id="q15"><summary><span class="topic">PyTorch</span><span class="q">自定义算子直接放进 torch.compile 会怎样？怎么支持训练和多卡？</span><span class="mark"></span></summary><div class="a"><p>pybind 导出的函数 Dynamo 不认识，会切断计算图。要用 TORCH_LIBRARY 注册成 torch.ops.xxx 并提供只推形状的 Meta 实现，vLLM 就是这样做的；已完成，explain 确认整层 1 张图。</p>
-      <p>注意扩展要在 compile 之前加载，否则加载代码本身会造成 graph break。即使不切断，自定义算子在 Inductor 眼里仍是黑盒，不能和前后融合。训练需要反向 kernel + autograd；多卡需要 device guard 和同设备检查，目前都没有。</p><label><input type="checkbox" id="m-q15"> 已掌握</label></div></details>
-      <details class="qa" data-t="sys" id="q16"><summary><span class="topic">端到端</span><span class="q">算子快了 4 倍，整个模型快了多少？</span><span class="mark"></span></summary><div class="a"><p>decoder layer 里 RMSNorm 只占约 2%，矩阵乘法 95% 以上。prefill 整层快约 1.5%（Amdahl 预测 1.4%，p=2%，s=3.5）；decode batch 1 快约 10%、batch 8 约 2%，原因是少发射 10 个 kernel，而不是 kernel 时间。最初在 nsys 下测到 20%，不开工具复测后更正。</p><label><input type="checkbox" id="m-q16"> 已掌握</label></div></details>
-      <details class="qa" data-t="sys" id="q17"><summary><span class="topic">端到端</span><span class="q">decode 时 GPU 为什么会空闲？</span><span class="mark"></span></summary><div class="a"><p>CPU 把 kernel 放进队列、GPU 按顺序执行，两者异步。decode 每个 kernel 只要几 μs，CPU 发射一个要几十 μs，GPU 做完只能等。不开 nsys 时，Orin 上 eager decode b1 每层 1436 μs，kernel 合计约 1264 μs，GPU 约 12% 时间空闲；ours 只多约 30 μs。batch 8 时 kernel 变大，几乎不空闲。判断方法：比较实际耗时和 kernel 合计。</p><label><input type="checkbox" id="m-q17"> 已掌握</label></div></details>
-      <details class="qa" data-t="sys" id="q18"><summary><span class="topic">端到端</span><span class="q">CUDA Graphs 是什么？有什么限制？</span><span class="mark"></span></summary><div class="a"><p>把一串 kernel 录成图，之后一次 cudaGraphLaunch 重放。kernel 不变快，只去掉 CPU 发射开销，所以 decode 收益大、prefill 几乎没用。限制：地址固定（新输入要拷进录制时的缓冲区）、形状固定（vLLM 为常见 batch 各录一张）、没有 CPU 分支。</p><label><input type="checkbox" id="m-q18"> 已掌握</label></div></details>
-      <details class="qa" data-t="sys" id="q19"><summary><span class="topic">端到端</span><span class="q">decode 为什么 batch 8 的 kernel 时间只比 batch 1 多一点？</span><span class="mark"></span></summary><div class="a"><p>decode 的 kernel 时间主要在读权重：一层 205 MB，按约 190 GB/s 读一遍约 1.08 ms，实测 1.26 ms。batch 8 仍只读一遍权重，8 个 token 共用，所以只到 1.73 ms。这就是推理服务要批处理的原因。</p><label><input type="checkbox" id="m-q19"> 已掌握</label></div></details>
-      <details class="qa" data-t="method" id="q20"><summary><span class="topic">测量</span><span class="q">你怎么保证性能数据可信？</span><span class="mark"></span></summary><div class="a"><ul><li>先验证正确性；</li><li>Orin 锁频并记录频率；</li><li>预热，CUDA event 包住多次调用，多样本取中位数，多轮交替；</li><li>关键结论 3 个独立进程确认；</li><li>算有效带宽和峰值比，超过峰值说明在 L2；</li><li>知道工具偏差：ncu 冷缓存基础频率，nsys 放大发射开销。</li></ul><label><input type="checkbox" id="m-q20"> 已掌握</label></div></details>
-      <details class="qa" data-t="method" id="q21"><summary><span class="topic">测量</span><span class="q">举一个你被数据推翻的猜测。</span><span class="mark"></span></summary><div class="a"><p>曾看到 n=3840 比 4096 快一倍，以为和 n 有关。3 个独立进程重复扫描后只有部分运行出现，原因是那次工作集刚好留在 L2。之后把"避开接近 L2 大小的形状"作为规则。warp 版阈值 1024 → 256 也是类似例子。</p><label><input type="checkbox" id="m-q21"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q22"><summary><span class="topic">kernel</span><span class="q">如果继续优化，你会做什么？</span><span class="mark"></span></summary><div class="a"><ul><li>FP16 / BF16（实际推理精度，搬运减半）；</li><li>warp 间规约改成一次同步：部分和放进 shared，再用一个 warp shuffle；</li><li>查清不用 CUDA Graph 时调用自定义算子的 CPU 开销；</li><li>层间也融合（上一层最后的 add + 下一层 norm1）、silu * mul 融合；</li><li>TensorRT 这条线：FP16（half 读写、float 累加）、fused 版 plugin、INT8。</li></ul><p class="small muted">已完成：残差加法 + RMSNorm 融合、TORCH_LIBRARY 注册并接入 compile 和 CUDA Graphs、按行数分档、float4 向量化、TensorRT plugin FP32。</p><label><input type="checkbox" id="m-q22"> 已掌握</label></div></details>
-      <details class="qa" data-t="torch" id="q23"><summary><span class="topic">PyTorch</span><span class="q">你的算子在 torch.compile 下为什么反而变慢？后来怎么追回来的？</span><span class="mark"></span></summary><div class="a"><ul><li>Inductor 把"残差相加 + norm2"融合成一个 Triton kernel；我们的算子是黑盒，残差只能单独一个 kernel，kernel 14 → 15，decode b1 341 → 378 μs。</li><li>写 fused add + RMSNorm 后 kernel 数持平，但 GPU 时间还多 26 μs，说明问题变成 kernel 本身。</li><li>读 inductor_cache：Triton 每行 512 线程（num_warps=16），我们 128；单 kernel 扫描证实 1 行时 128×16 最慢。分档加行数维度后，GPU 差距 26 → 5 μs，CUDA Graph 下整层只差 2.4%；再加 float4 后 GPU 时间 278.0 vs 276.4 μs，CUDA Graph 下 b1 只差 0.6%、b8 打平。</li><li>排除频率：同作业交替测、三次独立作业差距稳定、只多在 RMSNorm 部分（间接证据）。</li></ul><label><input type="checkbox" id="m-q23"> 已掌握</label></div></details>
-      <details class="qa" data-t="torch" id="q24"><summary><span class="topic">PyTorch</span><span class="q">torch.compile 从调用到执行经过哪几步？融合发生在哪？</span><span class="mark"></span></summary><div class="a"><p>torch.compile 只包一层；第一次调用时 Dynamo 用 FakeTensor 逐行读 forward 抓 FX 图和 guards（自定义算子靠 Meta 推形状，非张量代码会 graph break）→ AOTAutograd 翻译成核心 aten 算子 → Inductor lowering、scheduler（融合在这里）、codegen 出 Triton，矩阵乘交给 cuBLAS → reduce-overhead 时再录 CUDA Graph。</p>
-      <p>缓存按 guards 存多份，默认上限 8。Dynamo 管图完不完整，Inductor 管 kernel 少不少，CUDA Graph 管 CPU 发射开销。</p><label><input type="checkbox" id="m-q24"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q25"><summary><span class="topic">kernel</span><span class="q">为什么分档不能只看 n，还要看行数？</span><span class="mark"></span></summary><div class="a"><p>行数 = batch × seq，决定一次启动多少 block。decode b1 只有 1 行、整张 A100 只有 1 个 block，速度由延迟决定：128 线程每个串行读 16 个数，比不过 512 线程每个读 4 个（8.25 vs 5.01 μs）。</p>
-      <p>行多时 GPU 已满，block 小一点能让一个 SM 同时放几个、更好地藏延迟（512 行时 256×8 最好）。同一模型 hidden 固定，行数每一步都在变，所以两个维度都要看。之前单算子测试都是几千行，看不出来，放进整层测 decode 才暴露。</p><label><input type="checkbox" id="m-q25"> 已掌握</label></div></details>
-      <details class="qa" data-t="sys" id="q26"><summary><span class="topic">端到端</span><span class="q">eager+ours、compile、compile_cg 在 decode 下的收益分别来自哪？</span><span class="mark"></span></summary><div class="a"><p>都是在减少 CPU 发 kernel 的开销。eager+ours：RMSNorm 从约 5 个 kernel 变 1 个，一层少 10 个，每个约 14 μs，−29%；compile：Inductor 自动融合，约 14 个 kernel，−30%；compile_cg：再加 CUDA Graph，整串一次重放，CPU 开销基本消失，−57%。prefill 时 GPU 被矩阵乘占满、CPU 发射和计算重叠，所有写法差距 ≤2%。</p><label><input type="checkbox" id="m-q26"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q27"><summary><span class="topic">kernel</span><span class="q">float4 向量化是什么？有什么前提？</span><span class="mark"></span></summary><div class="a"><p>把指针当 float4* 读，一条 LDG.E.128 读 16 字节（4 个 float）进寄存器：数据量不变，读指令变成四分之一，延迟受限和带宽受限时都有帮助。线程按 float4 跨步，一个 warp 一条指令读连续 512 字节，仍是合并访问。</p>
-      <p>前提：地址 16 字节对齐（n % 4 == 0 才能保证每行开头对齐，切片可能不对齐），否则 misaligned address；所以 C++ 先检查，不满足就退回标量版。用 cuobjdump 看 SASS 确认有 LDG.E.128。</p>
-      <p>实测 1 行 add+norm 5.91 → 4.43 μs，整层 GPU 时间追平 Inductor。Triton 从 tt.divisibility=16 知道对齐，自动就做了。</p><label><input type="checkbox" id="m-q27"> 已掌握</label></div></details>
-      <details class="qa" data-t="method" id="q28"><summary><span class="topic">测量</span><span class="q">你怎么判断时间花在 GPU 还是 CPU？举个例子。</span><span class="mark"></span></summary><div class="a"><p>同时看实际耗时和 GPU kernel 总时间（profiler / nsys 的 kernel 时间可信）。float4 之后 compile+fused 和 compile：实际 397.8 vs 363.9 μs，kernel 总时间 278.0 vs 276.4 μs——GPU 只差 1.6，剩下约 32 μs 在 CPU。</p>
-      <p>再用 CUDA Graph 去掉 CPU 发射：cg+fused 212.4 vs 211.2，差距几乎消失，印证了这一点。单 kernel 比较则把同一个 kernel 录进 CUDA Graph 连续 100 次，彻底排除 CPU；计时前先让 GPU 升频（有一次扫描就因为没预热，把第一组数测大了近一倍）。</p><label><input type="checkbox" id="m-q28"> 已掌握</label></div></details>
-      <details class="qa" data-t="sys" id="q29"><summary><span class="topic">端到端</span><span class="q">你是怎么把自己的算子接进 TensorRT 的？</span><span class="mark"></span></summary><div class="a"><ul><li>先把选档和启动代码从 PyTorch 扩展里剥出来，放进只依赖 CUDA 的 launch.cuh，PyTorch 扩展和 plugin 共用（不带 PyTorch 路径单独 nvcc 编译验证）；</li><li>导出时写 symbolic：<code>ai_infra::rms_norm</code> → ONNX 自定义节点 RmsNorm，eps 作属性；老导出器追踪时真的跑 CUDA kernel，所以在 GPU 上导出；</li><li>plugin（IPluginV2DynamicExt）：getOutputDimensions 对应 Meta，supportsFormatCombination 声明只要 FP32 + 连续，enqueue 里调 launchRMSNorm，serialize 存 eps；creator 是工厂，REGISTER_TENSORRT_PLUGIN 让 .so 一加载就登记；</li><li>CMake 编成只链接 CUDA 和 TensorRT 的 .so，trtexec <code>--plugins=</code> 建 engine；用导出时存的同一个输入对 PyTorch 结果，误差约 1e-6。</li></ul><label><input type="checkbox" id="m-q29"> 已掌握</label></div></details>
-      <details class="qa" data-t="sys" id="q30"><summary><span class="topic">端到端</span><span class="q">加了 plugin 以后 b8 快了一倍，是你的 kernel 快吗？</span><span class="mark"></span></summary><div class="a"><p>不是。逐层看 norm 只有几 μs，和 Myelin 自己生成的差 1 μs 左右。原来 Myelin 把整层包成一个节点，在 FP32、禁 TF32、M=8 下给 MLP 矩阵乘选了 sliced1x4 sgemm，每个 2.4 ms；plugin 是黑盒，Myelin 被切成 17 段，MLP 矩阵乘交给普通矩阵乘层后只要 0.87 ms。</p>
-      <p>代价是多了独立的 Add 和 reshape 拷贝（各约 6 μs）。而且两个 engine 在 b8 都比 PyTorch eager（1.80 ms）慢，真正的问题是矩阵乘的 kernel 选择（推测，待开 TF32 / FP16 验证）。这和 compile 下"我们的算子挡住融合"是同一类现象：插入黑盒会改变编译器的整体决策。</p><label><input type="checkbox" id="m-q30"> 已掌握</label></div></details>
-      <details class="qa" data-t="kernel" id="q31"><summary><span class="topic">kernel</span><span class="q">标量版每个线程也读 4 个 float，为什么 float4 还有收益？</span><span class="mark"></span></summary><div class="a"><p>标量版是一个线程发 4 条 <code>LDG.E</code>、分 4 次读（线程 0 读 x[0]、x[512]、x[1024]、x[1536]）；float4 是一条 <code>LDG.E.128</code> 一次读 x[0..3]。数据量一样，读指令差 4 倍；一个 warp 一条指令从 128 字节变成 512 字节。</p>
-      <p>每条读指令都有发出、追踪、等数据的固定开销：1 行时速度看延迟，指令少等待轮数就少；行多时每条指令带更多数据，更容易用满带宽。Quest n=2048、1 行 add+norm：标量 512×4 5.91 μs，float4 512×4 4.43 μs。</p>
-      <p>它和 sector 对齐是两件事：对齐决定这段数据跨几个 32 字节块，float4 决定读这段数据要发几条指令；float4 还要求 16 字节对齐。</p><label><input type="checkbox" id="m-q31"> 已掌握</label></div></details>
-      <details class="qa" data-t="sys" id="q32"><summary><span class="topic">端到端</span><span class="q">导出那边和 plugin 那边怎么对上？写错会怎样？</span><span class="mark"></span></summary><div class="a"><p>两段代码互不调用，只靠 ONNX 里两个字符串：节点名 <code>RmsNorm</code>（symbolic 写 <code>g.op("ai_infra::RmsNorm", …)</code>，plugin 的 <code>getPluginName()</code> 返回 "RmsNorm"、版本 "1"）和属性名 <code>eps</code>（导出写 <code>eps_f</code>，creator 按 "eps" 读）。</p>
-      <p>加载 .so 时 creator 登记；Parser 遇到不认识的 RmsNorm 就按名字查注册表、调 <code>createPlugin</code>；engine 里只存 plugin 名字、版本和 eps。节点名写错：导出成功，建 engine 时报找不到 plugin；没加载 .so：建或加载 engine 时失败；属性名写成 epsilon：可能不报错，悄悄用默认值 1e-6，结果只差一点，所以必须和 PyTorch 输出比误差。</p><label><input type="checkbox" id="m-q32"> 已掌握</label></div></details>
-      <details class="qa" data-t="sys" id="q33"><summary><span class="topic">端到端</span><span class="q">TensorRT 给矩阵乘挑了慢的 kernel，你能怎么办？</span><span class="mark"></span></summary><div class="a"><ul><li>先证明问题在哪：<code>--exportLayerInfo</code>、<code>--dumpProfile</code>、nsys 看实际 kernel；b8 下 PyTorch eager（cuBLAS）1.80 ms，说明硬件本身没问题；</li><li>验证原因：FP16 或开 TF32 重建，看 kernel 和时间变不变。用 eager ONNX 开 FP16 重建：矩阵乘换成 Tensor Core 的 h16816gemm，b8 8.92 → 2.44 ms，说明和 kernel 选择有关（TF32 没测）；</li><li>调整模型结构，比如改 ONNX 图、切分节点，影响 Myelin 分组；换 TensorRT 版本或平台比较；</li><li>某个矩阵乘特别值得时自己写 plugin；或用 ONNX Runtime CUDA EP 跑同一个 ONNX 作开源对照，隔离问题是否在 TensorRT。</li></ul><p>之前 b8 变快恰好是 plugin 切开了 Myelin，不是主动设计，不能当成稳定方法，真实项目里要把这种依赖写进风险。</p><label><input type="checkbox" id="m-q33"> 已掌握</label></div></details>
-    </div>
-  
-      </div>
 </article>

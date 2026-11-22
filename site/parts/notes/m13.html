@@ -2,8 +2,8 @@
       <div class="eyebrow">模块 13</div>
       <h2>LLM 推理全流程：prefill、decode、lm_head 与 KV cache</h2>
       <p class="why"><strong>解决什么问题</strong>：把学过的算子（RMSNorm、GEMM）放回它们所在的地方——一句话从输入到生成回答，中间到底发生了什么，每一步是哪种瓶颈。用 TinyLlama-1.1B（22 层、hidden 2048、32 个头、4 个 KV 头、每头 64 维、MLP 5632、词表 32000）和例子"今天 天气 很"走一遍。本模块全部是讲解和粗算，<strong>没有实验数据</strong>；模型和系统的细节（哪个模型用什么结构、论文里的数字）是讲解内容，没有逐条核对出处。</p>
-
-      <div class="blk"><h3>先认清三类数据</h3>
+      <div class="blk ch" id="m13-ch1"><h3><span class="chn">1</span>基本概念</h3>
+        <section class="sub"><h4 class="subt">三类数据：权重、激活、KV cache</h4>
         <div class="tablewrap"><table>
           <thead><tr><th></th><th>内容</th><th>大小</th><th>会不会变</th></tr></thead>
           <tbody>
@@ -25,9 +25,8 @@
           </tbody>
         </table></div>
         <p>整个模型另有 embedding 表（32000 × 2048）、最后的 RMSNorm（2048）、lm_head（32000 × 2048）。</p>
-      </div>
-
-      <div class="blk"><h3>七步流程</h3>
+        </section>
+        <section class="sub"><h4 class="subt">推理的七个步骤</h4>
 <pre><code>文字 → ① 分词 → ② embedding → ③ prefill：22 层一次处理整段 prompt（顺便建好 KV cache）
      → ④ 输出层：得到每个词的分数 → ⑤ 采样出一个词
      → ⑥ decode 循环：每次只喂刚生成的 1 个词，过 22 层，再采样一个……直到结束
@@ -41,9 +40,23 @@
           <li><strong>decode 循环</strong>："好" → embedding → x：1 × 2048，同样过 22 层，但只算这 1 行 → lm_head → 采样 → 得到"。"，再喂进去……每生成一个词的时间叫 <strong>TPOT</strong>，决定每秒出几个字。</li>
           <li><strong>停止并输出</strong>：遇到结束符或达到最大长度，把编号拼回文字。</li>
         </ol>
+        </section>
+        <section class="sub"><h4 class="subt">decoder layer 与 decode 阶段</h4>
+        <div class="tablewrap"><table>
+          <thead><tr><th></th><th>Decoder layer（解码器层）</th><th>Decode 阶段（解码阶段）</th></tr></thead>
+          <tbody>
+            <tr><td>是什么</td><td>模型的<strong>结构</strong>：一个组件</td><td>推理的<strong>时间阶段</strong>：一个过程</td></tr>
+            <tr><td>对应</td><td><code>DecoderLayer</code> 那个类</td><td>生成时"一次出一个 token"的那段循环</td></tr>
+            <tr><td>和谁对比</td><td>encoder layer</td><td>prefill 阶段</td></tr>
+          </tbody>
+        </table></div>
+        <p>名字的来历：最早的 Transformer（2017，做翻译）分两半，encoder 读原文、每个词能看全句；decoder 生成译文、带 causal mask、每个词只能看自己和前面。Llama、GPT 只保留 decoder 那一半（decoder-only），每层就叫 decoder layer，代码里 <code>is_causal=True</code> 是它的标志。</p>
+        <p><strong>同样的 22 个 decoder layer，在 prefill 和 decode 两个阶段都要走</strong>，只是输入不一样。prefill 和 decode 是两个阶段，不是两层：模型有 22 层、回复 100 个 token，就是 prefill 走 22 层一次，decode 走 22 层 100 次。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>prefill 时一层里做什么</h3>
+      <div class="blk ch" id="m13-ch2"><h3><span class="chn">2</span>Prefill</h3>
+        <section class="sub"><h4 class="subt">一层里的计算</h4>
 <pre><code>① 归一化        a = RMSNorm(x)                        3 × 2048
 ② 算 Q、K、V    Q = a × W_q   → 3 × 2048 = 32 个头 × 64 维
                 K = a × W_k   → 3 × 256  =  4 个头 × 64 维（GQA）
@@ -61,22 +74,8 @@
                 结果 = m × W_down                     3 × 2048
 ⑨ 残差          x = x + 结果</code></pre>
         <p>输出的 x 还是 3 × 2048，交给下一层，重复 22 次。每层 7 个大矩阵乘（Q、K、V、O、gate、up、down）、2 次 RMSNorm（最后输出层还有 1 次）。我们自己写的那一层 <code>DecoderLayer</code>（<a href="#m8">模块 8</a>）就是这个骨架，少了 RoPE 和 KV cache，所以现在只能做 prefill 那种计算。</p>
-      </div>
-
-      <div class="blk"><h3>decoder layer 和 decode 阶段不是一回事</h3>
-        <div class="tablewrap"><table>
-          <thead><tr><th></th><th>Decoder layer（解码器层）</th><th>Decode 阶段（解码阶段）</th></tr></thead>
-          <tbody>
-            <tr><td>是什么</td><td>模型的<strong>结构</strong>：一个组件</td><td>推理的<strong>时间阶段</strong>：一个过程</td></tr>
-            <tr><td>对应</td><td><code>DecoderLayer</code> 那个类</td><td>生成时"一次出一个 token"的那段循环</td></tr>
-            <tr><td>和谁对比</td><td>encoder layer</td><td>prefill 阶段</td></tr>
-          </tbody>
-        </table></div>
-        <p>名字的来历：最早的 Transformer（2017，做翻译）分两半，encoder 读原文、每个词能看全句；decoder 生成译文、带 causal mask、每个词只能看自己和前面。Llama、GPT 只保留 decoder 那一半（decoder-only），每层就叫 decoder layer，代码里 <code>is_causal=True</code> 是它的标志。</p>
-        <p><strong>同样的 22 个 decoder layer，在 prefill 和 decode 两个阶段都要走</strong>，只是输入不一样。prefill 和 decode 是两个阶段，不是两层：模型有 22 层、回复 100 个 token，就是 prefill 走 22 层一次，decode 走 22 层 100 次。</p>
-      </div>
-
-      <div class="blk"><h3>prefill 出来的是什么，为什么只用最后一行</h3>
+        </section>
+        <section class="sub"><h4 class="subt">输出只取最后一行</h4>
         <p>22 层走完得到一个 3 × 2048 的矩阵，每个 token 一行，叫 hidden state——"模型读到这个位置时的总结"。关键在于<strong>第 i 行是被训练成预测第 i+1 个词的</strong>：</p>
         <ul class="plain">
           <li>"今天"那一行：用来猜下一个词，答案是"天气"。</li>
@@ -84,9 +83,11 @@
           <li><strong>"很"那一行</strong>：总结了"今天天气很"，用来猜下一个词，这正是我们要的。</li>
         </ul>
         <p>前两行的"下一个词"就在 prompt 里，训练时有用，推理时用不上。所以只取最后一行，一个 2048 维的向量 h。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>lm_head：给每个词打分</h3>
+      <div class="blk ch" id="m13-ch3"><h3><span class="chn">3</span>生成一个词</h3>
+        <section class="sub"><h4 class="subt">lm_head 打分</h4>
         <p>lm_head 是一个 32000 × 2048 的权重矩阵：32000 行对应词表里的 32000 个 token，每一行是这个词的 2048 维向量。所以<strong>lm_head 本身就是"词库"</strong>，不是拿它去和另一个词库比。<code>logits = lm_head × h</code> 一次算出 h 和全部 32000 个词向量的点积（一次 GEMV），点积越大说明这个词和当前语境越搭。这些行向量是训练学出来的。</p>
 <pre><code>玩具例子：5 个词、3 维（省略了点积之前的 RMSNorm）
 h = [0.9, 0.1, 0.5]                     （"今天天气很"那一行）
@@ -103,9 +104,8 @@ h = [0.9, 0.1, 0.5]                     （"今天天气很"那一行）
 <pre><code>prefill：  整段 prompt → 22 层 → 取最后一行 → lm_head → 采样 → 第 1 个新词
 decode 1： 第 1 个新词  → 22 层 → lm_head → 采样 → 第 2 个新词
 decode 2： 第 2 个新词  → 22 层 → lm_head → 采样 → 第 3 个新词</code></pre>
-      </div>
-
-      <div class="blk"><h3>softmax 和采样</h3>
+        </section>
+        <section class="sub"><h4 class="subt">softmax 与采样</h4>
         <p>分数可正可负，加起来也不等于 1。softmax 先取 e 的指数（都变成正数），再除以总和：</p>
 <pre><code>e^1.30 = 3.67   e^1.03 = 2.80   e^0.88 = 2.41   e^0.10 = 1.11   e^−0.14 = 0.87     总和 = 10.86
 概率：好 34%   冷 26%   热 22%   猫 10%   跑 8%</code></pre>
@@ -115,9 +115,11 @@ decode 2： 第 2 个新词  → 22 层 → lm_head → 采样 → 第 3 个新�
           <li><strong>top-p</strong>：按概率从大到小累加到 p 为止，只在这几个词里抽。p = 0.8 时好 + 冷 + 热 = 82%，"猫""跑"直接排除。</li>
         </ul>
         <p>softmax 在流程里出现两处：attention 里面，以及最后采样。</p>
+        </section>
       </div>
 
-      <div class="blk"><h3>decode：每次 1 个 token，靠 KV cache 看到整句话</h3>
+      <div class="blk ch" id="m13-ch4"><h3><span class="chn">4</span>Decode 与 KV cache</h3>
+        <section class="sub"><h4 class="subt">逐 token 生成与 KV cache</h4>
         <p>"好"查 embedding 得到 1 × 2048 的 x，作为唯一的输入过 22 层。每层的区别：</p>
         <ul class="plain">
           <li>Q、K、V 都只有 1 行。</li>
@@ -131,9 +133,8 @@ decode 2： 第 2 个新词  → 22 层 → lm_head → 采样 → 第 3 个新�
 decode 1：    [今天, 天气, 很, 好]          4 个   ← 追加"好"
 decode 2：    [今天, 天气, 很, 好, 。]      5 个   ← 追加"。"</code></pre>
         <p>后果：越生成越慢一点（attention 要读的 K、V 越来越多）；显存一直涨，到上下文窗口为止。</p>
-      </div>
-
-      <div class="blk"><h3>两个阶段是两种瓶颈</h3>
+        </section>
+        <section class="sub"><h4 class="subt">两个阶段的瓶颈</h4>
         <div class="tablewrap"><table>
           <thead><tr><th></th><th>prefill</th><th>decode</th></tr></thead>
           <tbody>
@@ -164,9 +165,11 @@ Llama-2-7B： 2 × 32 × 32 × 128 × 2 字节 = 512 KB / token   一个 4K 上�
             <tr><td>KV cache 管理</td><td>每层读写</td><td>下一节是概念，还没动手</td></tr>
           </tbody>
         </table></div>
+        </section>
       </div>
 
-      <div class="blk"><h3>生产中怎么管 KV cache 的大小</h3>
+      <div class="blk ch" id="m13-ch5"><h3><span class="chn">5</span>生产中的 KV cache 管理</h3>
+        <section class="sub"><h4 class="subt">容量控制</h4>
         <p>分成几类：少存、存得紧凑、复用、放不下怎么办。</p>
         <p><strong>一、从模型结构上让每个 token 存得更少</strong>（模型设计时定好的）：</p>
         <div class="tablewrap"><table>
@@ -199,9 +202,8 @@ Llama-2-7B： 2 × 32 × 32 × 128 × 2 字节 = 512 KB / token   一个 4K 上�
           </tbody>
         </table></div>
         <p><strong>端侧简单得多</strong>（比如 Orin 上用 llama.cpp）：启动时按设定的上下文长度（<code>n_ctx</code>）一次性分配好整块 cache；满了就停止，或者丢掉一部分旧内容腾地方（context shift）。主要手段是 KV cache 量化和选用 GQA 模型，因为端侧通常只服务一个用户，不需要分页和调度那一套。</p>
-      </div>
-
-      <div class="blk"><h3>cache 的"冷热"怎么看</h3>
+        </section>
+        <section class="sub"><h4 class="subt">冷热判断与换出</h4>
         <p>按<strong>最近会不会被用到</strong>来分，和 CPU 缓存、操作系统换页的思路一样。关键点：<strong>正在生成的请求，它的 cache 全部是热的</strong>——decode 每一步新词的 Q 都要和这个请求全部的 K、V 做 attention，整块都要读，没有哪部分可以挪走。冷热主要是在<strong>请求之间</strong>区分的。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>状态</th><th>冷 / 热</th><th>例子</th></tr></thead>
@@ -216,9 +218,11 @@ Llama-2-7B： 2 × 32 × 32 × 128 × 2 字节 = 512 KB / token   一个 4K 上�
         <p><strong>系统怎么判断</strong>：最近什么时候被用过（LRU，显存不够时先踢最久没用过的；vLLM 的 prefix caching 是请求结束后块不马上清空、标记为可回收，需要新块时从最久没被命中的开始回收）；被用了多少次；引用计数（计数 &gt; 0 的块绝对不能动）；请求的状态（调度器知道哪些在跑、哪些在排队、哪些在等用户）。</p>
         <p><strong>挪走还是丢掉，算一笔账</strong>：换出到 CPU 内存或 SSD，代价是以后搬回来的传输时间；直接丢掉，代价是以后重新 prefill 的计算时间。前缀很长（几万 token 的文档）时重算很贵，存下来更划算；前缀很短或传输很慢时直接重算可能更快。</p>
         <p>例子：用户聊了 8000 个 token 后在想下一句，这段时间 cache 是冷的，可以挪到 CPU 内存；用户发来新消息时搬回 GPU，只对新消息做 prefill；10 分钟都没回就可能直接删掉。所以冷热本质上是一个<strong>预测问题</strong>：猜这块 cache 下次什么时候会被用到，再在显存、CPU 内存、SSD 和重算之间选最便宜的。</p>
+        </section>
       </div>
 
-      <div class="blk iv" id="m13-iv"><h3>面试要求</h3>
+      <div class="blk ch" id="m13-ch6"><h3><span class="chn">6</span>复习</h3>
+        <section class="sub iv" id="m13-iv"><h4 class="subt">面试要求</h4>
         <p>LLM 推理岗位的基础题。这里只到"讲清流程和瓶颈"，vLLM 的实现细节和手写 KV cache 还没学。</p>
         <h4>必须会</h4>
         <ul class="plain">
@@ -242,7 +246,9 @@ Llama-2-7B： 2 × 32 × 32 × 128 × 2 字节 = 512 KB / token   一个 4K 上�
           <li>MoE 模型在 FFN 位置的差别（每个 token 只去部分专家，多卡时是 all-to-all；dense 模型的张量并行是 all-reduce），见<a href="#lina">Lina 论文笔记</a>。</li>
         </ul>
         <p class="small muted">三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+        </section>
       </div>
+
 
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>推理时有哪三类数据？各自多大、会不会变？"1.1B"指的是什么？</li>
