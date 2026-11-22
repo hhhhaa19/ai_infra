@@ -231,7 +231,8 @@ off = 2：    3   4  11  11  12  12  11  14     lane ≥ 2 加上左边第 2 个
 off = 4：    3   4  11  11  15  16  22  25     lane ≥ 4 加上左边第 4 个</code></pre>
         <p>off 从 16 往 1 倒着走也对：lane i 最后的值是所有 x[i − d] 之和，d 是从 {16, 8, 4, 2, 1} 里挑若干个加起来，而 0～31 的每个数写成二进制只有一种方式，所以每一项正好加一次，和先后顺序无关；d &gt; i 的项被 <code>if (lane &gt;= off)</code> 挡掉。两种顺序只是中间状态不同，习惯上写从 1 往上。</p>
         <p><strong>shuffle 只在调用者自己的 warp 里交换</strong>：<code>warp_scan_incl</code> 是每个线程各自执行一遍，lane 是调用者在自己 warp 里的编号；lane 0 往前没有 lane，返回自己的值、被 if 挡掉，不会去拿上一个 warp 的 lane 31。所以三层衔接各用各的办法：warp 内 shuffle，warp 之间 shared + <code>__syncthreads()</code>，block 之间多个 kernel 或 look-back。</p>
-        <p><strong>第 3 步的两个细节</strong>：warp 0 对 8 个 warp_sums 做 scan 时，32 个 lane 必须全部执行 shuffle（mask 是 0xffffffff），所以 lane ≥ 8 的读 0 陪着算、最后只有 lane 0～7 写回——和 softmax warp 版越界填 −∞ 是同一个思路。两个 <code>__syncthreads()</code> 都要写在 <code>if (warp == 0)</code> 外面：同步 ① 保证 8 个 warp 都写完 warp_sums，同步 ② 保证 warp 0 写回 scan 结果后别的 warp 才读 <code>warp_sums[warp − 1]</code>。</p>
+        <p><strong>第 3 步的两个细节</strong>：warp 0 对 8 个 warp_sums 做 scan 时，32 个 lane 必须全部执行 shuffle（mask 是 0xffffffff），所以 lane ≥ 8 的读 0 陪着算、最后只有 lane 0～7 写回——和 softmax warp 版越界填 −∞ 是同一个思路。</p>
+        <p>两个 <code>__syncthreads()</code> 都要写在 <code>if (warp == 0)</code> 外面：同步 ① 保证 8 个 warp 都写完 warp_sums，同步 ② 保证 warp 0 写回 scan 结果后别的 warp 才读 <code>warp_sums[warp − 1]</code>。</p>
         <p><strong>incl、excl 不会改动 v</strong>：<code>warp_scan_incl(int x)</code> 按值传参，传进去的是 v[3] 的副本，shuffle 交换的也是各线程自己的副本 x，v[0..3] 直到第 4 步才被改。第 1 步之后 v[3] 已经是本线程 4 个数的总和，所以 incl 是"包括我在内前面所有线程的总和"，excl = incl − v[3] 不含自己的任何一个数。lane 1 的完整过程（只看 warp 内）：</p>
 <pre><code>                       v[0]  v[1]  v[2]  v[3]   incl   excl
 第 0 步 读入             4     1     6     3
@@ -285,7 +286,8 @@ block 3 往前看：30（A）→ 20（A）→ 10（P，停），excl = 60，公�
           <li><strong>等待时必须真的去读显存</strong>：普通的 <code>while (status == X)</code> 可能被编译器只读一次放进寄存器，或被 L1 缓存住，永远看不到更新。要用 <code>volatile</code> 指针或原子操作读。</li>
           <li><strong>每次 launch 前清零</strong>：状态数组和计数器都要是 0，所以 launch 里先 <code>cudaMemsetAsync(work, 0, …)</code>。</li>
         </ol>
-        <p><strong>和 double buffering 不是一回事</strong>：double buffering 在一个 block 内部，让搬下一块和算这一块重叠；look-back 是 block 之间的通信协议，省掉的是一整个 kernel 和一遍读写。更贴切的类比是加法器：接力像逐位进位，look-back 像跳跃进位。一句话：把"自己的部分"和"依赖别人的部分"拆开，自己的部分先公布，依赖别人的部分往前查到第一个已确定的结果就停。CUB 还让一个 warp 同时往前看 32 个 block、再用 shuffle 加起来。</p>
+        <p><strong>和 double buffering 不是一回事</strong>：double buffering 在一个 block 内部，让搬下一块和算这一块重叠；look-back 是 block 之间的通信协议，省掉的是一整个 kernel 和一遍读写。</p>
+        <p>更贴切的类比是加法器：接力像逐位进位，look-back 像跳跃进位。一句话：把"自己的部分"和"依赖别人的部分"拆开，自己的部分先公布，依赖别人的部分往前查到第一个已确定的结果就停。CUB 还让一个 warp 同时往前看 32 个 block、再用 shuffle 加起来。</p>
         <p class="small muted">决定先不写 ④：思路已经讲清，难点在内存可见性和调度细节，调试耗时，而之后的卷积和 attention 用不上它。scan 在 ③ 收尾。</p>
       </div>
 

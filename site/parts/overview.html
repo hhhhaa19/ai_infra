@@ -13,7 +13,7 @@
     <div class="phase">
       <div class="phase-head"><h3>算子线：手写 CUDA</h3></div>
       <ol class="tasks">
-        <li><span class="n">1</span><div class="t"><h4>RMSNorm <span class="pill done">已完成</span></h4><p class="small">受带宽限制的算子：warp shuffle 规约 → 编译期线程数 → x 存寄存器 → 按 n 分档 → float4，再接入 PyTorch、torch.compile 和 TensorRT plugin。 见 <a href="#rmsnorm">RMSNorm 专题</a>。</p></div></li>
+        <li><span class="n">1</span><div class="t"><h4>RMSNorm <span class="pill done">已完成</span></h4><p class="small">受带宽限制的算子：warp shuffle 规约 → 编译期线程数 → x 存寄存器 → 按 n 分档 → float4，再接入 PyTorch、torch.compile 和 TensorRT plugin。 见 <a href="#rmsnorm">RMSNorm</a>。</p></div></li>
         <li><span class="n">2</span><div class="t"><h4>GEMM <span class="pill done">已完成</span></h4><p class="small">naive 408 → 寄存器分块 1744 → double buffering 2895 GFLOPS（4096³，cuBLAS 的 85%）。 见 <a href="#m11">模块 11</a>。</p></div></li>
         <li><span class="n">3</span><div class="t"><h4>转置 <span class="pill done">已完成</span></h4><p class="small">shared memory tile + padding 消 bank conflict，每线程搬 4 行后到 copy 的 97～98%（8192² 只有 80%，原因未查）。 见 <a href="#m12">模块 12</a>。</p></div></li>
         <li><span class="n">4</span><div class="t"><h4>Softmax <span class="pill done">已完成</span></h4><p class="small">naive / block / online / warp 四版，按 n 分档派发：n ≤ 1024 用 warp 版（copy 的 106～108%），很长的行用 online 版。 见 <a href="#m14">模块 14</a>。</p></div></li>
@@ -58,5 +58,21 @@
 
   <section>
     <p class="small muted">设备：Jetson AGX Orin 64GB（sm_87，TensorRT 8.5.2）是主力平台；Quest A100-PCIE-40GB（sm_80）用于交叉验证。</p>
+  </section>
+  <section>
+    <div class="panel" id="notes-interview">
+      <h2>面试要求怎么看</h2>
+      <p>每个模块在「自测」前加了一块「面试要求」，按推理优化 / 端侧部署 / CUDA 算子方向常见的面试内容分三档：<strong>必须会</strong> = 不看资料能当场讲清或写出来，答不上来基本会被判定为"没真正做过"；<strong>应该会</strong> = 能讲清原理、写出关键片段、结合自己的项目举例；<strong>加分</strong> = 知道是什么、解决什么问题，能说出思路。各模块的「高频问题」并进了自测。档位是按这类岗位常见面试内容整理的经验判断，具体公司会有差异。</p>
+      <p><strong>通用原则</strong>：面试官最常问的不是"这是什么"，而是"你为什么这么做、你怎么知道它有效、数字是多少"。每个模块都准备一个<strong>自己做过的具体例子 + 一个数字</strong>。</p>
+      <h4>另外一定会考、但不在这些模块里的</h4>
+      <ul class="plain">
+        <li><strong>手写 CUDA 题</strong>：reduction、softmax（含 online softmax）、transpose（shared memory + 避免 bank conflict）、GEMM 分块、scan、LayerNorm / RMSNorm。</li>
+        <li><strong>Attention / FlashAttention</strong>：标准 attention 的计算和显存、FlashAttention 的分块 + online softmax、为什么能省显存访问（讲解见<a href="#m16">模块 16</a>）。</li>
+        <li><strong>LLM 推理系统</strong>：KV cache、PagedAttention、continuous batching、prefill / decode 分离（vLLM / SGLang 的核心概念）。</li>
+        <li><strong>算法题</strong>：LeetCode Hot 100，每天 1～2 题。</li>
+        <li><strong>八股</strong>：操作系统（进程 / 线程、虚拟内存、页表）、计算机组成（缓存、流水线）、C++（见模块 3）。</li>
+        <li><strong>项目讲述</strong>：RMSNorm 和 ACT 两个项目，各准备一个 2 分钟版本和一个 10 分钟版本，每个都要有"问题 → 做法 → 数字 → 局限"。</li>
+      </ul>
+    </div>
   </section>
 </div>

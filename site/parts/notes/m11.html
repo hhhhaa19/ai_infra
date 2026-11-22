@@ -956,7 +956,8 @@ draw();
           <li>反例：每线程只用 32 个寄存器、几乎不用 shared 时，寄存器够放 8 个 block，但 warp 槽位只够 6 个，占用率 100%，卡在 warp 槽位上。</li>
           <li><strong>Shared Mem 这一行也是 1，和预期不一样</strong>：每 block 只用 16.6 KB。推测：L1 和 shared memory 共用一块存储，驱动自动选了较小的 shared 配额，可以用 <code>cudaFuncSetAttribute(…, cudaFuncAttributePreferredSharedMemoryCarveout, …)</code> 调大。<strong>待验证</strong>。所以想回到每 SM 2 个 block，寄存器和 shared memory 两个限制要同时解决。</li>
         </ul>
-        <p><strong>local memory、stack frame、spill</strong>。线程的私有变量（<code>c[8][8]</code>、<code>a[8]</code>、<code>ra[4]</code>）最好都在寄存器里。寄存器有两个限制：数量有限（Ampere 每线程最多 255 个，用得越多能同时放的 warp 越少）；不能按运行时下标取（指令里必须直接写"用 R5"）。放不进寄存器的私有变量只能放 <strong>local memory</strong>：名字叫 local 是因为每个线程私有，但它物理上在 DRAM 里（经过 L1 / L2），用 <code>STL</code> / <code>LDL</code> 读写，延迟和全局内存差不多，等待也记在 long_scoreboard 上。</p>
+        <p><strong>local memory、stack frame、spill</strong>。线程的私有变量（<code>c[8][8]</code>、<code>a[8]</code>、<code>ra[4]</code>）最好都在寄存器里。寄存器有两个限制：数量有限（Ampere 每线程最多 255 个，用得越多能同时放的 warp 越少）；不能按运行时下标取（指令里必须直接写"用 R5"）。</p>
+        <p>放不进寄存器的私有变量只能放 <strong>local memory</strong>：名字叫 local 是因为每个线程私有，但它物理上在 DRAM 里（经过 L1 / L2），用 <code>STL</code> / <code>LDL</code> 读写，延迟和全局内存差不多，等待也记在 long_scoreboard 上。</p>
         <ul class="plain">
           <li><strong>stack frame</strong>：编译器给每个线程在 local memory 里划出的空间大小。<code>48 bytes stack frame</code> = 每线程 48 字节 = 12 个 float。最常见的原因是下标不固定的数组。</li>
           <li><strong>spill</strong>：寄存器不够用，编译器把一部分变量临时存到 local memory（spill store，STL），要用时再读回来（spill load，LDL）。常见原因：变量真的太多（<code>c[16][16]</code> 就要 256 个）；或者用 <code>__launch_bounds__(256, 2)</code> 强制压寄存器。</li>
@@ -1044,7 +1045,8 @@ for c, r, s:
     if (h &lt; 0 || h &gt;= H || w &lt; 0 || w &gt;= W) continue;
     sum += X[((n·C + c)·H + h)·W + w] * Wt[((k·C + c)·R + r)·S + s];
 Y[idx] = sum;                                // Y 的摊平顺序就是 n、k、p、q</code></pre>
-        <p>一维下标要一层套一层：把 Wt 想成一本书，k 是章、c 是节、r 是行、s 是字，第 k 章从 <code>k·C·R·S</code> 开始，提公因式就是 <code>((k·C + c)·R + r)·S + s</code>。<strong>易错</strong>：写成 <code>k*C + c*R + r*S + s</code>，代入 C = 2、R = S = 3、读第 1 层第一个数：正确位置是 9，这个写法得到 3（读成了第 0 层第 1 行）。<code>h = r + p</code> 只在 stride 1、pad 0 时对；idx 和 h / w 两个越界检查都不能少。kernel 里要调用的辅助函数（如 <code>P()</code> / <code>Q()</code>）要标 <code>__host__ __device__</code>。</p>
+        <p>一维下标要一层套一层：把 Wt 想成一本书，k 是章、c 是节、r 是行、s 是字，第 k 章从 <code>k·C·R·S</code> 开始，提公因式就是 <code>((k·C + c)·R + r)·S + s</code>。<strong>易错</strong>：写成 <code>k*C + c*R + r*S + s</code>，代入 C = 2、R = S = 3、读第 1 层第一个数：正确位置是 9，这个写法得到 3（读成了第 0 层第 1 行）。</p>
+        <p><code>h = r + p</code> 只在 stride 1、pad 0 时对；idx 和 h / w 两个越界检查都不能少。kernel 里要调用的辅助函数（如 <code>P()</code> / <code>Q()</code>）要标 <code>__host__ __device__</code>。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>形状（N, C, H×W, K, R×S, stride, pad）</th><th class="num">v1 direct</th><th class="num">cuDNN</th><th class="num">差距</th></tr></thead>
           <tbody>
@@ -1060,7 +1062,9 @@ Y[idx] = sum;                                // Y 的摊平顺序就是 n、k、
           <li><strong>读 X 看 stride</strong>：stride 1 时相邻线程的 w 相邻，地址连续能合并；siglip 的 stride 16 让相邻线程相隔 64 字节，32 个线程碰 32 段内存，所以最慢。</li>
           <li><strong>根本问题是没有复用</strong>：每次乘加都从显存读 2 个数。resnet3x3 里一个 X 元素被 9 个窗口位置 × 64 个卷积核用 576 次，每个权重被 3136 个输出位置用到，每次都重新读。以上是按代码推的，<strong>没有用 ncu 验证</strong>。</li>
         </ol>
-        <p><strong>下一步 v2 implicit GEMM</strong>：把 (c, r, s) 压成一个下标，长度 CRS，每个输出就是两个长度 CRS 的向量点积，所有输出合起来是一次 GEMM：A = 权重 reshape 成 K × CRS，B = "补丁矩阵" CRS × NPQ（每列是一个输出位置要用的那块输入，越界处为 0），C = K × NPQ。显式 im2col 要把 B 真写进显存，3×3 stride 1 时 B 约是输入的 9 倍；implicit 只改 GEMM 里"搬 B 的 tile"那一行，加载时按卷积规则现算地址，其余（shared 分块、寄存器分块、双缓冲）照搬模块里的 GEMM。之后的难点：每个元素都要做几次 <code>/</code> 和 <code>%</code>（预先算好或沿 k 增量更新）；NHWC 布局让 c 连续、可以 float4；padding 分支。形状差别：1×1 卷积本身就是 GEMM；siglip 的 patch embed 窗口互不重叠，im2col 只是 reshape；resnet3x3 对应 M = 64、N = 3136、K = 576。</p>
+        <p><strong>下一步 v2 implicit GEMM</strong>：把 (c, r, s) 压成一个下标，长度 CRS，每个输出就是两个长度 CRS 的向量点积，所有输出合起来是一次 GEMM：A = 权重 reshape 成 K × CRS，B = "补丁矩阵" CRS × NPQ（每列是一个输出位置要用的那块输入，越界处为 0），C = K × NPQ。</p>
+        <p>显式 im2col 要把 B 真写进显存，3×3 stride 1 时 B 约是输入的 9 倍；implicit 只改 GEMM 里"搬 B 的 tile"那一行，加载时按卷积规则现算地址，其余（shared 分块、寄存器分块、双缓冲）照搬模块里的 GEMM。</p>
+        <p>之后的难点：每个元素都要做几次 <code>/</code> 和 <code>%</code>（预先算好或沿 k 增量更新）；NHWC 布局让 c 连续、可以 float4；padding 分支。形状差别：1×1 卷积本身就是 GEMM；siglip 的 patch embed 窗口互不重叠，im2col 只是 reshape；resnet3x3 对应 M = 64、N = 3136、K = 576。</p>
       </div>
 
       <div class="blk" id="m11-im2col"><h3>卷积 v2：显式 im2col + 自己的 GEMM</h3>
@@ -1076,7 +1080,8 @@ Wt (2×4)           · B (4×4)  =  Y (2×4)
 [1 0 0 1]                         [ 6   8  12  14]   ← 输出第 0 层
 [1 1 1 1]                         [12  16  24  28]   ← 输出第 1 层（再加一个卷积核就是 Wt 多一行）</code></pre>
         <p>这就是 im2col（image to column）。乘出来的结果直接就是 Y：B 的列号 = p·Q + q，正好是 <code>Y[k][p][q]</code> 在一行里的位置；Y 的第 k 行就是第 k 个输出层。对应 GEMM 的三个维度：M = K（卷积核个数），N = P·Q（输出位置数），GEMM 的"K 维" = C·R·S（每个窗口有几个数）。resnet3x3 就是 M = 64、N = 3136、K = 576。</p>
-        <p><strong>为什么不用转置</strong>：GEMM 要求 <code>C[M×N] = A[M×K] · B[K×N]</code>，都是行主序。A = Wt，<code>Wt[k][c][r][s]</code> 本来就是一行一个卷积核；B 由我们自己按 [CRS × PQ] 行主序写，<code>B[row][col]</code> 在 <code>row·PQ + col</code>，一个窗口的数在内存里相隔 PQ，写出来就是列；C = 第 n 张图的 Y，<code>Y[k][p][q]</code> 本来就是 [K × PQ]。（上面 4×4 的 B 恰好对称，转不转看起来一样，只是巧合。）另一种摆法是每个窗口存成一行得到 Bᵀ [PQ × CRS]，算 <code>Yᵀ = Bᵀ · Wtᵀ</code>，Y 是 [PQ × K]，也就是 NHWC（channels-last）——要 NCHW 的话最后反而要再转置一次。</p>
+        <p><strong>为什么不用转置</strong>：GEMM 要求 <code>C[M×N] = A[M×K] · B[K×N]</code>，都是行主序。A = Wt，<code>Wt[k][c][r][s]</code> 本来就是一行一个卷积核；B 由我们自己按 [CRS × PQ] 行主序写，<code>B[row][col]</code> 在 <code>row·PQ + col</code>，一个窗口的数在内存里相隔 PQ，写出来就是列；C = 第 n 张图的 Y，<code>Y[k][p][q]</code> 本来就是 [K × PQ]。</p>
+        <p>（上面 4×4 的 B 恰好对称，转不转看起来一样，只是巧合。）另一种摆法是每个窗口存成一行得到 Bᵀ [PQ × CRS]，算 <code>Yᵀ = Bᵀ · Wtᵀ</code>，Y 是 [PQ × K]，也就是 NHWC（channels-last）——要 NCHW 的话最后反而要再转置一次。</p>
         <p><strong>拆下标：像"秒换算成时分秒"</strong>。B 的行号 <code>row = (c·R + r)·S + s</code>，列号 <code>col = p·Q + q</code>（N = 1 时）：</p>
 <pre><code>int s = row % S;          // 最低位：对自己的进制取余
 int r = (row / S) % R;    // 中间位：先除掉下面的位，再对自己的进制取余
@@ -1084,7 +1089,8 @@ int c = row / (R * S);    // 最高位
 int q = col % Q;  int p = col / Q;
 int h = p*stride - pad + r;  int w = q*stride - pad + s;      // 和 v1 完全相同
 B[row*PQ + col] = (h &lt; 0 || h &gt;= H || w &lt; 0 || w &gt;= W) ? 0.0f : Xn[(c*H + h)*W + w];</code></pre>
-        <p>h、w 的公式和 v1 一样，因为 im2col 只改变"按什么顺序数要哪些数"，没改变"每个数在输入图的哪里"：v1 的 (n,p,q) 来自线程号、(c,r,s) 来自循环变量；这里 (c,r,s) 来自行号、(n,p,q) 来自列号。和 v1 不同的是越界的 0 <strong>必须真的写进 B</strong>，因为 GEMM 会把整列都乘一遍。<strong>易错</strong>：<code>r = (row % C) / R</code>、<code>s = row % C % R / S</code>（r、s 和 C 无关，用 tiny 形状 row = 13 代入，应为 c = r = s = 1，得到 r = s = 0）；<code>p = col / P</code>（应为 / Q；方形输出测不出来，<code>odd_pad</code> 的 P = 7、Q = 9 能查出来）；<code>r = (row / S) % S</code>（R = S 时测不出，3×5 卷积核会错）、读 X 写成 <code>(c*C + h)*H + w</code>、漏越界补 0、第 n 张图起点写成 <code>X + n*CRS</code>（一张图是 C·H·W 个数）、<code>launch_tiled</code> 的 A 填成 X、C 少乘 PQ、N 和 K 对调、漏 stream。正确的调用：</p>
+        <p>h、w 的公式和 v1 一样，因为 im2col 只改变"按什么顺序数要哪些数"，没改变"每个数在输入图的哪里"：v1 的 (n,p,q) 来自线程号、(c,r,s) 来自循环变量；这里 (c,r,s) 来自行号、(n,p,q) 来自列号。</p>
+        <p>和 v1 不同的是越界的 0 <strong>必须真的写进 B</strong>，因为 GEMM 会把整列都乘一遍。<strong>易错</strong>：<code>r = (row % C) / R</code>、<code>s = row % C % R / S</code>（r、s 和 C 无关，用 tiny 形状 row = 13 代入，应为 c = r = s = 1，得到 r = s = 0）；<code>p = col / P</code>（应为 / Q；方形输出测不出来，<code>odd_pad</code> 的 P = 7、Q = 9 能查出来）；<code>r = (row / S) % S</code>（R = S 时测不出，3×5 卷积核会错）、读 X 写成 <code>(c*C + h)*H + w</code>、漏越界补 0、第 n 张图起点写成 <code>X + n*CRS</code>（一张图是 C·H·W 个数）、<code>launch_tiled</code> 的 A 填成 X、C 少乘 PQ、N 和 K 对调、漏 stream。正确的调用：</p>
 <pre><code>for n in 0..N-1:
     im2col_kernel(X + n·C·H·W → B)                         // B 只开一块，每张图复用
     launch_reg(Wt, B, Y + size_t(n)·K·PQ, /*M*/K, /*N*/PQ, /*K*/CRS, stream);</code></pre>
@@ -1143,10 +1149,16 @@ B[row*PQ + col] = (h &lt; 0 || h &gt;= H || w &lt; 0 || w &gt;= W) ? 0.0f : Xn[(
             <tr><td>代价</td><td>—</td><td>每次搬 B 都要做整数除法和取余，GPU 上较慢（之后用"增量算下标"优化）</td></tr>
           </tbody>
         </table></div>
-        <p><strong>一个线程、一个 block、一轮各管什么</strong>。还是一个线程算一个输出 <code>Y[n][k][p][q]</code>（row = k，col = p·Q + q），但一个 block 不是一张图：把 Yn 看成 [K × PQ] 矩阵，一个 block 负责其中 TILE × TILE 的方块（TILE = 16 时是 16 个卷积核 × 16 个输出位置）。resnet3x3 一张图需要 64/16 × 3136/16 = 4 × 196 = 784 个 block，它们同时交给 16 个 SM 去领，没有先后顺序；N 张图由 <code>launch_igemm</code> 里的循环每张图启动一次（以后可以放进 <code>blockIdx.z</code>）。这个方块放回 56×56 的输出图上，是按行展开后连续的 16 个像素，可能折到下一行（如 col 48～63 = 第 0 行最后 8 个 + 第 1 行前 8 个），拆 (p, q) 的公式会自动处理，所以 <code>odd_pad</code>（Q = 9）也能对。</p>
-        <p>block 内部的 <code>for (t = 0; t &lt; (GK + TILE − 1) / TILE; ++t)</code> 沿 CRS 方向走：第 t 轮搬 Wt 的第 16t～16t+15 列和 B 的第 16t～16t+15 行，每个线程把这 16 个乘积加进 sum；输出方块的位置在整个循环里不变，走完后每个线程只写一次 Y。轮数是 ⌈GK / TILE⌉：resnet3x3 GK = 576，36 轮；tiny GK = 2·3·3 = 18 要 2 轮，第 2 轮只有第 16、17 行是真数据，其余 14 行必须补 0（写成 <code>GK / TILE</code> 就只剩 1 轮、漏算最后 2 行）。一个 tile 的 16 行可以跨两层：resnet3x3 每层 9 行，第 0 轮是 c = 0 的全部 9 行加 c = 1 的前 7 行，因为每个线程只用自己的 brow 拆 (c, r, s)，这没有影响。</p>
-        <p><strong>为什么比 v1 快</strong>：v1 每个线程自己从显存读窗口和 Wt，每次乘加读 2 个数，读进来只给自己用；v3 每一轮 256 个线程合作搬 256（As）+ 256（Bs）= 512 个数，做 256 × 16 = 4096 次乘加，每读 1 个数做 8 次乘加，v1 是 0.5 次。Bs 里每个数被 16 行线程（16 个卷积核）各用一次，As 里每个数被 16 列线程（16 个输出位置）各用一次——和 GEMM 从 naive 到 tiled 是同一个道理。</p>
-        <p><strong>TILE 同时管三件事</strong>：① 一个 block 负责的输出大小（16 × 16）；② 线程数（一个线程一个输出，所以也是 256）；③ 每轮沿 GK 走多长。它是按硬件挑的（TILE² ≤ 1024、2·TILE² 个 float 放得进 shared memory，一般试 16 和 32），和卷积的 K 无关，K 不是 TILE 的倍数时多出来的线程不写 Y（<code>odd_pad</code> K = 5，一个 block 16 行线程只有 5 行有活）。三件事绑在一起就不灵活：想让 block 负责更大的输出，线程数也得跟着变。<code>gemm_reg</code> 把它们拆开了（输出 128 × 128、线程 16 × 16、每线程 8 × 8、每轮 BK = 8），所以 tiled 版跑通后，下一步是把同一套改法套到 reg 版上。</p>
+        <p><strong>一个线程、一个 block、一轮各管什么</strong>。还是一个线程算一个输出 <code>Y[n][k][p][q]</code>（row = k，col = p·Q + q），但一个 block 不是一张图：把 Yn 看成 [K × PQ] 矩阵，一个 block 负责其中 TILE × TILE 的方块（TILE = 16 时是 16 个卷积核 × 16 个输出位置）。</p>
+        <p>resnet3x3 一张图需要 64/16 × 3136/16 = 4 × 196 = 784 个 block，它们同时交给 16 个 SM 去领，没有先后顺序；N 张图由 <code>launch_igemm</code> 里的循环每张图启动一次（以后可以放进 <code>blockIdx.z</code>）。</p>
+        <p>这个方块放回 56×56 的输出图上，是按行展开后连续的 16 个像素，可能折到下一行（如 col 48～63 = 第 0 行最后 8 个 + 第 1 行前 8 个），拆 (p, q) 的公式会自动处理，所以 <code>odd_pad</code>（Q = 9）也能对。</p>
+        <p>block 内部的 <code>for (t = 0; t &lt; (GK + TILE − 1) / TILE; ++t)</code> 沿 CRS 方向走：第 t 轮搬 Wt 的第 16t～16t+15 列和 B 的第 16t～16t+15 行，每个线程把这 16 个乘积加进 sum；输出方块的位置在整个循环里不变，走完后每个线程只写一次 Y。</p>
+        <p>轮数是 ⌈GK / TILE⌉：resnet3x3 GK = 576，36 轮；tiny GK = 2·3·3 = 18 要 2 轮，第 2 轮只有第 16、17 行是真数据，其余 14 行必须补 0（写成 <code>GK / TILE</code> 就只剩 1 轮、漏算最后 2 行）。</p>
+        <p>一个 tile 的 16 行可以跨两层：resnet3x3 每层 9 行，第 0 轮是 c = 0 的全部 9 行加 c = 1 的前 7 行，因为每个线程只用自己的 brow 拆 (c, r, s)，这没有影响。</p>
+        <p><strong>为什么比 v1 快</strong>：v1 每个线程自己从显存读窗口和 Wt，每次乘加读 2 个数，读进来只给自己用；v3 每一轮 256 个线程合作搬 256（As）+ 256（Bs）= 512 个数，做 256 × 16 = 4096 次乘加，每读 1 个数做 8 次乘加，v1 是 0.5 次。</p>
+        <p>Bs 里每个数被 16 行线程（16 个卷积核）各用一次，As 里每个数被 16 列线程（16 个输出位置）各用一次——和 GEMM 从 naive 到 tiled 是同一个道理。</p>
+        <p><strong>TILE 同时管三件事</strong>：① 一个 block 负责的输出大小（16 × 16）；② 线程数（一个线程一个输出，所以也是 256）；③ 每轮沿 GK 走多长。它是按硬件挑的（TILE² ≤ 1024、2·TILE² 个 float 放得进 shared memory，一般试 16 和 32），和卷积的 K 无关，K 不是 TILE 的倍数时多出来的线程不写 Y（<code>odd_pad</code> K = 5，一个 block 16 行线程只有 5 行有活）。</p>
+        <p>三件事绑在一起就不灵活：想让 block 负责更大的输出，线程数也得跟着变。<code>gemm_reg</code> 把它们拆开了（输出 128 × 128、线程 16 × 16、每线程 8 × 8、每轮 BK = 8），所以 tiled 版跑通后，下一步是把同一套改法套到 reg 版上。</p>
         <p><strong>实测：从 tiled 到增量下标</strong>。implicit 先套在 tiled 版上（v3a），再套到 reg 版上（v3b，128 × 128 tile、double buffering），最后把下标计算挪出循环（v3c）：</p>
         <div class="tablewrap"><table>
           <thead><tr><th>版本（ms）</th><th class="num">resnet3x3</th><th class="num">resnet3x3_s2</th><th class="num">resnet1x1</th><th class="num">siglip_patch</th></tr></thead>

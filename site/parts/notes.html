@@ -1,48 +1,30 @@
 <!-- ============================== 复习笔记 ============================== -->
 <div class="view" id="notes" hidden>
-  <section>
-    <div class="eyebrow">按主题整理</div>
-    <h2>复习笔记</h2>
-    <p class="muted small">每个模块按学习顺序写成连贯讲解：这部分讲什么 → 一步步展开 → 自测。RMSNorm 的完整讲述和面试追问见 <a href="#rmsnorm">RMSNorm 专题</a>。</p>
-    <div class="panel" id="notes-interview">
-      <h3>面试要求怎么看</h3>
-      <p>每个模块在「自测」前加了一块「面试要求」，按推理优化 / 端侧部署 / CUDA 算子方向常见的面试内容分三档：<strong>必须会</strong> = 不看资料能当场讲清或写出来，答不上来基本会被判定为"没真正做过"；<strong>应该会</strong> = 能讲清原理、写出关键片段、结合自己的项目举例；<strong>加分</strong> = 知道是什么、解决什么问题，能说出思路。各模块的「高频问题」并进了自测。档位是按这类岗位常见面试内容整理的经验判断，具体公司会有差异。</p>
-      <p><strong>通用原则</strong>：面试官最常问的不是"这是什么"，而是"你为什么这么做、你怎么知道它有效、数字是多少"。每个模块都准备一个<strong>自己做过的具体例子 + 一个数字</strong>。</p>
-      <h4>另外一定会考、但不在这些模块里的</h4>
-      <ul class="plain">
-        <li><strong>手写 CUDA 题</strong>：reduction、softmax（含 online softmax）、transpose（shared memory + 避免 bank conflict）、GEMM 分块、scan、LayerNorm / RMSNorm。</li>
-        <li><strong>Attention / FlashAttention</strong>：标准 attention 的计算和显存、FlashAttention 的分块 + online softmax、为什么能省显存访问（讲解见<a href="#m16">模块 16</a>）。</li>
-        <li><strong>LLM 推理系统</strong>：KV cache、PagedAttention、continuous batching、prefill / decode 分离（vLLM / SGLang 的核心概念）。</li>
-        <li><strong>算法题</strong>：LeetCode Hot 100，每天 1～2 题。</li>
-        <li><strong>八股</strong>：操作系统（进程 / 线程、虚拟内存、页表）、计算机组成（缓存、流水线）、C++（见模块 3）。</li>
-        <li><strong>项目讲述</strong>：RMSNorm 和 ACT 两个项目，各准备一个 2 分钟版本和一个 10 分钟版本，每个都要有"问题 → 做法 → 数字 → 局限"。</li>
-      </ul>
-    </div>
-  </section>
   <div class="notes-shell">
     <div class="mod-list" role="group" aria-label="模块">
-      <div class="grp">部署与工程</div>
+      <div class="grp" data-key="deploy">部署与工程</div>
       <button type="button" data-mod="m1" aria-pressed="true">1 · 全流程总览</button>
       <button type="button" data-mod="m2" aria-pressed="false">2 · 环境与工程构建</button>
       <button type="button" data-mod="m3" aria-pressed="false">3 · C++ 必备</button>
       <button type="button" data-mod="m4" aria-pressed="false">4 · 模型导出与正确性</button>
-      <div class="grp">GPU 与性能</div>
+      <div class="grp" data-key="gpu">GPU 与性能</div>
       <button type="button" data-mod="m5" aria-pressed="false">5 · TensorRT 与 CUDA</button>
       <button type="button" data-mod="m6" aria-pressed="false">6 · 性能测量</button>
       <button type="button" data-mod="m7" aria-pressed="false">7 · PyTorch 与端到端</button>
       <button type="button" data-mod="m8" aria-pressed="false">8 · compile、融合与 CUDA Graph</button>
       <button type="button" data-mod="m9" aria-pressed="false">9 · ONNX → TensorRT plugin</button>
-      <div class="grp">端侧部署</div>
+      <div class="grp" data-key="edge">端侧部署</div>
       <button type="button" data-mod="m10" aria-pressed="false">10 · 策略模型上机</button>
-      <div class="grp">核心算子</div>
+      <div class="grp" data-key="ops">核心算子</div>
+      <button type="button" data-mod="rmsnorm" data-badge="R" aria-pressed="false">RMSNorm</button>
       <button type="button" data-mod="m11" aria-pressed="false">11 · 卷积与 GEMM</button>
       <button type="button" data-mod="m12" aria-pressed="false">12 · 转置</button>
       <button type="button" data-mod="m14" aria-pressed="false">14 · Softmax 与 online softmax</button>
       <button type="button" data-mod="m15" aria-pressed="false">15 · Scan（前缀和）</button>
-      <div class="grp">LLM 推理</div>
+      <div class="grp" data-key="llm">LLM 推理</div>
       <button type="button" data-mod="m13" aria-pressed="false">13 · 推理流程与 KV cache</button>
       <button type="button" data-mod="m16" aria-pressed="false">16 · FlashAttention</button>
-      <div class="grp">论文</div>
+      <div class="grp" data-key="papers">论文</div>
       <button type="button" data-mod="awq" aria-pressed="false">AWQ 量化</button>
       <button type="button" data-mod="lina" aria-pressed="false">Lina 与分布式 MoE</button>
       <button type="button" data-mod="vla" aria-pressed="false">端侧 VLA 论文</button>
@@ -79,6 +61,9 @@
 
     <!-- 模块 10 -->
     <div data-include="parts/notes/m10.html"></div>
+
+    <!-- RMSNorm -->
+    <div data-include="parts/notes/rmsnorm.html"></div>
 
     <!-- 模块 11 -->
     <div data-include="parts/notes/m11.html"></div>

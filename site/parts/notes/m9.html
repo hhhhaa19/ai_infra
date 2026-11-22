@@ -18,8 +18,10 @@
             <tr><td>CUDA Graph</td><td>CUDA 驱动</td><td>一串具体的 kernel 调用：参数、地址、grid</td><td>驱动里</td><td>绑定这个进程的地址</td></tr>
           </tbody>
         </table></div>
-        <p>这些图和 dispatcher 也有关系。dispatcher 是每个算子的实现表：eager 执行查 CUDA 格，eager 训练查 Autograd 格，Dynamo 抓图查 Meta 格。AOTAutograd 查的 Autograd 格和 eager 是同一套求导规则（<code>derivatives.yaml</code>），它就是把 eager 运行时会做的事提前录成图。<code>ai_infra::rms_norm</code> 只填了 CUDA 和 Meta 两格，Autograd 是空的，所以能推理、不能训练。</p>
-        <p>既然 CUDA Graph 已经记录了 kernel 调用，为什么不能直接交给 TensorRT？因为 ONNX 记的是"要算什么"，CUDA Graph 记的是"已经选好的 kernel 怎么调"。TensorRT 的价值是自己决定怎么融合、挑哪个 kernel，所以必须拿到前者。CUDA Graph 里还有这个进程的显存地址，也没有标准的文件格式给别的程序加载。CUDA 本身没有"模型"概念，要不用 PyTorch，可以直接用 TensorRT API 搭网络（TensorRT-LLM 的做法），或者整个模型手写 CUDA（llama.cpp、llm.c）。</p>
+        <p>这些图和 dispatcher 也有关系。dispatcher 是每个算子的实现表：eager 执行查 CUDA 格，eager 训练查 Autograd 格，Dynamo 抓图查 Meta 格。AOTAutograd 查的 Autograd 格和 eager 是同一套求导规则（<code>derivatives.yaml</code>），它就是把 eager 运行时会做的事提前录成图。</p>
+        <p><code>ai_infra::rms_norm</code> 只填了 CUDA 和 Meta 两格，Autograd 是空的，所以能推理、不能训练。</p>
+        <p>既然 CUDA Graph 已经记录了 kernel 调用，为什么不能直接交给 TensorRT？因为 ONNX 记的是"要算什么"，CUDA Graph 记的是"已经选好的 kernel 怎么调"。TensorRT 的价值是自己决定怎么融合、挑哪个 kernel，所以必须拿到前者。</p>
+        <p>CUDA Graph 里还有这个进程的显存地址，也没有标准的文件格式给别的程序加载。CUDA 本身没有"模型"概念，要不用 PyTorch，可以直接用 TensorRT API 搭网络（TensorRT-LLM 的做法），或者整个模型手写 CUDA（llama.cpp、llm.c）。</p>
       </div>
 
       <div class="blk"><h3>第二步：TensorRT 在这条线上相当于 Inductor</h3>
@@ -159,7 +161,8 @@ CMake：CMakeLists.txt（需求）→ cmake -S . -B build-orin（生成 Makefile
   add_library(rmsnorm_trt_plugin SHARED src/rmsnorm/tensorrt/plugin.cu)，只链接 CUDA::cudart 和 TensorRT
 PyTorch load()：生成 build.ninja（要和已装 torch 完全一致的编译参数）→ ninja 调 nvcc → 加载 .so → TORCH_LIBRARY 注册</code></pre>
         <p><code>.so</code> 有两种用法：编译时链接，程序一启动就加载（比如我们的 <code>.so</code> 链接 libnvinfer.so）；或者运行时 dlopen（trtexec 的 <code>--plugins=</code>、Python 的 <code>ctypes.CDLL</code>、PyTorch 的 <code>load()</code>）。<code>.so</code> 里同时有 CPU 机器码和 GPU 的 SASS，可能还附带 PTX。plugin 必须是 <code>.so</code>，因为 <code>trtexec</code> 已经编译好了，只能在运行时打开它；<code>.a</code> 是给链接器用的，不能这样加载。</p>
-        <p>再看 GPU 代码的三层：CUDA C++ 是人写的；PTX 是"虚拟 GPU 汇编"，寄存器不限、跨代兼容，新驱动可以 JIT；SASS 是真正的机器码，每代架构不同，寄存器在这一步分配，存在 cubin 里。float4 那次看的 <code>LDG.E.128</code> 是 SASS，PTX 里对应 <code>ld.global.v4.f32</code>。Triton 不经过 CUDA C++，直接生成 PTX 再交给 ptxas。engine 不能跨 GPU，就是因为里面有为这块 GPU 挑好的 SASS kernel。</p>
+        <p>再看 GPU 代码的三层：CUDA C++ 是人写的；PTX 是"虚拟 GPU 汇编"，寄存器不限、跨代兼容，新驱动可以 JIT；SASS 是真正的机器码，每代架构不同，寄存器在这一步分配，存在 cubin 里。float4 那次看的 <code>LDG.E.128</code> 是 SASS，PTX 里对应 <code>ld.global.v4.f32</code>。</p>
+        <p>Triton 不经过 CUDA C++，直接生成 PTX 再交给 ptxas。engine 不能跨 GPU，就是因为里面有为这块 GPU 挑好的 SASS kernel。</p>
         <p>想自己看的话：<code>nvcc -arch=sm_87 -ptx src/rmsnorm/kernels.cu -o k.ptx</code>；<code>nvcc -arch=sm_87 -cubin … &amp;&amp; cuobjdump -sass k.cubin | grep LDG</code>。</p>
       </div>
 
@@ -199,7 +202,8 @@ PyTorch load()：生成 build.ninja（要和已装 torch 完全一致的编译�
             <tr><td>计时</td><td>GPU Compute Time 等；<code>--dumpProfile</code> 逐层</td><td>和 bench_layer.py 同样的 CUDA event 方法，所以能和 PyTorch 直接比</td><td>std::chrono，含 H2D / D2H</td></tr>
           </tbody>
         </table></div>
-        <p><code>trtexec</code> 回答"跑多快"，用随机输入，不检查结果对不对；<code>trt_check.py</code> 回答"算得对不对"，并用和 PyTorch 相同的方法计时。Python 的 tensorrt 包和 C++ 接口底层是同一个 libnvinfer，函数一一对应（<code>deserialize_cuda_engine</code> ↔ <code>deserializeCudaEngine</code>、<code>execute_async_v3</code> ↔ <code>enqueueV3</code>）。trt_check.py 借 PyTorch 分配显存、比误差、录 CUDA Graph，只是为了测试方便，真正部署通常用 C++。</p>
+        <p><code>trtexec</code> 回答"跑多快"，用随机输入，不检查结果对不对；<code>trt_check.py</code> 回答"算得对不对"，并用和 PyTorch 相同的方法计时。Python 的 tensorrt 包和 C++ 接口底层是同一个 libnvinfer，函数一一对应（<code>deserialize_cuda_engine</code> ↔ <code>deserializeCudaEngine</code>、<code>execute_async_v3</code> ↔ <code>enqueueV3</code>）。</p>
+        <p>trt_check.py 借 PyTorch 分配显存、比误差、录 CUDA Graph，只是为了测试方便，真正部署通常用 C++。</p>
         <p>trtexec 要公平对比，需要加 <code>--noTF32</code>（TensorRT 默认允许 TF32，PyTorch 默认关）、<code>--noDataTransfers</code>、<code>--useSpinWait</code>；另跑一次 <code>--useCudaGraph</code>；用 <code>--profilingVerbosity=detailed --exportLayerInfo</code> 看融合结果。</p>
         <p>把这次每一步实际用的东西列出来，就能看清 PyTorch 只在哪里出现：只有第 3、5 步用到 PyTorch，engine 建好后推理本身完全不需要它。</p>
         <div class="tablewrap"><table>
@@ -223,7 +227,8 @@ PyTorch load()：生成 build.ninja（要和已装 torch 完全一致的编译�
           </tbody>
         </table></div>
         <p>两种方法能对上：同一个 eager engine，trtexec 和 trt_check.py 在 b1 是 1.309 / 1.311 ms，b8 是 8.882 / 9.030 ms，prefill 是 14.790 / 14.789 ms。</p>
-        <p>改用自己的 C++ 程序还要做三件事（还没做）：① 链接 plugin 或用 <code>dlopen</code> 加载；② <code>createNetworkV2(0U)</code> 在 TensorRT 8.5 是隐式 batch，ONNX parser 不支持，要传显式 batch 标志（原代码是在 Quest 的 TensorRT 10 上写的）；③ 用 <code>clearFlag(kTF32)</code> / <code>setFlag(kFP16)</code> 设置精度。另外 <code>infer_async.cpp</code> 为 ResNet 写死了形状和路径，要改成从 <code>getTensorShape()</code> 读。</p>
+        <p>改用自己的 C++ 程序还要做三件事（还没做）：① 链接 plugin 或用 <code>dlopen</code> 加载；② <code>createNetworkV2(0U)</code> 在 TensorRT 8.5 是隐式 batch，ONNX parser 不支持，要传显式 batch 标志（原代码是在 Quest 的 TensorRT 10 上写的）；③ 用 <code>clearFlag(kTF32)</code> / <code>setFlag(kFP16)</code> 设置精度。</p>
+        <p>另外 <code>infer_async.cpp</code> 为 ResNet 写死了形状和路径，要改成从 <code>getTensorShape()</code> 读。</p>
       </div>
 
       <div class="blk"><h3>第十步：三份代码逐段读</h3>
@@ -309,7 +314,8 @@ runtime = trt.Runtime(logger)                                # 建 engine 用 Bu
             <tr><td><code>.engine</code></td><td>整个模型优化后的执行方案，含权重</td><td>TensorRT 根据 ONNX 构建</td></tr>
           </tbody>
         </table></div>
-        <p>所以有两种"编译"：<code>nvcc</code> 编译的是<strong>代码</strong>，TensorRT 建 engine 处理的是<strong>模型</strong>。部署时要同时带上 <code>.engine</code> 和 <code>.so</code>，还要有运行环境（TensorRT 和 CUDA 运行库、GPU 驱动，Orin 上由 JetPack 提供），但不需要 PyTorch。平台绑定程度也不同：ONNX 不绑定硬件；engine 绑定 TensorRT 版本和 GPU 型号；plugin 的 <code>.so</code> 绑定 CPU 架构和 CUDA 环境（Orin 是 ARM + sm_87，Quest 是 x86 + sm_80，要分别编译、分别建 engine）。所以常见做法是把 ONNX 留作交换格式，到目标机器上再建 engine。</p>
+        <p>所以有两种"编译"：<code>nvcc</code> 编译的是<strong>代码</strong>，TensorRT 建 engine 处理的是<strong>模型</strong>。部署时要同时带上 <code>.engine</code> 和 <code>.so</code>，还要有运行环境（TensorRT 和 CUDA 运行库、GPU 驱动，Orin 上由 JetPack 提供），但不需要 PyTorch。</p>
+        <p>平台绑定程度也不同：ONNX 不绑定硬件；engine 绑定 TensorRT 版本和 GPU 型号；plugin 的 <code>.so</code> 绑定 CPU 架构和 CUDA 环境（Orin 是 ARM + sm_87，Quest 是 x86 + sm_80，要分别编译、分别建 engine）。所以常见做法是把 ONNX 留作交换格式，到目标机器上再建 engine。</p>
         <p>再看"plugin 对象是不是算子"。更准确地说，plugin 对象是图里一个算子节点在 TensorRT 里的外壳：</p>
         <div class="tablewrap"><table>
           <thead><tr><th>概念</th><th>是什么</th><th>数量</th></tr></thead>
@@ -375,7 +381,8 @@ torch.onnx.export(layer, (x,), path, dynamo=True,
 
       <div class="blk" id="fp16"><h3>FP16 基线实测：开 FP16 后改了什么、快了多少、误差怎么看</h3>
         <p><strong>要回答的问题</strong>：FP32 + 禁 TF32 时，eager engine 的 decode b8 要 8.92 ms，比 PyTorch eager 的 1.80 ms 还慢，推测是 Myelin 给 M=8 的矩阵乘挑了慢 kernel。按上一节"FP16 分两步"的第一步，只用现有的 eager ONNX、不改 kernel，看 FP16 快多少、矩阵乘 kernel 变没变。</p>
-        <p><strong>开 <code>--fp16</code> 改的是什么</strong>：代码和 ONNX 文件都不改，改的只是 TensorRT 建 engine 时允许用的精度，所以变化全在 engine 里面。① 每层的候选实现里多了 FP16 版本，TensorRT 照样逐层实测，哪个快、能用就选哪个，不是强制所有层都变 FP16；② 选了 FP16 实现的层，权重会被转成 FP16 存进 engine，这次三个 engine 都是 99 MB；③ FP32 + <code>--noTF32</code> 时矩阵乘不能用 Tensor Core，开 FP16 后可以；④ 相邻层都是 FP16 时中间结果也是 FP16，读写减半，前后精度不同的地方 TensorRT 会插格式转换层，转换太多会抵消收益；⑤ ONNX 的输入 <code>x</code> 和输出 <code>out</code> 是 FP32，不额外设置时 engine 对外仍收发 FP32，只在内部转换，所以 <code>trt_check.py</code> 和以后的 C++ 程序不用改接口。要让接口也变成 FP16，得加 <code>--inputIOFormats=fp16:chw --outputIOFormats=fp16:chw</code>，这次没加。<code>--noTF32</code> 管的是仍保留 FP32 的那些层，保证它们和 FP32 基线条件一致。</p>
+        <p><strong>开 <code>--fp16</code> 改的是什么</strong>：代码和 ONNX 文件都不改，改的只是 TensorRT 建 engine 时允许用的精度，所以变化全在 engine 里面。① 每层的候选实现里多了 FP16 版本，TensorRT 照样逐层实测，哪个快、能用就选哪个，不是强制所有层都变 FP16；② 选了 FP16 实现的层，权重会被转成 FP16 存进 engine，这次三个 engine 都是 99 MB；③ FP32 + <code>--noTF32</code> 时矩阵乘不能用 Tensor Core，开 FP16 后可以；④ 相邻层都是 FP16 时中间结果也是 FP16，读写减半，前后精度不同的地方 TensorRT 会插格式转换层，转换太多会抵消收益；⑤ ONNX 的输入 <code>x</code> 和输出 <code>out</code> 是 FP32，不额外设置时 engine 对外仍收发 FP32，只在内部转换，所以 <code>trt_check.py</code> 和以后的 C++ 程序不用改接口。</p>
+        <p>要让接口也变成 FP16，得加 <code>--inputIOFormats=fp16:chw --outputIOFormats=fp16:chw</code>，这次没加。<code>--noTF32</code> 管的是仍保留 FP32 的那些层，保证它们和 FP32 基线条件一致。</p>
 <pre><code>同一个 eager ONNX（FP32 权重和计算图）
         ↓ trtexec --fp16 --noTF32
 每层在 FP16 / FP32 实现里实测挑选
@@ -395,14 +402,16 @@ trtexec --loadEngine=… --noDataTransfers --useSpinWait --dumpProfile --separat
           </tbody>
         </table></div>
         <p class="small muted">条件：Orin 锁频，GPU 开始和结束都是 1300.5 MHz。FP16 时间来自 trt_check.py（CUDA event，方法同 bench_layer.py）；trtexec 的 GPU Compute Time 是 b8 2.42、b1 0.687、prefill 2.370 ms，两种方法对得上。FP32 一列和 FP16 不是同一次运行。FP32 engine 的误差对照：最大绝对 1e-6 量级，相对 L2 约 2e-7。</p>
-        <p><strong>矩阵乘 kernel 确实换了</strong>：逐层 profile 里 FP32 b8 只有 1 个 ForeignNode，平均 9.24 ms；FP16 是 ForeignNode 2.42 ms，加上前后各一个 Reformatting CopyNode（0.017 / 0.006 ms），这就是 FP32 输入输出和内部 FP16 之间的转换。ForeignNode 里面看不到 kernel，所以又用 nsys 抓了 b8 FP16 engine（每次前向的平均时间）：</p>
+        <p><strong>矩阵乘 kernel 确实换了</strong>：逐层 profile 里 FP32 b8 只有 1 个 ForeignNode，平均 9.24 ms；FP16 是 ForeignNode 2.42 ms，加上前后各一个 Reformatting CopyNode（0.017 / 0.006 ms），这就是 FP32 输入输出和内部 FP16 之间的转换。</p>
+        <p>ForeignNode 里面看不到 kernel，所以又用 nsys 抓了 b8 FP16 engine（每次前向的平均时间）：</p>
 <pre><code>FP32：ampere_sgemm_128x32_sliced1x4_nn            × 3，各约 2436 μs
 FP16：trt_ampere_h16816gemm_128x64_ldg8_relu_nn_v1 × 2，各约 662 μs
                trt_ampere_h16816gemm_128x64_ldg8_nn_v1      × 1，约 640 μs
                ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_nn × 2，各约 296 μs
                norm（Myelin 融合）__myl_bb0_3 / bb0_8_MulMeaAddSqrDivMulMul 约 6.0 / 5.5 μs
 h16816 / s16816：Tensor Core 的 16×8×16 矩阵乘指令；h 是 FP16 累加，s 是 FP32 累加（按命名习惯理解，没查文档）</code></pre>
-        <p>所以 FP16 下 b8 的大头从约 7.3 ms 降到约 2.2 ms，支持"FP32 下 Myelin 给 M=8 挑的 kernel 不好"的推测；但 FP32 下它为什么会挑 sliced1x4 sgemm，仍然没查清。另外 b8 FP16 的 2.44 ms 还是比 PyTorch eager FP32 的 1.80 ms 慢，两次不是同时测的，不能直接下结论。推测：b8 只有 8 行，128×64 这种大分块浪费了大部分计算单元，按读完权重的理论时间应该更短，<strong>未验证</strong>。</p>
+        <p>所以 FP16 下 b8 的大头从约 7.3 ms 降到约 2.2 ms，支持"FP32 下 Myelin 给 M=8 挑的 kernel 不好"的推测；但 FP32 下它为什么会挑 sliced1x4 sgemm，仍然没查清。</p>
+        <p>另外 b8 FP16 的 2.44 ms 还是比 PyTorch eager FP32 的 1.80 ms 慢，两次不是同时测的，不能直接下结论。推测：b8 只有 8 行，128×64 这种大分块浪费了大部分计算单元，按读完权重的理论时间应该更短，<strong>未验证</strong>。</p>
         <p><strong>误差怎么看</strong>：几个指标比较的是同一件事，即 FP16 输出和 PyTorch FP32 标准答案差多少，只是角度不同。用三个数举例：</p>
 <pre><code>ref = [ 2.000, 0.001, -1.000 ]   PyTorch FP32 标准答案
 out = [ 2.002, 0.002, -0.999 ]   TensorRT FP16 输出
@@ -412,7 +421,8 @@ out = [ 2.002, 0.002, -0.999 ]   TensorRT FP16 输出
 最大相对误差  |out − ref| / |ref|：0.001、1.0、0.001        第 2 个被分母 0.001 放大成 1.0
 相对 L2      ‖out − ref‖ / ‖ref‖ = 0.00245 / 2.236 ≈ 0.0011  整体差了约 0.1%
 余弦相似度    两个长向量的方向是否一致；ref=[2,1]、out=[4,2] 时也是 1，不看大小</code></pre>
-        <p><code>trt_check.py</code> 的相对误差公式是 <code>|out − ref| / (|ref| + 1e-3)</code>，真实输出里总有接近 0 的元素，绝对误差 0.003 也会被除成很大的数，这就是 max_rel_err 到 0.61～0.87 的原因。它适合发现局部异常，不适合描述 FP16 的整体误差。这次的主要依据是相对 L2（4e-4～1e-3，整体约 0.04%～0.1%）加最大绝对误差（0.004～0.006，输出平均绝对值约 0.8、最大约 4～5）；余弦只作补充，因为输出整体放大 2 倍它也还是 1。</p>
+        <p><code>trt_check.py</code> 的相对误差公式是 <code>|out − ref| / (|ref| + 1e-3)</code>，真实输出里总有接近 0 的元素，绝对误差 0.003 也会被除成很大的数，这就是 max_rel_err 到 0.61～0.87 的原因。</p>
+        <p>它适合发现局部异常，不适合描述 FP16 的整体误差。这次的主要依据是相对 L2（4e-4～1e-3，整体约 0.04%～0.1%）加最大绝对误差（0.004～0.006，输出平均绝对值约 0.8、最大约 4～5）；余弦只作补充，因为输出整体放大 2 倍它也还是 1。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>指标</th><th>回答什么</th><th>缺点</th></tr></thead>
           <tbody>
@@ -422,7 +432,9 @@ out = [ 2.002, 0.002, -0.999 ]   TensorRT FP16 输出
             <tr><td>余弦相似度</td><td>方向是否一致</td><td>不看大小</td></tr>
           </tbody>
         </table></div>
-        <p><strong>多少算大</strong>：没有统一标准，分三层判断。第一层，和这种精度本身的舍入误差比：FP32 约 7 位有效数字，常见相对误差 1e-7～1e-6；FP16 有 10 位尾数，相邻两个数的间隔约 2⁻¹⁰ ≈ 9.8e-4，常见 1e-4～1e-3；INT8 只有 256 级，常到 1e-2，强依赖校准（这些是经验量级，不是硬标准）。所以这次 4e-4～1e-3 落在 FP16 的正常范围。第二层，和参考实现比：先测"PyTorch FP32 对 PyTorch FP16"的误差 A，再看"PyTorch FP32 对 TensorRT FP16"的误差 B，B 和 A 差不多才说明 TensorRT 没额外引入问题；这次没测 A，所以只能说"在 FP16 正常量级内"。第三层，看最终任务：分类看 Top-1 和准确率，LLM 看困惑度和评测，机器人策略看动作误差、成功率和动作是否平稳。工程上的起点（经验值，不是标准）：FP32 engine 相对 L2 &lt; 1e-5；FP16 engine 相对 L2 不明显超过 PyTorch FP16 基线；INT8 先看任务指标再定能接受多少数值误差。</p>
+        <p><strong>多少算大</strong>：没有统一标准，分三层判断。第一层，和这种精度本身的舍入误差比：FP32 约 7 位有效数字，常见相对误差 1e-7～1e-6；FP16 有 10 位尾数，相邻两个数的间隔约 2⁻¹⁰ ≈ 9.8e-4，常见 1e-4～1e-3；INT8 只有 256 级，常到 1e-2，强依赖校准（这些是经验量级，不是硬标准）。</p>
+        <p>所以这次 4e-4～1e-3 落在 FP16 的正常范围。第二层，和参考实现比：先测"PyTorch FP32 对 PyTorch FP16"的误差 A，再看"PyTorch FP32 对 TensorRT FP16"的误差 B，B 和 A 差不多才说明 TensorRT 没额外引入问题；这次没测 A，所以只能说"在 FP16 正常量级内"。</p>
+        <p>第三层，看最终任务：分类看 Top-1 和准确率，LLM 看困惑度和评测，机器人策略看动作误差、成功率和动作是否平稳。工程上的起点（经验值，不是标准）：FP32 engine 相对 L2 &lt; 1e-5；FP16 engine 相对 L2 不明显超过 PyTorch FP16 基线；INT8 先看任务指标再定能接受多少数值误差。</p>
         <p><strong>还没证明的</strong>：只测了单层，几十层叠起来误差会累积；数值接近不等于任务一样好；相对 L2 和余弦是在 Orin 上临时算的，没加进 <code>trt_check.py</code>；没有同一次运行的 PyTorch FP16 对照（要先给 <code>bench_layer.py</code> 加 dtype 参数，提了但没做）。</p>
         <p><strong>为什么到这里就停</strong>：这次要回答的三个问题（FP16 有没有收益、b8 慢是不是和矩阵乘 kernel 有关、FP16 误差正不正常）都有了答案。b8 仍慢于 PyTorch FP32 是这个测试用 decoder layer 的问题，不是项目目标；由此定下一条规则：每做一个实验先问"这个结果会改变下一步要做什么吗"，不会就记录下来，不继续追。下一步转 ACT 部署（模块 10）。</p>
       </div>

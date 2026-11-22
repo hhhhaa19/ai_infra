@@ -25,7 +25,8 @@ hidden 2048、16 头 × 128、intermediate 5632，一层约 5138 万参数（FP3
         <p>再说权重。同一层在两个阶段用同一套权重；不同层结构相同，但权重各有一套。所以参数量 = 每层 × 层数 + embedding / 输出层。开源模型主要发布的是权重、<code>config.json</code> 和分词器。</p>
         <p>这也解释了为什么可以放心替换算子：训练只改权重，不改公式。只要数学等价（eps 位置一致）、权重形状和含义一致、误差在容差内，就能换一种实现。测速时还可以用随机权重，因为计算量和读写量只看形状（MoE 路由除外）。但结论不能直接套到别的模型：hidden 变大时 RMSNorm 占比下降，走的分档也不同。数值验证（尤其 FP16）仍需要真实权重，这一点待验证。</p>
         <p>batch 是同时处理几个请求。decode 的主要成本是读一遍权重，b8 共用这一遍读取，所以只比 b1 慢约 24%，均摊到每个请求快很多。这就是批处理的意义。</p>
-        <p>真实请求长度不同怎么办？hidden 由模型决定，大家都一样；会变的是 prompt 长度和历史长度。主流做法是把所有请求的 token 拼成一长条（packing），配一张 <code>cu_seqlens</code> 边界表。RMSNorm、投影、MLP 这些按行处理的算子不用知道边界，只有 Attention 要用 varlen 接口。在此之上还有连续批处理（prefill 与 decode 混排）、chunked prefill（长 prompt 切块、每步有 token 预算），更大规模时会把 prefill 和 decode 分开部署。</p>
+        <p>真实请求长度不同怎么办？hidden 由模型决定，大家都一样；会变的是 prompt 长度和历史长度。主流做法是把所有请求的 token 拼成一长条（packing），配一张 <code>cu_seqlens</code> 边界表。RMSNorm、投影、MLP 这些按行处理的算子不用知道边界，只有 Attention 要用 varlen 接口。</p>
+        <p>在此之上还有连续批处理（prefill 与 decode 混排）、chunked prefill（长 prompt 切块、每步有 token 预算），更大规模时会把 prefill 和 decode 分开部署。</p>
       </div>
 
       <div class="blk"><h3>第四步：调用是怎么走到 GPU 的</h3>
@@ -43,14 +44,17 @@ layer(x)
 【最早（PYBIND11，已删除）】
 ext().forward(x, w, eps) → C++ forward → …
 PYBIND11_MODULE 只把 C++ 函数交给 Python，PyTorch 本身不知道它存在，torch.compile 只能切断图。</code></pre>
-        <p>有三点要注意。第一，张量本来就在 GPU 上，所以不需要 H2D / D2H；但必须用 <code>getCurrentCUDAStream()</code>，这样才能和前后的 PyTorch 运算保持顺序。第二，这个算子只有前向，训练时梯度会断在这里，要支持训练就得另写反向 kernel，并用 <code>autograd.Function</code> 配对，所以它是推理加速。第三，已知限制：没有同设备检查和 device guard；rows / n 转 int 缺大尺寸检查；只支持 FP32、连续存储。</p>
+        <p>有三点要注意。第一，张量本来就在 GPU 上，所以不需要 H2D / D2H；但必须用 <code>getCurrentCUDAStream()</code>，这样才能和前后的 PyTorch 运算保持顺序。第二，这个算子只有前向，训练时梯度会断在这里，要支持训练就得另写反向 kernel，并用 <code>autograd.Function</code> 配对，所以它是推理加速。</p>
+        <p>第三，已知限制：没有同设备检查和 device guard；rows / n 转 int 缺大尺寸检查；只支持 FP32、连续存储。</p>
       </div>
 
       <div class="blk"><h3>第五步：测出来整层到底快了多少</h3>
         <p><strong>prefill</strong>（1 × 512 token）是矩阵 × 矩阵，GPU 一直在忙。RMSNorm 只占约 2%，算子本身快 3.5 倍，整层也只快约 1.5%。这符合 Amdahl 定律：整体加速 = 1 / ((1−p) + p/s)，p 是占比，s 是该部分的加速倍数。占比太小，算子再快也没用。</p>
-        <p><strong>decode</strong>（每次 1 个 token）不一样：它是向量 × 矩阵，每个 kernel 只要几 μs，但 CPU 发射一个 kernel 要几十 μs，所以 GPU 常常在等 CPU。eager 每层比 kernel 合计多约 170 μs，GPU 约 12% 的时间在等。我们把每层 kernel 从 34 个减到 24 个，不开 nsys 实测 b1 整层快约 10%、b8 约 2%。收益来自少发射，不是 kernel 变快。batch 越大，kernel 越大，GPU 越不空闲，这部分收益就越小。nsys 会放大发射开销，在它下面测得的 −23% / −20% 不能作为结论。</p>
+        <p><strong>decode</strong>（每次 1 个 token）不一样：它是向量 × 矩阵，每个 kernel 只要几 μs，但 CPU 发射一个 kernel 要几十 μs，所以 GPU 常常在等 CPU。eager 每层比 kernel 合计多约 170 μs，GPU 约 12% 的时间在等。</p>
+        <p>我们把每层 kernel 从 34 个减到 24 个，不开 nsys 实测 b1 整层快约 10%、b8 约 2%。收益来自少发射，不是 kernel 变快。batch 越大，kernel 越大，GPU 越不空闲，这部分收益就越小。nsys 会放大发射开销，在它下面测得的 −23% / −20% 不能作为结论。</p>
         <p>由此可以判断瓶颈：wall 约等于 kernel 合计时，是 GPU 受限；wall 远大于 kernel 合计时，是 CPU 受限。</p>
-        <p>decode 的 kernel 时间主要花在读权重：205 MB ÷ 约 190 GB/s ≈ 1.08 ms，实测 1.26 ms。cuBLAS 的名字也能看出来：GEMM 是矩阵 × 矩阵，GEMV 是矩阵 × 向量，前缀 s 表示 FP32。prefill 走 sgemm（计算受限）；decode b1 走 gemv（读权重受限，和 RMSNorm 一样受带宽限制）；b8 走扁矩阵的 sliced sgemm + splitK。这些 kernel 占整层 95% 以上，决定了换 RMSNorm 的收益上限。</p>
+        <p>decode 的 kernel 时间主要花在读权重：205 MB ÷ 约 190 GB/s ≈ 1.08 ms，实测 1.26 ms。cuBLAS 的名字也能看出来：GEMM 是矩阵 × 矩阵，GEMV 是矩阵 × 向量，前缀 s 表示 FP32。</p>
+        <p>prefill 走 sgemm（计算受限）；decode b1 走 gemv（读权重受限，和 RMSNorm 一样受带宽限制）；b8 走扁矩阵的 sliced sgemm + splitK。这些 kernel 占整层 95% 以上，决定了换 RMSNorm 的收益上限。</p>
       </div>
 
       <div class="blk"><h3>第六步：减少开销的几种办法</h3>
@@ -102,7 +106,8 @@ TORCH_LIBRARY_IMPL(ai_infra, Meta, m) {  // ③ 输入是 Meta / Fake 张量：�
     m.impl("fused_add_rms_norm", &amp;fused_forward_meta);
 }</code></pre>
         <p>schema 和 C++ 类型有对应关系：<code>float</code> 对应 <code>double</code>，<code>int</code> 对应 <code>int64_t</code>，所以 forward 的参数是 <code>double eps, int64_t impl</code>。<code>int impl=0</code> 是默认值。<code>-&gt; (Tensor, Tensor)</code> 在 C++ 里返回 <code>std::tuple</code>，用 <code>return {h, y};</code> 构造，Python 拿到 <code>(h, y)</code>。<code>m.impl</code> 的名字必须和 <code>m.def</code> 完全一致。</p>
-        <p>Meta 实现要和真实实现行为一致。schema 写 <code>-&gt; Tensor</code> 表示返回新张量，所以要 <code>return torch::empty_like(x)</code>。如果直接返回 x，compile 会以为这是原地修改，图和实际运行就不一致了，可能出现隐蔽错误。Meta 张量的 <code>empty_like</code> 不分配显存。真正原地修改的算子要在 schema 里写 <code>Tensor(a!)</code>，vLLM 的 <code>fused_add_rms_norm</code> 就是这样，我们先做的是返回新张量的版本。</p>
+        <p>Meta 实现要和真实实现行为一致。schema 写 <code>-&gt; Tensor</code> 表示返回新张量，所以要 <code>return torch::empty_like(x)</code>。如果直接返回 x，compile 会以为这是原地修改，图和实际运行就不一致了，可能出现隐蔽错误。</p>
+        <p>Meta 张量的 <code>empty_like</code> 不分配显存。真正原地修改的算子要在 schema 里写 <code>Tensor(a!)</code>，vLLM 的 <code>fused_add_rms_norm</code> 就是这样，我们先做的是返回新张量的版本。</p>
         <p>只注册 CUDA 和 Meta 时，CPU 张量在 dispatcher 处就会报错。所以把模型放在 GPU 上导出：torch 2.1 老导出器追踪时真的运行 CUDA 实现；新版 <code>dynamo=True</code> 用 FakeTensor，只需要 Meta。我们也没注册 Autograd，所以不能训练，要支持的话得写反向 kernel，用 <code>torch.library.register_autograd</code> 或 <code>autograd.Function</code> 配对。</p>
         <p><code>torch.ops</code> 是 dispatcher 里所有算子的总目录，<code>aten</code> 是 PyTorch 自带算子的分区（名字来自 C++ 核心库 ATen），<code>ai_infra</code> 是 <code>TORCH_LIBRARY(ai_infra, m)</code> 开的分区。<code>torch.rsqrt(x)</code> 只是 <code>torch.ops.aten.rsqrt(x)</code> 的短名字。C++ 里写 <code>aten::rsqrt</code>、<code>ai_infra::rms_norm</code>，Python 里写点号，指的是同一个东西。</p>
         <p>迁移时不是一步切换：先两种接口并存，确认 <code>torch.ops</code> 和原 forward 结果完全一致、Meta 能推形状；再把脚本全部改调 <code>torch.ops</code>；最后删除 PYBIND11，改用 <code>load(..., is_python_module=False)</code>。<code>torch.ops</code> 在 Orin CPU 上每次调用比 pybind 多约 10 μs，整层里 CPU 跑在 GPU 前面时被藏住了。</p>
@@ -166,7 +171,9 @@ load(..., extra_cuda_cflags=["-O2", "-lineinfo", f"-DRMSNORM_SRC_HASH={digest}"]
       </div>
 
       <div class="blk"><h3>补充：测试和 NVTX 具体是什么</h3>
-        <p><strong>23 形状 + 160 强制路径 + 5 输入检查</strong>是 <code>src/rmsnorm/torch/test.py</code> 的三组测试，都和 float64 的参考结果比。23 个形状测自动分档，让 <code>launchRMSNorm</code> 自己选，覆盖小 n、大 n、边界值、三维张量和空张量。160 个强制路径是因为自动分档时某个实现可能根本选不到，所以用 <code>impl</code> 强制指定：rows ∈ {1,3,4,5,64} × 10 种 n × 3 种实现 = 150 个，再加 5 种大 n × 2 种实现 = 10 个。5 个输入检查确保错误输入会报错，而不是算出错的结果：x 在 CPU 上、x 是 float16、weight 长度不对、非连续张量、强制 warp 版但 n &gt; 1024。</p>
+        <p><strong>23 形状 + 160 强制路径 + 5 输入检查</strong>是 <code>src/rmsnorm/torch/test.py</code> 的三组测试，都和 float64 的参考结果比。23 个形状测自动分档，让 <code>launchRMSNorm</code> 自己选，覆盖小 n、大 n、边界值、三维张量和空张量。</p>
+        <p>160 个强制路径是因为自动分档时某个实现可能根本选不到，所以用 <code>impl</code> 强制指定：rows ∈ {1,3,4,5,64} × 10 种 n × 3 种实现 = 150 个，再加 5 种大 n × 2 种实现 = 10 个。</p>
+        <p>5 个输入检查确保错误输入会报错，而不是算出错的结果：x 在 CPU 上、x 是 float16、weight 长度不对、非连续张量、强制 warp 版但 n &gt; 1024。</p>
         <p><strong>NVTX</strong> 是 NVIDIA 的打标签工具，在代码里标记"这段时间在做什么"，标签会显示在 nsys 时间线上。nsys 只能看到一堆 kernel，不知道它们属于模型哪一部分，所以 <code>profile_layer.py</code> 打上 <code>norm1</code>、<code>attn</code> 这样的标签，<code>analyze_nsys.py</code> 再归类：kernel → 用 correlationId 找到启动它的 CUDA 调用 → 看这个调用落在哪个 NVTX 范围里 → 算到对应模块。Orin 的 profiler 抓不到 GPU kernel，RMSNorm 占整层约 2% 就是这样统计出来的。</p>
       </div>
 
@@ -186,7 +193,8 @@ load(..., extra_cuda_cflags=["-O2", "-lineinfo", f"-DRMSNORM_SRC_HASH={digest}"]
             <tr><td>求导</td><td>默认 <code>requires_grad=True</code></td><td>默认不求导</td></tr>
           </tbody>
         </table></div>
-        <p><code>export_onnx.py</code> 里的 <code>layer.load_state_dict(base.state_dict())</code> 就靠这张表把 eager 模型的权重拷进 ours 模型，两边才完全一致。<code>nn.Linear</code> 内部也用 <code>nn.Parameter</code>。它计算 <code>y = W @ x</code>，W 的列数要等于输入长度，行数决定输出长度，所以 <code>nn.Linear(2048, 5632)</code> 的 weight 形状是 <code>[5632, 2048]</code>，和参数的顺序相反。这也和 AWQ 笔记对应：W 的一列对应一个输入通道，一行对应一个输出通道。</p>
+        <p><code>export_onnx.py</code> 里的 <code>layer.load_state_dict(base.state_dict())</code> 就靠这张表把 eager 模型的权重拷进 ours 模型，两边才完全一致。<code>nn.Linear</code> 内部也用 <code>nn.Parameter</code>。</p>
+        <p>它计算 <code>y = W @ x</code>，W 的列数要等于输入长度，行数决定输出长度，所以 <code>nn.Linear(2048, 5632)</code> 的 weight 形状是 <code>[5632, 2048]</code>，和参数的顺序相反。这也和 AWQ 笔记对应：W 的一列对应一个输入通道，一行对应一个输出通道。</p>
         <p>接着看 <code>rms_norm_op</code>。它不是 aten 算子，而是 <code>decoder_layer.py</code> 里的一个 Python 小函数，作用是确保扩展已加载，然后返回算子：</p>
 <pre><code>_op = None
 def rms_norm_op():

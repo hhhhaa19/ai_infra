@@ -146,7 +146,8 @@ decode 2：    [今天, 天气, 很, 好, 。]      5 个   ← 追加"。"</cod
             <tr><td>影响的指标</td><td>首字延迟 TTFT</td><td>每秒 token 数（TPOT）</td></tr>
           </tbody>
         </table></div>
-        <p><strong>decode 在 Orin 上的粗算</strong>（理论上限，没有实测，实际会更低）：TinyLlama FP16 权重约 2.2 GB，每生成 1 个 token 要把全部权重读一遍；Orin 带宽 204.8 GB/s，每个 token 至少 2.2 ÷ 204.8 ≈ 11 ms，最多约 90 token/秒。换成 INT4 后权重约 0.6 GB，上限提高到 3 倍多。<strong>端侧 LLM 量化省的主要不是计算，是要搬的数据。</strong>云端的另一个办法是 batching：权重读一次，给很多请求同时算（continuous batching）。</p>
+        <p><strong>decode 在 Orin 上的粗算</strong>（理论上限，没有实测，实际会更低）：TinyLlama FP16 权重约 2.2 GB，每生成 1 个 token 要把全部权重读一遍；Orin 带宽 204.8 GB/s，每个 token 至少 2.2 ÷ 204.8 ≈ 11 ms，最多约 90 token/秒。</p>
+        <p>换成 INT4 后权重约 0.6 GB，上限提高到 3 倍多。<strong>端侧 LLM 量化省的主要不是计算，是要搬的数据。</strong>云端的另一个办法是 batching：权重读一次，给很多请求同时算（continuous batching）。</p>
         <p><strong>KV cache 多大</strong>：每个 token 存 K 和 V，22 层，每层 4 个 KV 头，每头 64 维，FP16 每个数 2 字节：</p>
 <pre><code>TinyLlama：  2 × 22 × 4 × 64 × 2 字节 ≈ 22 KB / token      2048 个 token ≈ 45 MB
 Llama-2-7B： 2 × 32 × 32 × 128 × 2 字节 = 512 KB / token   一个 4K 上下文的请求 ≈ 2 GB</code></pre>
@@ -213,7 +214,8 @@ Llama-2-7B： 2 × 32 × 32 × 128 × 2 字节 = 512 KB / token   一个 4K 上�
           </tbody>
         </table></div>
         <p><strong>系统怎么判断</strong>：最近什么时候被用过（LRU，显存不够时先踢最久没用过的；vLLM 的 prefix caching 是请求结束后块不马上清空、标记为可回收，需要新块时从最久没被命中的开始回收）；被用了多少次；引用计数（计数 &gt; 0 的块绝对不能动）；请求的状态（调度器知道哪些在跑、哪些在排队、哪些在等用户）。</p>
-        <p><strong>挪走还是丢掉，算一笔账</strong>：换出到 CPU 内存或 SSD，代价是以后搬回来的传输时间；直接丢掉，代价是以后重新 prefill 的计算时间。前缀很长（几万 token 的文档）时重算很贵，存下来更划算；前缀很短或传输很慢时直接重算可能更快。例子：用户聊了 8000 个 token 后在想下一句，这段时间 cache 是冷的，可以挪到 CPU 内存；用户发来新消息时搬回 GPU，只对新消息做 prefill；10 分钟都没回就可能直接删掉。所以冷热本质上是一个<strong>预测问题</strong>：猜这块 cache 下次什么时候会被用到，再在显存、CPU 内存、SSD 和重算之间选最便宜的。</p>
+        <p><strong>挪走还是丢掉，算一笔账</strong>：换出到 CPU 内存或 SSD，代价是以后搬回来的传输时间；直接丢掉，代价是以后重新 prefill 的计算时间。前缀很长（几万 token 的文档）时重算很贵，存下来更划算；前缀很短或传输很慢时直接重算可能更快。</p>
+        <p>例子：用户聊了 8000 个 token 后在想下一句，这段时间 cache 是冷的，可以挪到 CPU 内存；用户发来新消息时搬回 GPU，只对新消息做 prefill；10 分钟都没回就可能直接删掉。所以冷热本质上是一个<strong>预测问题</strong>：猜这块 cache 下次什么时候会被用到，再在显存、CPU 内存、SSD 和重算之间选最便宜的。</p>
       </div>
 
       <div class="blk iv" id="m13-iv"><h3>面试要求</h3>

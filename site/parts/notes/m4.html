@@ -36,7 +36,8 @@ dynamo=True 是导出器选择，不等于动态形状
 output_names=['logits'] 只是名字
 opset_version 是算子规范版本，不是数值精度
 checker / Netron 只查结构，不证明数值正确</code></pre>
-        <p>这里容易把两件事混起来：两条路的中间图看起来都有 aten，但 Quest 那条是 FX 图，Orin 那条是 TorchScript 图。另外，名字叫 <code>dynamo=True</code>，新版 <code>torch.export</code> 不一定走 Dynamo 的字节码抓图，取决于 torch 版本和导出策略，这点没在 Quest 上确认。如果 RmsNorm 改走 Quest 这条路，<code>register_custom_op_symbolic</code> 就不能用了，要改用转换表（<code>custom_translation_table</code>），Meta 实现可以用来推形状。这条路还没实际跑过。</p>
+        <p>这里容易把两件事混起来：两条路的中间图看起来都有 aten，但 Quest 那条是 FX 图，Orin 那条是 TorchScript 图。另外，名字叫 <code>dynamo=True</code>，新版 <code>torch.export</code> 不一定走 Dynamo 的字节码抓图，取决于 torch 版本和导出策略，这点没在 Quest 上确认。</p>
+        <p>如果 RmsNorm 改走 Quest 这条路，<code>register_custom_op_symbolic</code> 就不能用了，要改用转换表（<code>custom_translation_table</code>），Meta 实现可以用来推形状。这条路还没实际跑过。</p>
       </div>
 
       <div class="blk"><h3>第四步：验证数值</h3>

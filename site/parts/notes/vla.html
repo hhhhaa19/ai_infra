@@ -28,7 +28,8 @@
       </div>
 
       <div class="blk"><h3>4. EagleVLA：推理引擎怎么做快（最该看的部分）</h3>
-        <p>实现分两个仓库：EagleVLA 负责算法和训练（基于 OpenPI），EagleVLA-Edge 负责端侧推理（基于 llama.cpp）。模型转成 GGUF（语言模型和动作专家一个文件，视觉编码器一个文件），ViT、LLM、动作专家都放进 llama.cpp 的 GGML 计算图，常驻成一个服务，控制程序每次通过 HTTP 上传图像、状态和指令，拿回动作。推理时用三个缓冲区：<code>B_kv</code>（VLM 的 KV cache，给动作专家用）、<code>B_h</code>（VLM 压缩状态，给修正模块用）、<code>B_a</code>（已确定要执行的动作）。</p>
+        <p>实现分两个仓库：EagleVLA 负责算法和训练（基于 OpenPI），EagleVLA-Edge 负责端侧推理（基于 llama.cpp）。模型转成 GGUF（语言模型和动作专家一个文件，视觉编码器一个文件），ViT、LLM、动作专家都放进 llama.cpp 的 GGML 计算图，常驻成一个服务，控制程序每次通过 HTTP 上传图像、状态和指令，拿回动作。</p>
+        <p>推理时用三个缓冲区：<code>B_kv</code>（VLM 的 KV cache，给动作专家用）、<code>B_h</code>（VLM 压缩状态，给修正模块用）、<code>B_a</code>（已确定要执行的动作）。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>优化</th><th>开关或文档</th><th>怎么做</th><th>和学过的对应</th></tr></thead>
           <tbody>
@@ -47,12 +48,14 @@
           </tbody>
         </table></div>
         <p>v7 摘要写 14.71 倍；v1 写 8.66 倍、最后一行是 412.9 ms / 6.06 Hz，版本之间数字不同，以最新版为准。这张表的写法值得学：先拆阶段，再逐项加优化，能看出每一步的贡献；图复用收益最大，调度主要改善反应时间。这里没有用量化，作者把优化限定在系统层，说明可以和量化、剪枝叠加。</p>
-        <p>任务结果：LIBERO 仿真里异步条件下基本保住了同步推理的成功率（比如 Spatial 97.4 对同步 97.3，论文称平均比 VLASH 高 14.8%、比 RTC 高 3.9%），这些仿真实验不是在 Orin 上跑的完整流程；真机叠衣服每个子任务 10 次，Orin 上普通异步抓取 / 折叠 / 放置 6 / 0 / 5，EagleVLA 10 / 8 / 9。局限：真机样本少；模型继续变大或 batch 增大时端侧仍追不上高端 GPU（作者自己说的）。没确认的：哪个线程负责推理、哪个负责控制，Q-Former 内部结构，源码没有逐行读。</p>
+        <p>任务结果：LIBERO 仿真里异步条件下基本保住了同步推理的成功率（比如 Spatial 97.4 对同步 97.3，论文称平均比 VLASH 高 14.8%、比 RTC 高 3.9%），这些仿真实验不是在 Orin 上跑的完整流程；真机叠衣服每个子任务 10 次，Orin 上普通异步抓取 / 折叠 / 放置 6 / 0 / 5，EagleVLA 10 / 8 / 9。</p>
+        <p>局限：真机样本少；模型继续变大或 batch 增大时端侧仍追不上高端 GPU（作者自己说的）。没确认的：哪个线程负责推理、哪个负责控制，Q-Former 内部结构，源码没有逐行读。</p>
       </div>
 
       <div class="blk"><h3>5. LiteVLA-Edge：只证明了"能跑起来"</h3>
         <p>流程是：相机图像 → SmolVLM-256M（LoRA 微调）→ GGUF Q4_K_M 量化 → llama.cpp CUDA 后端（42 层放 GPU）→ ROS 2 节点异步发布速度指令，平均端到端 150.5 ms，约 6.6 Hz。它没用 TensorRT，走的是 LLM 常见的 GGUF 路线。</p>
-        <p>证据很弱：没有任务成功率；量化对动作准确性的影响只有论述没有实测；硬件描述有矛盾（有的章节写 AGX Orin 64GB，另一处把 150.5 ms 写成 Orin NX 的结果）；测量次数正文说 30 次、表格写 300 次；延迟没拆分；和其他模型的比较来自不同硬件和数据；"提升 220%"看不出计算依据。反过来看，这正说明自己的实验要做到：写清硬件和功耗模式，延迟拆成采集 / 预处理 / 推理 / 后处理，同时报告成功率和置信区间，量化前后在同一任务上比较。</p>
+        <p>证据很弱：没有任务成功率；量化对动作准确性的影响只有论述没有实测；硬件描述有矛盾（有的章节写 AGX Orin 64GB，另一处把 150.5 ms 写成 Orin NX 的结果）；测量次数正文说 30 次、表格写 300 次；延迟没拆分；和其他模型的比较来自不同硬件和数据；"提升 220%"看不出计算依据。</p>
+        <p>反过来看，这正说明自己的实验要做到：写清硬件和功耗模式，延迟拆成采集 / 预处理 / 推理 / 后处理，同时报告成功率和置信区间，量化前后在同一任务上比较。</p>
       </div>
 
       <div class="blk"><h3>6. GGUF、ONNX Runtime、TensorRT、Inductor 分别在哪一层</h3>
@@ -69,7 +72,8 @@
           </tbody>
         </table></div>
         <p>EagleVLA 为什么选 llama.cpp，论文没专门解释；推测是它更方便控制图复用时机、GPU 缓冲区和去噪循环展开，这些都要深入引擎内部。选型建议：ACT、检测、分割走 ONNX + TensorRT；LLM、VLM 先看 GGUF + llama.cpp；π0.5 这类 VLA 没有固定答案。</p>
-        <p><strong>ONNX Runtime（ORT）</strong>是微软主导的开源推理引擎：读 ONNX → 做图优化（常量折叠、部分融合）→ 把节点分给不同的 Execution Provider（CPU / CUDA / TensorRT 等后端），不支持的节点退回 CPU。它适合当对照：同一个 ONNX 比较 PyTorch、ORT、TensorRT，能分清问题出在导出还是 TensorRT 的优化。注意 CUDA EP 不支持的节点可能回到 CPU 并增加拷贝，用 ORT 先查节点是否跑在 GPU 上；我们的 RmsNorm plugin 不能直接用于 ORT，要另写 ORT 自定义算子（kernel 和 <code>launchRMSNorm</code> 可复用）；Orin 上装哪个包、支持哪些 EP 还没确认。之前 ResNet 验证里用 ORT 确认过 ONNX 的数值。</p>
+        <p><strong>ONNX Runtime（ORT）</strong>是微软主导的开源推理引擎：读 ONNX → 做图优化（常量折叠、部分融合）→ 把节点分给不同的 Execution Provider（CPU / CUDA / TensorRT 等后端），不支持的节点退回 CPU。</p>
+        <p>它适合当对照：同一个 ONNX 比较 PyTorch、ORT、TensorRT，能分清问题出在导出还是 TensorRT 的优化。注意 CUDA EP 不支持的节点可能回到 CPU 并增加拷贝，用 ORT 先查节点是否跑在 GPU 上；我们的 RmsNorm plugin 不能直接用于 ORT，要另写 ORT 自定义算子（kernel 和 <code>launchRMSNorm</code> 可复用）；Orin 上装哪个包、支持哪些 EP 还没确认。之前 ResNet 验证里用 ORT 确认过 ONNX 的数值。</p>
         <div class="tablewrap"><table>
           <thead><tr><th></th><th>Inductor</th><th>ONNX Runtime</th><th>TensorRT</th></tr></thead>
           <tbody>
@@ -80,12 +84,15 @@
             <tr><td>自定义算子</td><td>外部 kernel，黑盒</td><td>自定义 op，通常也是黑盒</td><td>plugin，黑盒</td></tr>
           </tbody>
         </table></div>
-        <p>所以 ORT 更接近"运行时 + 图优化器"，Inductor 是"编译器 + 代码生成器"；按角色对应，TensorRT 比 ORT 更接近 Inductor。三条路可以这样记：PyTorch 里自动生成 kernel 用 Inductor；ONNX 通用运行和对照用 ORT；NVIDIA 端侧深度优化用 TensorRT。其他开源框架（vLLM / SGLang、ExecuTorch、TFLite、MNN / ncnn、OpenVINO、IREE、TensorRT Model Optimizer）只是按印象分类，版本和支持情况没有逐个核实。</p>
+        <p>所以 ORT 更接近"运行时 + 图优化器"，Inductor 是"编译器 + 代码生成器"；按角色对应，TensorRT 比 ORT 更接近 Inductor。三条路可以这样记：PyTorch 里自动生成 kernel 用 Inductor；ONNX 通用运行和对照用 ORT；NVIDIA 端侧深度优化用 TensorRT。</p>
+        <p>其他开源框架（vLLM / SGLang、ExecuTorch、TFLite、MNN / ncnn、OpenVINO、IREE、TensorRT Model Optimizer）只是按印象分类，版本和支持情况没有逐个核实。</p>
       </div>
 
       <div class="blk"><h3>7. 这个方向的会议和阅读顺序</h3>
         <p>没有查到"机器人策略端侧推理"的公认 benchmark（几次搜索的结论，不能排除漏掉）。相邻方向较公认的有：MLPerf Inference（通用推理，Edge 场景，只查到 v4.0 / v4.1 时期的 Orin 资料）、RobotPerf（ROS 2 计算图的延迟、吞吐和功耗，是否正式发表未确认）、RoWild（ACM POMACS 2023，6 个端到端机器人应用）、MAVBench（无人机端到端负载，发表会议未查证）。有报道提到 VLA-HWBench 测了 18 个 VLA 的 7 段延迟，没找到原论文，数字先不引用。</p>
-        <p>会议按论文重点选（领域判断，没逐个核对 2027 年截止日期）：机器人学习看 CoRL、RSS；机器人综合看 ICRA、IROS、RA-L；ML 系统看 MLSys、MobiSys、SenSys；实时系统看 RTSS、RTAS；体系结构看 ASPLOS、MICRO、ISCA、HPCA。只核实到 CoRL 2026 在 11 月 9～12 日（Austin），同期有 Efficient Foundation Models for Real-Time Embodied AI workshop（11 月 12 日）。MLSys 2026 的几篇 oral 可以借方法：IntAttention（去掉 softmax 的浮点绕行，相对 FP16 最高 3.7 倍，但主要在 Armv8 CPU 上）、MixLLM（混合精度量化）、CORE（端侧 LLM 的频率和能耗）、CAGE（QAT）。</p>
+        <p>会议按论文重点选（领域判断，没逐个核对 2027 年截止日期）：机器人学习看 CoRL、RSS；机器人综合看 ICRA、IROS、RA-L；ML 系统看 MLSys、MobiSys、SenSys；实时系统看 RTSS、RTAS；体系结构看 ASPLOS、MICRO、ISCA、HPCA。</p>
+        <p>只核实到 CoRL 2026 在 11 月 9～12 日（Austin），同期有 Efficient Foundation Models for Real-Time Embodied AI workshop（11 月 12 日）。</p>
+        <p>MLSys 2026 的几篇 oral 可以借方法：IntAttention（去掉 softmax 的浮点绕行，相对 FP16 最高 3.7 倍，但主要在 Armv8 CPU 上）、MixLLM（混合精度量化）、CORE（端侧 LLM 的频率和能耗）、CAGE（QAT）。</p>
         <p>建议阅读顺序：① 量化 ACT（和要做的最接近）；② EagleVLA 最新版的延迟拆分和优化方法，再读 EagleVLA-Edge 的 <code>pi0_decode_graph_reuse.md</code>，对照 CUDA Graph 理解它怎么固定图和地址；③ Embodied Foundation Models at the Edge（综述，强调端侧部署主要是系统工程问题）；④ Characterizing VLA across XPUs（RTX 4090、Orin、Thor 上的瓶颈分析）；⑤ 学 INT8 时读 IntAttention；有空看 RoWild 学系统评估方法、Kress-Gazit 等学真机评估设计。现在不急着投稿，等项目有"量化 + 系统优化 + 真机任务结果"再和导师讨论。</p>
       </div>
 

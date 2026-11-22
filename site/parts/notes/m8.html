@@ -8,7 +8,8 @@
         <p>prefill 时，每个权重要和 512 个 token 各乘一次，约 52 GFLOP（1 GFLOP 是十亿次浮点运算）。A100 FP32 约 20 TFLOPS，所以要约 3 ms。瓶颈是算力。CPU 发 26 个 kernel 约 0.3 ms，这段时间和 GPU 计算重叠，等于没花时间，所以 6 种写法都在 3.6 ms 左右。</p>
         <p>decode 的计算量只有 prefill 的 1/512（约 0.1 GFLOP），读完 205 MB 约 140 μs。而 CPU 发 26 个 kernel 约 0.3 ms，比 GPU 干活还慢，GPU 大部分时间在等。所以 token 差 512 倍，耗时只差约 7 倍（3.6 ms 对 0.49 ms）。</p>
         <p>这里可以用一个比喻：GPU 是厨师，CPU 是递菜单的服务员。prefill 每道菜做很久，服务员慢一点看不出来；decode 每道菜几微秒做完，总时间几乎由菜单数量和服务员速度决定。</p>
-        <p>所以每层耗时 ≈ GPU 真正干活 + GPU 空等 CPU。eager 的 RMSNorm 是 pow → mean → +eps → rsqrt → ×scale → ×w，约 5 个 kernel，每发一个，CPU 要跑 Python + dispatcher + launch 约 10～15 μs。换成我们的 1 个后，488 − 347 = 141 μs，÷ 10 个 ≈ 14 μs / 个，和 Orin 上"每少一个 op 省约 15 μs"对得上。<strong>这 −29% 省的是 CPU 时间，不是 GPU 算得更快。</strong></p>
+        <p>所以每层耗时 ≈ GPU 真正干活 + GPU 空等 CPU。eager 的 RMSNorm 是 pow → mean → +eps → rsqrt → ×scale → ×w，约 5 个 kernel，每发一个，CPU 要跑 Python + dispatcher + launch 约 10～15 μs。</p>
+        <p>换成我们的 1 个后，488 − 347 = 141 μs，÷ 10 个 ≈ 14 μs / 个，和 Orin 上"每少一个 op 省约 15 μs"对得上。<strong>这 −29% 省的是 CPU 时间，不是 GPU 算得更快。</strong></p>
       </div>
 
       <div class="blk"><h3>第二步：GPU 上的执行层次</h3>
@@ -85,7 +86,8 @@ extern_kernels.mm(buf12, Wgate/Wup); triton_poi_fused__unsafe_view_mul_silu_2; e
 buf17 = buf10; triton_poi_fused__unsafe_view_add_3.run(buf17, x, buf16)    # out = attn + x + mlp，原地写
 自己看：TORCH_LOGS=output_code python 脚本.py</code></pre>
         <p>kernel 名是 <code>triton_&lt;类型&gt;_fused_&lt;被合并的操作&gt;</code>：red 是规约，poi 是逐元素。注释里的 <code>Original ATen: [aten.pow, aten.mean, …]</code> 就是第 3 步翻译出的算子。</p>
-        <p>融合 kernel 是<strong>两遍循环</strong>：第 1 遍读 x、attn_out 求平方和，第 2 遍再读一次，<code>eviction_policy='evict_last'</code> 让数据留在缓存。我们把数据存在寄存器里只读一次，所以当时变慢的原因不在读写量。<code>.json</code> 里两个 RMSNorm kernel 都是 <code>num_warps=16</code>（每行 512 线程）；<code>triton_meta</code> 里 <code>tt.divisibility 16</code> 表示指针 16 字节对齐，于是自动生成 128 位读取。</p>
+        <p>融合 kernel 是<strong>两遍循环</strong>：第 1 遍读 x、attn_out 求平方和，第 2 遍再读一次，<code>eviction_policy='evict_last'</code> 让数据留在缓存。我们把数据存在寄存器里只读一次，所以当时变慢的原因不在读写量。</p>
+        <p><code>.json</code> 里两个 RMSNorm kernel 都是 <code>num_warps=16</code>（每行 512 线程）；<code>triton_meta</code> 里 <code>tt.divisibility 16</code> 表示指针 16 字节对齐，于是自动生成 128 位读取。</p>
         <p>这里有一个教训：我最初说"融合 kernel 写出 h 和 norm2(h)"，后来又说"h 要写回一次"，读代码后发现两种都不对，它根本不写 h。<strong>没读代码前的推断要标明是推断。</strong></p>
       </div>
 
@@ -200,7 +202,8 @@ __global__ void fusedAddRmsNormVec4(…) {
 }
 n=2048、行少（512 线程）：每线程正好 1 个 float4；行多（256 线程）：每线程 2 个</code></pre>
         <p>为什么更快？读进来的数据量一样，只是"跑腿次数"少了。每条读指令都有发出、追踪、等待的固定开销。1 行时速度由延迟决定，指令少等待轮数就少；行多时每条指令搬得多，更容易用满带宽。</p>
-        <p>条件是地址必须 16 字节对齐，否则报 misaligned address。PyTorch 新分配的张量起始对齐，每行开头 = 行号 × n × 4 字节，所以要 n % 4 == 0；切片（比如起始偏 4 字节的连续 view）可能不对齐。C++ 用 <code>aligned16(p)</code> 检查 x / r / w / h / y，不满足就退回 own_reg。<code>rms_norm(…, impl=4)</code> 用来强制 float4 做测试。最大 n = 1024 × 9 × 4 = 36864。</p>
+        <p>条件是地址必须 16 字节对齐，否则报 misaligned address。PyTorch 新分配的张量起始对齐，每行开头 = 行号 × n × 4 字节，所以要 n % 4 == 0；切片（比如起始偏 4 字节的连续 view）可能不对齐。</p>
+        <p>C++ 用 <code>aligned16(p)</code> 检查 x / r / w / h / y，不满足就退回 own_reg。<code>rms_norm(…, impl=4)</code> 用来强制 float4 做测试。最大 n = 1024 × 9 × 4 = 36864。</p>
         <p>怎么确认生效？用 <code>nvcc -cubin</code> 实例化两个模板，<code>cuobjdump -sass</code> 里出现 <code>LDG.E.128</code> / <code>STG.E.128</code>，条数和预期一致（<code>rmsNormVec4&lt;512,1&gt;</code> 读 x、w 各 1 条；<code>fused&lt;128,4&gt;</code> 读 8 + 4 条、写 1 + 8 条）。512 线程 × 1 个 float4，和 Triton 的 num_warps=16、每线程 4 个元素是同一个切法。</p>
         <p>这和之前的对齐研究是一类问题：n 不是 32 的倍数时，每个请求从 4 个 sector 变 4.4 个。<strong>对齐决定一次能读多宽。</strong></p>
       </div>
@@ -237,7 +240,8 @@ n=2048、行少（512 线程）：每线程正好 1 个 float4；行多（256 �
           </tbody>
         </table></div>
         <p>profiler 拖慢的是 CPU，不是 GPU。开着它时，kernel 的种类、个数、每个 kernel 本身的 GPU 时间都不变；整层耗时变长，多出来的是 GPU 在等 CPU。所以脚本分两次测：开 profiler 只跑 1 次前向数 kernel，关掉，预热 2 秒，再不开任何工具用 CUDA event 计时。</p>
-        <p>Orin 上和 GPU / CUDA 相关的软件都要用 Jetson 版（JetPack 5.1.2 自带 CUDA 11.4、TensorRT 8.5.2，NVIDIA 的 torch 2.1 wheel，nsys / ncu）；Python 3.8 是普通的 Ubuntu 20.04 自带版本。原因是 CPU 是 ARM，GPU 集成在芯片里和 CPU 共用内存。分工上，Orin 做开发和 TensorRT，Quest 做需要新版 PyTorch 的 compile 对比。</p>
+        <p>Orin 上和 GPU / CUDA 相关的软件都要用 Jetson 版（JetPack 5.1.2 自带 CUDA 11.4、TensorRT 8.5.2，NVIDIA 的 torch 2.1 wheel，nsys / ncu）；Python 3.8 是普通的 Ubuntu 20.04 自带版本。</p>
+        <p>原因是 CPU 是 ARM，GPU 集成在芯片里和 CPU 共用内存。分工上，Orin 做开发和 TensorRT，Quest 做需要新版 PyTorch 的 compile 对比。</p>
       </div>
 
       <div class="blk"><h3>最后：FX 图和 ONNX 的关系</h3>

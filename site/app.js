@@ -1,26 +1,64 @@
 (function () {
-  var VIEWS = ["overview", "notes", "rmsnorm", "source", "leetcode"];
+  var VIEWS = ["overview", "notes", "source", "leetcode"];
   var navLinks = document.querySelectorAll("nav.views a");
 
+  // 左侧模块按钮按 .grp 分组；顶部导航的分组链接用 data-group 对应
+  var groupOf = {};
+  var lastGrp = "";
+  Array.prototype.forEach.call(document.querySelectorAll(".mod-list > *"), function (el) {
+    if (el.classList.contains("grp")) { lastGrp = el.dataset.key || el.textContent.trim(); el.dataset.group = lastGrp; }
+    else if (el.dataset.mod) { el.dataset.group = lastGrp; groupOf[el.dataset.mod] = lastGrp; }
+  });
+  function setNav(key) {
+    navLinks.forEach(function (a) {
+      if (a.dataset.view === key || a.dataset.group === key) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+    });
+  }
   function showView(name) {
     VIEWS.forEach(function (v) { document.getElementById(v).hidden = v !== name; });
-    navLinks.forEach(function (a) { if (a.dataset.view === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
+    if (name !== "notes") setNav(name);
   }
+  // 当前模块的小节目录，放在左侧按钮下面
+  function buildToc(id) {
+    var old = document.querySelector(".mod-toc"); if (old) old.remove();
+    var art = document.getElementById(id), btn = document.querySelector('.mod-list button[data-mod="' + id + '"]');
+    if (!art || !btn) return;
+    var title = art.querySelector("h2");
+    var heads = Array.prototype.filter.call(art.querySelectorAll(".blk > h3, section > h2"), function (h) { return h !== title; });
+    if (heads.length < 2) return;
+    var nav = document.createElement("nav"); nav.className = "mod-toc"; nav.setAttribute("aria-label", "本模块小节");
+    heads.forEach(function (h, k) {
+      var box = h.parentElement;
+      var target = box.id ? box : h;
+      if (!target.id) target.id = id + "-t" + k;
+      var a = document.createElement("a"); a.href = "#" + target.id;
+      a.textContent = h.textContent.replace(/\s+/g, " ").trim();
+      nav.appendChild(a);
+    });
+    btn.insertAdjacentElement("afterend", nav);
+  }
+  var curMod = null;
   function showModule(id) {
     document.querySelectorAll("article.mod").forEach(function (m) { m.hidden = m.id !== id; });
     document.querySelectorAll(".mod-list button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.mod === id)); });
+    var g = groupOf[id];
+    Array.prototype.forEach.call(document.querySelectorAll(".mod-list > [data-group]"), function (el) { el.hidden = el.dataset.group !== g; });
+    setNav(g);
+    if (curMod !== id) { buildToc(id); curMod = id; }
   }
   function route() {
     var id = (location.hash || "#overview").slice(1);
     if (!/^[A-Za-z0-9_.~-]+$/.test(id)) id = "overview";
     var el = document.getElementById(id);
     if (!el) { showView("overview"); return; }
+    if (id === "notes") { showView("notes"); showModule("m1"); window.scrollTo(0, 0); return; }
     if (VIEWS.indexOf(id) >= 0) { showView(id); window.scrollTo(0, 0); return; }
     var view = el.closest(".view");
     if (view) showView(view.id);
     var mod = el.closest("article.mod");
     if (mod) showModule(mod.id);
     if (el.tagName === "DETAILS") el.open = true;
+    if (el.classList.contains("mod")) { requestAnimationFrame(function () { window.scrollTo(0, 0); }); return; }
     requestAnimationFrame(function () { el.scrollIntoView(); });
   }
   window.addEventListener("hashchange", route);
@@ -89,7 +127,7 @@
 (function () {
   document.querySelectorAll(".mod-list button").forEach(function (b) {
     var t = b.textContent, m = t.match(/^(\d+)\s*·\s*(.*)$/);
-    var num = m ? m[1] : "论", name = m ? m[2] : t;
+    var num = b.dataset.badge || (m ? m[1] : "论"), name = m ? m[2] : t;
     b.textContent = "";
     var n = document.createElement("span"); n.className = "mnum"; n.setAttribute("aria-hidden", "true"); n.textContent = num;
     var l = document.createElement("span"); l.textContent = name;

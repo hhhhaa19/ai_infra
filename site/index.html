@@ -4,7 +4,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;900&family=JetBrains+Mono:wght@400;600&display=swap">
 <style>
-/* 布局：顶部固定导航切换 5 个视图（总览 / 复习笔记 / RMSNorm 专题 / 源码与报告 / 刷题）；正文单栏，笔记视图左侧模块列表。
+/* 布局：顶部固定导航切换 总览、6 个笔记分组（部署与工程 / GPU 与性能 / 端侧部署 / 核心算子 / LLM 推理 / 论文）、源码与报告、刷题；正文单栏，笔记视图左侧模块列表。
    主题：硅片蓝灰底 + 信号蓝强调；琥珀色只用于"后来被修正 / 需要注意"；绿色只用于"已完成 / 已掌握"。 */
 :root {
   --bg: #f4f6f9; --panel: #ffffff; --ink: #17202c; --muted: #586374; --line: #d9dfe8;
@@ -234,6 +234,21 @@ code.path { overflow-wrap: anywhere; word-break: break-all; }
 :root[data-theme="dark"] .lc-d.H { background: #3a1616; color: #ff8a80; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .lc-d.H { background: #3a1616; color: #ff8a80; } }
 @media (max-width: 900px) { .lc-top { grid-template-columns: repeat(2, minmax(0, 1fr)); } .lc-cats { grid-template-columns: minmax(0, 1fr); } }
+
+/* 笔记分组导航 + 可读性 */
+[hidden]:not([hidden=until-found i]) { display: none !important; }
+.mod-list button > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.mod-toc { display: grid; gap: 1px; margin: 2px 0 10px 22px; padding-left: 10px; border-left: 1px solid var(--line); }
+.mod-toc a { font-size: 12.5px; line-height: 1.45; color: var(--muted); text-decoration: none; padding: 4px 8px; border-radius: 6px; }
+.mod-toc a:hover { color: var(--accent); background: var(--code-bg); }
+article.mod { gap: 26px; }
+article.mod p, article.mod li { line-height: 1.9; }
+article.mod .blk { gap: 14px; padding-top: 26px; border-top: 1px solid var(--line); }
+article.mod .blk > h3 { font-size: 19px; }
+article.mod p > strong:first-child { color: var(--accent); }
+article.mod ul.plain, article.mod ol.plain { gap: 10px; }
+article.mod .selftest { margin-top: 6px; }
+@media (max-width: 900px) { .mod-toc { display: none; } }
 </style>
 
 <header class="top">
@@ -241,8 +256,12 @@ code.path { overflow-wrap: anywhere; word-break: break-all; }
     <a class="brand" href="#overview">AI INFRA <span>/</span> 学习日志</a>
     <nav class="views" aria-label="视图">
       <a href="#overview" data-view="overview">总览</a>
-      <a href="#notes" data-view="notes">复习笔记</a>
-      <a href="#rmsnorm" data-view="rmsnorm">RMSNorm 专题</a>
+      <a href="#m1" data-group="deploy">部署与工程</a>
+      <a href="#m5" data-group="gpu">GPU 与性能</a>
+      <a href="#m10" data-group="edge">端侧部署</a>
+      <a href="#rmsnorm" data-group="ops">核心算子</a>
+      <a href="#m13" data-group="llm">LLM 推理</a>
+      <a href="#awq" data-group="papers">论文</a>
       <a href="#source" data-view="source">源码与报告</a>
       <a href="#leetcode" data-view="leetcode">刷题</a>
     </nav>
@@ -253,7 +272,6 @@ code.path { overflow-wrap: anywhere; word-break: break-all; }
 <p class="muted small" id="boot-status">正在加载内容…</p>
 <div data-include="parts/overview.html"></div>
 <div data-include="parts/notes.html"></div>
-<div data-include="parts/rmsnorm.html"></div>
 <div data-include="parts/source.html"></div>
 <div data-include="parts/leetcode.html"></div>
 </div>

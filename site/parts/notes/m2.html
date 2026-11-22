@@ -43,7 +43,8 @@ sudo jetson_clocks --restore                   # 测完</code></pre>
           <li><strong>记录目标和关系</strong>：<code>add_library</code>、<code>target_link_libraries</code> 只是记下"这个 .so 由哪些文件编译、链接时带哪些库"，这时还没有编译或链接。</li>
           <li><strong>生成规则</strong>：把这些信息写成具体命令，放进 <code>build/</code> 里的 Makefile 或 build.ninja。</li>
         </ol>
-        <p>所以 <code>build/</code> 是第一条命令创建的，但里面还没有成品。<code>cmake --build build</code> 才调用 make / ninja，再由它们调用 <code>nvcc</code>、<code>g++</code>，这时才真正编译和链接。改了 <code>.cu</code> 或 <code>.cpp</code> 后只要再跑第二条，它只重编改动过的文件；改了 <code>CMakeLists.txt</code>，第二条通常也会自动重新配置。找到的路径缓存在 <code>build/CMakeCache.txt</code>，环境变了（比如换 CUDA 版本）却还用旧路径时，可以删掉 <code>build/</code> 重新配置。</p>
+        <p>所以 <code>build/</code> 是第一条命令创建的，但里面还没有成品。<code>cmake --build build</code> 才调用 make / ninja，再由它们调用 <code>nvcc</code>、<code>g++</code>，这时才真正编译和链接。改了 <code>.cu</code> 或 <code>.cpp</code> 后只要再跑第二条，它只重编改动过的文件；改了 <code>CMakeLists.txt</code>，第二条通常也会自动重新配置。</p>
+        <p>找到的路径缓存在 <code>build/CMakeCache.txt</code>，环境变了（比如换 CUDA 版本）却还用旧路径时，可以删掉 <code>build/</code> 重新配置。</p>
       </div>
 
       <div class="blk"><h3>库：.a、.so 和 dlopen</h3>
@@ -55,7 +56,9 @@ sudo jetson_clocks --restore                   # 测完</code></pre>
             <tr><td><code>add_library(foo SHARED a.cu)</code></td><td><code>libfoo.so</code>（动态库）</td><td>运行时才加载：链接时写 <code>-lfoo</code> 则启动时自动加载；或程序自己调 <code>dlopen</code></td><td>换掉 .so 即可</td></tr>
           </tbody>
         </table></div>
-        <p>为什么 plugin 必须是 <code>.so</code>？<code>trtexec</code> 是 NVIDIA 编译好的程序，不知道 RmsNorm 存在，也不可能再把代码链接进去，只能在运行时接收路径：<code>trtexec --onnx=model.onnx --plugins=librmsnorm_trt_plugin.so</code>。打开 <code>.so</code> 时，系统初始化里面的全局变量，<code>REGISTER_TENSORRT_PLUGIN</code> 定义的全局对象构造时把 creator 注册给 TensorRT，之后 Parser 才找得到它。所以 trtexec 一行代码没改，就能用上我们的算子。<code>.a</code> 只是给链接器用的归档文件，不能用 dlopen 打开。<code>build_engine.cpp</code> 的源码在自己手里，所以链接时带上或 dlopen 都可以。</p>
+        <p>为什么 plugin 必须是 <code>.so</code>？<code>trtexec</code> 是 NVIDIA 编译好的程序，不知道 RmsNorm 存在，也不可能再把代码链接进去，只能在运行时接收路径：<code>trtexec --onnx=model.onnx --plugins=librmsnorm_trt_plugin.so</code>。</p>
+        <p>打开 <code>.so</code> 时，系统初始化里面的全局变量，<code>REGISTER_TENSORRT_PLUGIN</code> 定义的全局对象构造时把 creator 注册给 TensorRT，之后 Parser 才找得到它。所以 trtexec 一行代码没改，就能用上我们的算子。</p>
+        <p><code>.a</code> 只是给链接器用的归档文件，不能用 dlopen 打开。<code>build_engine.cpp</code> 的源码在自己手里，所以链接时带上或 dlopen 都可以。</p>
 <pre><code>void* h = dlopen("./librmsnorm_plugin.so", RTLD_LAZY);   // 运行到这一行才打开文件，编译时不用知道这个库</code></pre>
       </div>
 

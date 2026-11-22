@@ -99,7 +99,8 @@
             <tr><td>SASS（机器码）</td><td>编译器到底生成了什么</td><td>数 <code>LDG</code>，确认 <code>LDG.E.128</code>、循环有没有展开</td><td>知道运行时发生了什么</td></tr>
           </tbody>
         </table></div>
-        <p>为什么 nsys 不能报整层时间？它要记录每次 CUDA 调用，CPU 每发一个 kernel 都多了拦截开销。kernel 的执行时间由 GPU 记录，不受影响；但 decode 时 GPU 本来就在等 CPU，CPU 一变慢，整层时间就被拉长。所以 nsys 下 decode b1 / b8 是 −23% / −20%，CUDA event 下是 −10% / −2%：kernel 少了 10 个，每个 kernel 在 nsys 下省得更多，收益就被放大了。</p>
+        <p>为什么 nsys 不能报整层时间？它要记录每次 CUDA 调用，CPU 每发一个 kernel 都多了拦截开销。kernel 的执行时间由 GPU 记录，不受影响；但 decode 时 GPU 本来就在等 CPU，CPU 一变慢，整层时间就被拉长。</p>
+        <p>所以 nsys 下 decode b1 / b8 是 −23% / −20%，CUDA event 下是 −10% / −2%：kernel 少了 10 个，每个 kernel 在 nsys 下省得更多，收益就被放大了。</p>
         <p>CUDA event 在 stream 上放两个时间点，测的是中间这一整段，不只是 kernel 的执行时间。GPU 在等 CPU 发下一个 kernel 时，空等也算进去。这正是整层测速要的，因为用户感受到的就是这段时间；只想要单个 kernel 自身的时间，就看 nsys 的 kernel 时间。</p>
 <pre><code>【例一：own 为什么比 CUB 慢】
 CUDA event：发现 own 慢
@@ -132,7 +133,8 @@ torch.compile 有没有切断图      → torch._dynamo.explain
 compile 把算子融合成了什么      → TORCH_LOGS=output_code 或 inductor_cache
 PyTorch 里实际要多久            → torch.cuda.Event
 不在 PyTorch 里（如 TensorRT）  → nsys、trtexec --dumpProfile</code></pre>
-        <p><code>torch.profiler</code> 要通过 CUPTI（NVIDIA 的 CUDA 性能分析接口）拿 kernel 记录。NVIDIA 的 Jetson torch 2.1 编译时没带上这部分，所以 Orin 上能看到 <code>aten::mm</code> 这样的 CPU 操作，看不到 GPU 上运行了什么。这是 wheel 的打包问题，不是 GPU 不支持（依据是实测和排查，没有查 wheel 的编译配置）。nsys 是独立工具，不经过 PyTorch，所以能用；kernel 也照常运行，只是 profiler 拿不到记录。</p>
+        <p><code>torch.profiler</code> 要通过 CUPTI（NVIDIA 的 CUDA 性能分析接口）拿 kernel 记录。NVIDIA 的 Jetson torch 2.1 编译时没带上这部分，所以 Orin 上能看到 <code>aten::mm</code> 这样的 CPU 操作，看不到 GPU 上运行了什么。</p>
+        <p>这是 wheel 的打包问题，不是 GPU 不支持（依据是实测和排查，没有查 wheel 的编译配置）。nsys 是独立工具，不经过 PyTorch，所以能用；kernel 也照常运行，只是 profiler 拿不到记录。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>工具</th><th>Quest</th><th>Orin</th></tr></thead>
           <tbody>

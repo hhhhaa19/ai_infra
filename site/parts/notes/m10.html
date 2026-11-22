@@ -358,8 +358,10 @@ tnow=56;draw();
             <tr><td>C 单步去噪</td><td>x_t、时间步、16 层 K、V</td><td>速度 v</td><td>10</td></tr>
           </tbody>
         </table></div>
-        <p>风险：原代码的 KV cache 是 Python 对象 <code>DynamicCache</code>（还带追加再裁剪），要写包装层换成纯张量；自定义二维注意力掩码导出后要验证；FP16 精度要逐块对比；opset 要按 TensorRT 8.5 选。后续步骤：② Orin 上先 FP32 再 FP16，逐块和 PyTorch 参考输出对比 → ③ C++ 串起来（预处理 kernel、KV 常驻显存、Euler 更新 kernel、循环在 C++）→ ④ 固定输入和噪声做端到端对比 → ⑤ nsys 找瓶颈，依次试提前算交叉注意力 K/V、CUDA Graph、视觉 INT8、减少去噪步数、异步推理 → ⑥ 延迟 / 离线动作误差 / 仿真成功率三层评估（<code>smolvla_base</code> 没有在具体任务上微调，到这一步要找 LIBERO 微调权重或自己微调）。</p>
-        <p><strong>① 引擎 A 的导出</strong>：<code>src/vla/export_vision.py</code>把 ×2−1 → SigLIP → post_layernorm → connector → ×√960 包成一个模型，resize 和补边留在外面；PyTorch 跑两组随机图把输入输出存成 <code>vision_io.pt</code>，以后 onnxruntime 和 TensorRT 都拿它对答案。PyTorch 在这里只做两件事：导出需要它实际跑一遍来记录计算图（tracing），以及留下标准答案；部署到 Orin 后不需要 PyTorch。三次 CPU 作业：</p>
+        <p>风险：原代码的 KV cache 是 Python 对象 <code>DynamicCache</code>（还带追加再裁剪），要写包装层换成纯张量；自定义二维注意力掩码导出后要验证；FP16 精度要逐块对比；opset 要按 TensorRT 8.5 选。</p>
+        <p>后续步骤：② Orin 上先 FP32 再 FP16，逐块和 PyTorch 参考输出对比 → ③ C++ 串起来（预处理 kernel、KV 常驻显存、Euler 更新 kernel、循环在 C++）→ ④ 固定输入和噪声做端到端对比 → ⑤ nsys 找瓶颈，依次试提前算交叉注意力 K/V、CUDA Graph、视觉 INT8、减少去噪步数、异步推理 → ⑥ 延迟 / 离线动作误差 / 仿真成功率三层评估（<code>smolvla_base</code> 没有在具体任务上微调，到这一步要找 LIBERO 微调权重或自己微调）。</p>
+        <p><strong>① 引擎 A 的导出</strong>：<code>src/vla/export_vision.py</code>把 ×2−1 → SigLIP → post_layernorm → connector → ×√960 包成一个模型，resize 和补边留在外面；PyTorch 跑两组随机图把输入输出存成 <code>vision_io.pt</code>，以后 onnxruntime 和 TensorRT 都拿它对答案。</p>
+        <p>PyTorch 在这里只做两件事：导出需要它实际跑一遍来记录计算图（tracing），以及留下标准答案；部署到 Orin 后不需要 PyTorch。三次 CPU 作业：</p>
         <ol class="plain">
           <li><strong>tracing 时报 IndexError</strong>：SigLIP 每层前要生成 attention mask，要用到 patch 总数 1024；导出时这个数被换成"会记账的张量"，transformers 误以为是旧版本的调用方式（传一串位置编号），去取第一个元素就越界。这是库的兼容 bug，只在导出时触发。我们的图都是满图，mask 全是"可以"，于是不调用 <code>embed_image</code>，手动依次调用 embeddings → encoder（不传 mask）→ post_layernorm → connector，和原版的最大差值 0。</li>
           <li><strong>onnxruntime 加载失败</strong>：SmolVLM 为了支持任意尺寸的图，位置编号的算法是"相对坐标 → 查落在哪个格子 → 按条件写回"，导出后变成 NonZero、ScatterND 这类"按数据决定往哪写"的节点，ScatterND 的输入类型前后不一致（float 和 int64）；就算能加载，TensorRT 对这类节点的支持也差。满图时编号就是 0～1023，改成直接加整张位置编码表 [1024, 768]。</li>
@@ -376,7 +378,8 @@ tnow=56;draw();
             <tr><td>Tanh</td><td class="num">12</td><td>GELU 的 tanh 近似，每层 MLP 一个</td></tr>
           </tbody>
         </table></div>
-        <p>ViT 本身：图切成 16×16 的块，每块 16×16×3 = 768 个数乘一个矩阵变成 768 维向量（这正是 K = 768 的 16×16 stride 16 卷积），加上可学的位置编码；每层 LayerNorm → attention（12 个头、每头 64 维，[1024, 1024] 的分数表每行 softmax）→ 残差 → LayerNorm → MLP（768 → 3072 → 768，GELU）→ 残差。每层约 4.8 G（四个投影）+ 3.2 G（QKᵀ 和 PV）+ 9.7 G（MLP）FLOP，12 层约 200 GFLOP 一张图，几乎全是矩阵乘，所以 Orin 上快不快主要看能不能用上 FP16 Tensor Core。Orin 上的结果见下面 ②。</p>
+        <p>ViT 本身：图切成 16×16 的块，每块 16×16×3 = 768 个数乘一个矩阵变成 768 维向量（这正是 K = 768 的 16×16 stride 16 卷积），加上可学的位置编码；每层 LayerNorm → attention（12 个头、每头 64 维，[1024, 1024] 的分数表每行 softmax）→ 残差 → LayerNorm → MLP（768 → 3072 → 768，GELU）→ 残差。</p>
+        <p>每层约 4.8 G（四个投影）+ 3.2 G（QKᵀ 和 PV）+ 9.7 G（MLP）FLOP，12 层约 200 GFLOP 一张图，几乎全是矩阵乘，所以 Orin 上快不快主要看能不能用上 FP16 Tensor Core。Orin 上的结果见下面 ②。</p>
         <p><strong>② 引擎 A 在 Orin 上编 TensorRT</strong>：ONNX 和参考数据经本机 ssh 管道从 Quest 拷到 Orin（用 md5 核对），<code>trtexec --onnx=… --noTF32</code> 编 FP32（<code>--noTF32</code> 保证矩阵乘真用 FP32 而不是 TF32，和 PyTorch 比才公平），再编 FP16；检查脚本 <code>src/vla/check_vision_trt.py</code> 仿照 ACT 的 <code>check_trt.py</code>，喂 2 组参考输入，比 rel_l2、max_abs、cos。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>引擎</th><th class="num">延迟（普通 / CUDA Graph）</th><th class="num">rel_l2</th><th class="num">cos</th></tr></thead>
@@ -393,7 +396,9 @@ tnow=56;draw();
           <li><strong>FP32 速度合理吗</strong>：3 张图约 650 GFLOP，226 ms 约 2.9 TFLOPS，约 1300 MHz 下 FP32 峰值的 55%（估算）。FP16 快约 4.6 倍。</li>
           <li><strong>8.5e-3 够不够</strong>：对 FP16 的 ViT 常见，但最终要等整条管线输出动作后在动作上看。</li>
         </ol>
-        <p><strong>③ 引擎 B（VLM 前缀 → KV cache）的导出脚本已写好、还没跑</strong>（<code>src/vla/export_prefix.py</code>）。输入 <code>img_emb [3,64,960]</code>（直接接引擎 A 输出）、<code>lang_tokens [1,48]</code>（int32）、<code>lang_mask [1,48]</code>、<code>state [1,32]</code>；输出 <code>k_cache</code>、<code>v_cache</code> 各 [16, 5, 241, 64]。attention mask 和位置编号只依赖 <code>lang_mask</code>，放在图里算，原版的 cumsum 改成乘一个上三角全 1 矩阵（TensorRT 一定支持矩阵乘）。和原版的两处不同（导出后会逐层对比）：RoPE 原版用下标赋值写结果，导出会变成 ScatterND，改成 cat，数学上一样；补齐的 token 让它至少能看自己，否则这一整行 softmax 在 FP16 下是 NaN，并通过 V 传给所有 token，真 token 的 K、V 不受影响。提前记下的 FP16 风险：RoPE 的角度最大约 240 弧度，FP16 在 240 附近的精度只有 0.125，所以编 FP16 时 RoPE 也要留在 FP32（<strong>待验证</strong>）。</p>
+        <p><strong>③ 引擎 B（VLM 前缀 → KV cache）的导出脚本已写好、还没跑</strong>（<code>src/vla/export_prefix.py</code>）。输入 <code>img_emb [3,64,960]</code>（直接接引擎 A 输出）、<code>lang_tokens [1,48]</code>（int32）、<code>lang_mask [1,48]</code>、<code>state [1,32]</code>；输出 <code>k_cache</code>、<code>v_cache</code> 各 [16, 5, 241, 64]。</p>
+        <p>attention mask 和位置编号只依赖 <code>lang_mask</code>，放在图里算，原版的 cumsum 改成乘一个上三角全 1 矩阵（TensorRT 一定支持矩阵乘）。和原版的两处不同（导出后会逐层对比）：RoPE 原版用下标赋值写结果，导出会变成 ScatterND，改成 cat，数学上一样；补齐的 token 让它至少能看自己，否则这一整行 softmax 在 FP16 下是 NaN，并通过 V 传给所有 token，真 token 的 K、V 不受影响。</p>
+        <p>提前记下的 FP16 风险：RoPE 的角度最大约 240 弧度，FP16 在 240 附近的精度只有 0.125，所以编 FP16 时 RoPE 也要留在 FP32（<strong>待验证</strong>）。</p>
         <p><strong>④ 引擎 A 的算子按计算量拆开（讲解）</strong>：855 个节点里真正做计算的只有 5 类，其余 Reshape / Transpose / Constant 只是挪数据、摆形状。一张图的路径：像素 [0,1] → [−1,1] → Conv patch embed（[3,512,512] → [1024,768]，约 1.2 GFLOP，本质是每块 768 个像素乘 [768,768] 的矩阵）→ 加位置编码 → 12 层 transformer（约 213 GFLOP）→ post LayerNorm → pixel shuffle（4×4 块拼成一个 token，1024 → 64 个 token、每个 12288 维，只挪数据）→ connector MatMul 12288 → 960（约 1.5 GFLOP）→ 乘 √960。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>每张图约 215 GFLOP</th><th class="num">计算量</th><th class="num">占比</th></tr></thead>
@@ -409,7 +414,8 @@ tnow=56;draw();
           <li><strong>精度问题只出在 LayerNorm</strong>：ViT 残差流里有少数"离群通道"值到几百，|x − 均值| &gt; 256 时平方超过 65504。另外两个看起来危险的算子没事：Softmax 在 TensorRT 里先减每行最大值；GELU（tanh 近似）里的 x³ 在 |x| &gt; 40 时会变成 inf，但 tanh(±inf) = ±1，正数原样输出、负数输出 0，结果仍正确。</li>
           <li><strong>引擎 B 为什么还要再跑一次导出</strong>：上次的脚本虽然加载了整个模型，但只 trace 了 SigLIP + connector，16 层 Llama 从没导出过；参考答案（原版 RoPE 和 mask 下的 K / V cache，存成 <code>prefix_io.pt</code>）也要在加载模型的那次运行里算。可以把引擎 C（去噪一步）的导出写进同一个脚本，一次 srun 都导出（还没定）。到了引擎 B，同样几类算子的变化是：LayerNorm 换成 RMSNorm、多了 RoPE、注意力变成 15 个 Q 头配 5 个 KV 头（GQA）。</li>
         </ol>
-        <p><strong>⑤ A、B、C 全部在 Orin 上跑通</strong>。先解决一个导出前的问题：checkpoint 里 VLM 文本部分和动作专家存成 <strong>bf16</strong>，transformers 按 config 的 <code>torch_dtype: bfloat16</code> 把这两部分建成 bf16（视觉部分是 FP32，所以 A 当初没事）。onnxruntime CPU 版没有 bf16 矩阵乘，TensorRT 8.5 不支持 bf16，所以导出前整体 <code>.float()</code>：bf16 的 8 位指数和 FP32 相同、尾数是 FP32 的前 7 位，转成 FP32 只是在尾数后面补 0，值完全不变。</p>
+        <p><strong>⑤ A、B、C 全部在 Orin 上跑通</strong>。先解决一个导出前的问题：checkpoint 里 VLM 文本部分和动作专家存成 <strong>bf16</strong>，transformers 按 config 的 <code>torch_dtype: bfloat16</code> 把这两部分建成 bf16（视觉部分是 FP32，所以 A 当初没事）。</p>
+        <p>onnxruntime CPU 版没有 bf16 矩阵乘，TensorRT 8.5 不支持 bf16，所以导出前整体 <code>.float()</code>：bf16 的 8 位指数和 FP32 相同、尾数是 FP32 的前 7 位，转成 FP32 只是在尾数后面补 0，值完全不变。</p>
         <p>怎么判断 FP16 误差"够小"：同一个模型用原生 bf16 算一遍、用 FP32 算一遍，两者的动作差距就是模型在自己训练精度下本来就有的误差，叫<strong>噪声底线</strong>。TensorRT FP16 的端到端误差只要不超过它，就说明 FP16 没有带来超出模型本身的精度损失。这比凭经验定一个 1e-2 之类的阈值更有依据，因为阈值随模型和输出范围变（动作范围约 ±1.7）。</p>
         <div class="tablewrap"><table>
           <thead><tr><th>引擎</th><th class="num">FP32</th><th class="num">FP16 方案</th><th>留 FP32 的部分</th><th class="num">FP16 单引擎误差（rel_l2）</th></tr></thead>
