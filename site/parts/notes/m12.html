@@ -1,0 +1,286 @@
+<article class="mod" id="m12" hidden>
+      <div class="eyebrow">模块 12</div>
+      <h2>核心算子：矩阵转置，把"跳着访问"挪进 shared memory</h2>
+      <p class="why"><strong>主线</strong>：转置没有计算，纯搬数据，是带宽问题。难点是读和写的方向不一致：读 A 连续，写 B 就要跳着写。优化分两段：先让读写全局内存都连续（①～③），再让同时在路上的读请求变多（④⑤）。衡量标准是有效带宽 GB/s，天花板是同样数据量的 copy。</p>
+
+      <div class="blk"><h3>结果总览</h3>
+        <p>Orin，锁频 1300 MHz，4096 × 4096，FP32；GB/s = 2·M·N·4 / 时间。所有版本和 CPU 结果逐元素按位相等。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>版本</th><th>改了什么</th><th class="num">GB/s</th><th class="num">占 copy</th></tr></thead>
+          <tbody>
+            <tr><td>① naive</td><td>一个线程读一个、写一个</td><td class="num">37.3</td><td class="num">37%</td></tr>
+            <tr><td>② shared 中转</td><td>整块读进 tile，再按 B 的行写出</td><td class="num">61.9</td><td class="num">61%</td></tr>
+            <tr><td>③ padding</td><td><code>tile[32][33]</code>，消掉 32 路 bank conflict</td><td class="num">91.1</td><td class="num">89%（copy 101.9）</td></tr>
+            <tr><td>④ 每线程 4 个数</td><td>block 32×8，每个线程循环 4 次</td><td class="num">184.3</td><td class="num">—</td></tr>
+            <tr><td>⑤ copy 加 <code>__restrict__</code></td><td>天花板本身写到最快</td><td class="num win">184.2</td><td class="num win">98%（copy 187.8）</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li>184 GB/s 约是 Orin 带宽上限 204.8 的 90%。</li>
+          <li>2048 × 8192 转置是 copy 的 97%；8192 × 8192 只有 80%（原因未查，可能和 TLB / DRAM 分页有关）。</li>
+          <li>③ 的 bank conflict 是按公式推的，没有用 ncu 实测确认。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>两条规则：全局内存要连续，shared memory 要分散</h3>
+        <div class="tablewrap"><table>
+          <thead><tr><th></th><th>全局内存</th><th>shared memory</th></tr></thead>
+          <tbody>
+            <tr><td>在哪</td><td>DRAM，经过 L1 / L2</td><td>SM 内部，不是缓存，直接按地址取</td></tr>
+            <tr><td>喜欢</td><td>一个 warp 的 32 个地址<strong>连续</strong></td><td>32 个地址落在<strong>不同的 bank</strong></td></tr>
+            <tr><td>做不好的后果</td><td>按 32 字节一箱搬，跳着读写时每箱只用 4 字节，浪费带宽</td><td>同一 bank 的不同地址排队，一条指令分几轮</td></tr>
+            <tr><td>规则</td><td>—</td><td>bank = 线性位置 % 32；同一地址是广播，不算冲突</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li><strong>判断方法都是"竖着看一条指令"</strong>：一个 warp 的 32 个地址，看连不连续（全局）、% 32 有没有重复（shared）。</li>
+          <li><strong>一个 warp 是哪 32 个线程</strong>：tid = x + y × blockDim.x，每 32 个一组。block 宽 32 时一个 warp 正好是一行。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>① naive：读连续，写跳着（37.3 GB/s）</h3>
+<pre><code>int x = blockIdx.x * blockDim.x + threadIdx.x;   // A 的列
+int y = blockIdx.y * blockDim.y + threadIdx.y;   // A 的行
+if (y &lt; M &amp;&amp; x &lt; N) B[x*M + y] = A[y*N + x];    // A 是 M×N，B 是 N×M，行优先</code></pre>
+        <ul class="plain">
+          <li>同一个 warp 里 x 连续：读 A 连续；写 <code>B[x*M + y]</code> 相邻线程相隔 M 个 float，每个数占一整箱，写的带宽只用上 1/8。</li>
+          <li><strong>只用寄存器解决不了</strong>：每个线程只能写自己读进来的数，读和写不可能同时连续。转置里一个线程要写出去的数是别的线程读进来的，必须经过大家都能访问的 shared memory 交接。</li>
+        </ul>
+        <p><strong>动画 · naive 和 shared 中转的数据流（缩小版）</strong>：对比读写各搬了几箱。</p>
+<p class="sr-only">动画：缩小版转置。8×8 的 A 里右上角那块 4×4 小块，用 naive 和 shared memory 两种方法搬到 B 的左下角，统计读写各搬了多少箱数据。</p>
+<div class="anim" id="anim-tf-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+<button id="anim-tf-m0">① naive</button><button id="anim-tf-m1">② 经过 shared</button>
+<span style="flex:1"></span>
+<button id="anim-tf-play">播放</button><button id="anim-tf-next">下一步</button><button id="anim-tf-reset">重来</button>
+</div>
+<div id="anim-tf-stage" style="font-size:14px;font-weight:500;margin-bottom:4px"></div>
+<svg id="anim-tf-sv" viewBox="0 0 680 270" width="100%" role="img" aria-label="转置数据流"></svg>
+<div id="anim-tf-res" style="font-size:14px;margin-top:6px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-tf-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv'),N=8,T=4,CS=21,BY=0,BX=4;
+const AX=14,AY=40,TX=270,TY=82,BXp=440,BYp=40;
+let mode=1,st=-1,tm=null;
+function steps(){const s=[];if(mode===0){for(let y=0;y<T;y++)s.push({k:'n',y})}else{for(let y=0;y<T;y++)s.push({k:'ld',y});s.push({k:'sync'});for(let j=0;j<T;j++)s.push({k:'st',j})}return s}
+function el(t,a,x){const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;sv.appendChild(e);return e}
+function grid(x0,y0,n,lab,fill){el('text',{x:x0,y:y0-8,fill:'var(--muted)','font-size':12},lab);for(let r=0;r<n;r++)for(let c=0;c<n;c++){const f=fill(r,c);el('rect',{x:x0+c*CS+1,y:y0+r*CS+1,width:CS-2,height:CS-2,rx:3,fill:f||'transparent',stroke:'var(--line)','stroke-width':0.6})}
+ if(n===N)for(let r=0;r<n;r++)for(let c=0;c<n;c+=T)el('rect',{x:x0+c*CS,y:y0+r*CS,width:T*CS,height:CS,fill:'none',stroke:'var(--muted)','stroke-width':0.4,'stroke-dasharray':'2 2'})}
+function draw(){sv.innerHTML='';const S=steps(),cur=st>=0?S[st]:null;
+ const readA=new Set(),wroteB=new Set(),inTile=new Set(),curA=new Set(),curB=new Set(),curT=new Set();let rBox=0,wBox=0;
+ for(let i=0;i<=st;i++){const s=S[i];
+  if(s.k==='n'){const rows=new Set();for(let x=0;x<T;x++){readA.add((BY+s.y)+','+(BX+x));wroteB.add((BX+x)+','+(BY+s.y));rows.add(BX+x)}rBox+=1;wBox+=rows.size;
+   if(i===st){for(let x=0;x<T;x++){curA.add((BY+s.y)+','+(BX+x));curB.add((BX+x)+','+(BY+s.y))}}}
+  if(s.k==='ld'){for(let x=0;x<T;x++){readA.add((BY+s.y)+','+(BX+x));inTile.add(s.y+','+x)}rBox+=1;if(i===st)for(let x=0;x<T;x++){curA.add((BY+s.y)+','+(BX+x));curT.add(s.y+','+x)}}
+  if(s.k==='st'){for(let x=0;x<T;x++)wroteB.add((BX+s.j)+','+(BY+x));wBox+=1;if(i===st)for(let x=0;x<T;x++){curB.add((BX+s.j)+','+(BY+x));curT.add(x+','+s.j)}}}
+ if(mode===1&&st>=0)for(let y=0;y<T;y++)for(let x=0;x<T;x++)if(S.slice(0,st+1).some(s=>s.k==='ld'&&s.y===y))inTile.add(y+','+x);
+ const blockA=(r,c)=>r>=BY&&r<BY+T&&c>=BX&&c<BX+T,blockB=(r,c)=>r>=BX&&r<BX+T&&c>=BY&&c<BY+T;
+ grid(AX,AY,N,'A（8×8，全局内存）：右上角这块交给一个 block',(r,c)=>curA.has(r+','+c)?'var(--accent)':(readA.has(r+','+c)?'var(--accent-soft)':(blockA(r,c)?'var(--code-bg)':null)));
+ el('rect',{x:AX+BX*CS,y:AY+BY*CS,width:T*CS,height:T*CS,fill:'none',stroke:'var(--accent)','stroke-width':2,rx:3});
+ grid(BXp,BYp,N,'B = Aᵀ（全局内存）：这块落到左下角',(r,c)=>curB.has(r+','+c)?'var(--good)':(wroteB.has(r+','+c)?'var(--good-soft)':(blockB(r,c)?'var(--code-bg)':null)));
+ el('rect',{x:BXp+BY*CS,y:BYp+BX*CS,width:T*CS,height:T*CS,fill:'none',stroke:'var(--good)','stroke-width':2,rx:3});
+ if(mode===1){grid(TX,TY,T,'tile（shared）',(r,c)=>curT.has(r+','+c)?'var(--amber)':(inTile.has(r+','+c)?'var(--amber-soft)':null));}
+ else el('text',{x:TX-10,y:TY+40,fill:'var(--muted)','font-size':12},'不经过 shared，直接写');
+ for(let r=0;r<N;r+=1)el('text',{x:AX-4,y:AY+r*CS+15,'text-anchor':'end','font-size':9,fill:'var(--muted)'},r);
+ el('text',{x:14,y:262,fill:'var(--muted)','font-size':11},'虚线框 = 一"箱"（缩小版里 4 个 float 一箱，真实是 32 字节 = 8 个 float）。一行 4 个线程看成一个 warp。');
+ const lab=!cur?(mode===0?'naive：每个线程读 A 的一个数，直接写到 B 的对应位置':'shared 版：先整块读进 tile，同步，再按 B 的行写出'):
+  cur.k==='n'?'第 '+cur.y+' 行的 4 个线程：读 A 的一行（连续，1 箱）→ 写 B 的一列（4 个不同的行，4 箱）':
+  cur.k==='ld'?'① 读：第 '+cur.y+' 行的 4 个线程读 A 的一行（连续，1 箱）→ 存进 tile 第 '+cur.y+' 行':
+  cur.k==='sync'?'__syncthreads()：等整块都进了 tile，下一步要读别的线程存的数':
+  '② 写：第 '+cur.j+' 行的 4 个线程从 tile 竖着取第 '+cur.j+' 列 → 写 B 的一行（连续，1 箱）';
+ $('stage').textContent=lab;
+ $('res').innerHTML='已搬：读 A <strong>'+rBox+'</strong> 箱，写 B <strong style="color:'+(mode===0&&wBox>4?'var(--amber)':'var(--good)')+'">'+wBox+'</strong> 箱。'+(mode===0?'<br><span style="color:var(--muted)">naive 写 B 时一个 warp 的 4 个地址在 4 个不同的行，每个数各占一箱，写的带宽只用上 1/4（真实是 1/8）。</span>':'<br><span style="color:var(--muted)">读和写都是整行连续。代价是第 ② 步竖着取 tile 的一列，下面的动画看这一步的 bank conflict。</span>');
+ $('m0').style.borderColor=mode===0?'var(--accent)':'';$('m1').style.borderColor=mode===1?'var(--accent)':''}
+function stop(){clearInterval(tm);tm=null}
+$('m0').onclick=()=>{stop();mode=0;st=-1;draw()};$('m1').onclick=()=>{stop();mode=1;st=-1;draw()};
+$('next').onclick=()=>{stop();const n=steps().length;st=st>=n-1?-1:st+1;draw()};
+$('reset').onclick=()=>{stop();st=-1;draw()};
+$('play').onclick=()=>{stop();st=-1;draw();const n=steps().length;tm=setInterval(()=>{st++;draw();if(st>=n-1)stop()},900)};
+draw();
+})();
+</script>
+      </div>
+
+      <div class="blk"><h3>② shared memory 中转：读写全局都连续（61.9 GB/s）</h3>
+<pre><code>__shared__ float tile[32][32];
+int tx = threadIdx.x, ty = threadIdx.y;          // 块内坐标，只用来访问 tile
+int bx = blockIdx.x * 32, by = blockIdx.y * 32;  // 小块在 A 里的起点
+if (by+ty &lt; M &amp;&amp; bx+tx &lt; N) tile[ty][tx] = A[(by+ty)*N + bx+tx];   // 按 A 的行读，连续
+__syncthreads();                                                      // 不能放在 if 里
+if (bx+ty &lt; N &amp;&amp; by+tx &lt; M) B[(bx+ty)*M + by+tx] = tile[tx][ty];   // bx、by 对调；按 B 的行写，连续</code></pre>
+        <ul class="plain">
+          <li><strong>tile 只用块内坐标</strong>，全局坐标会越界。</li>
+          <li><strong>写 B 时块的起点对调</strong>：A 的第 (by, bx) 块落在 B 的第 (bx, by) 块。</li>
+          <li><strong>验证</strong>：B 的 (bx+ty, by+tx) 应等于 A 的 (by+tx, bx+ty)，在 tile 里是第 tx 行第 ty 列，即 <code>tile[tx][ty]</code>。</li>
+          <li><strong>边界</strong>：读 A 查行 &lt; M、列 &lt; N；写 B 查行 &lt; N、列 &lt; M。B 每行 M 个数，方阵测不出乘错，测试要用非方阵、非 32 倍数的形状。</li>
+          <li><strong>代价</strong>：第二步一个 warp 读 <code>tile[0..31][ty]</code>，同一列都在同一个 bank → 32 路冲突。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>③ padding：tile[32][33]（91.1 GB/s，copy 的 89%）</h3>
+        <ul class="plain">
+          <li>只改一行：<code>__shared__ float tile[32][33];</code>。bank = (r × 33 + c) % 32 = (r + c) % 32，竖着取一列时 32 行正好落在 32 个 bank。</li>
+          <li>只改 tile 的宽度：线程数、块大小、A 和 B 的下标都不变，块的起点仍是 <code>blockIdx.y * 32</code>。</li>
+          <li><strong>和 GEMM 的 +4 对比</strong>："行宽 % 32"决定往下一行 bank 挪几格。转置一个 warp 跨 32 行，每行挪 1 格正好铺满；GEMM 写 As 跨 8 行、每行 4 个数，要挪 4 格，而且 float4 要求每行起点是 4 的倍数。</li>
+        </ul>
+        <p><strong>动画 · 竖着读 tile 一列时的 bank 分布</strong>：切换 32 / 33，拖动列号。</p>
+<p class="sr-only">动画：一个 warp 竖着读 tile 的第 c 列时，32 个地址落在哪些 bank；切换 tile[32][32] 和 tile[32][33] 对比。</p>
+<div class="anim" id="anim-tb-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+<button id="anim-tb-w0">tile[32][32]</button><button id="anim-tb-w1">tile[32][33]</button>
+<label style="font-size:14px;color:var(--muted);margin-left:8px">读第 c 列</label><input type="range" min="0" max="31" value="5" id="anim-tb-c" style="width:140px"><span id="anim-tb-co" style="font-family:var(--f-mono)">5</span>
+</div>
+<div id="anim-tb-f" style="font-family:var(--f-mono);font-size:13px;color:var(--muted);margin-bottom:4px"></div>
+<svg id="anim-tb-sv" viewBox="0 0 680 205" width="100%" role="img" aria-label="tile 一列的 bank 分布"></svg>
+<div id="anim-tb-res" style="font-size:14px;margin-top:4px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-tb-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');let W=32,c=5;
+function el(t,a,x){const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;sv.appendChild(e);return e}
+function draw(){sv.innerHTML='';const X0=40,CW=(680-X0-4)/32;
+ $('f').textContent='线程 tx = r（r = 0..31）读 tile['+'r]['+c+']，位置 = r × '+W+' + '+c+'，bank = 位置 % 32';
+ el('text',{x:4,y:16,fill:'var(--muted)','font-size':11},'线程');el('text',{x:4,y:44,fill:'var(--muted)','font-size':11},'bank');
+ const banks={};
+ for(let r=0;r<32;r++){const b=(r*W+c)%32;(banks[b]=banks[b]||[]).push(r);const x=X0+r*CW;
+  el('text',{x:x+CW/2,y:16,'text-anchor':'middle','font-size':9,fill:'var(--muted)'},r);
+  el('rect',{x:x+1,y:26,width:CW-2,height:24,rx:3,fill:'var(--accent-soft)',stroke:'var(--accent)','stroke-width':0.8});
+  el('text',{x:x+CW/2,y:42,'text-anchor':'middle','font-size':10,fill:'var(--ink)'},b)}
+ const BYy=96;el('text',{x:4,y:BYy-10,fill:'var(--muted)','font-size':11},'32 个 bank：每个 bank 前排了几个线程（不同地址）');
+ for(let b=0;b<32;b++){const n=(banks[b]||[]).length,x=X0+b*CW;
+  el('rect',{x:x+1,y:BYy,width:CW-2,height:18,rx:2,fill:n===0?'transparent':(n>1?'var(--amber-soft)':'var(--good-soft)'),stroke:n>1?'var(--amber)':'var(--line)','stroke-width':n>1?1.5:0.5});
+  el('text',{x:x+CW/2,y:BYy+13,'text-anchor':'middle','font-size':9,fill:'var(--muted)'},b);
+  if(n){const h=Math.min(60,n*2);el('rect',{x:x+3,y:BYy+24,width:CW-6,height:h,rx:2,fill:n>1?'var(--amber)':'var(--good)',opacity:0.8});
+   el('text',{x:x+CW/2,y:BYy+24+h+12,'text-anchor':'middle','font-size':10,'font-weight':600,fill:n>1?'var(--amber)':'var(--good)'},'×'+n)}}
+ const R=Math.max(...Object.values(banks).map(v=>v.length));
+ $('res').innerHTML=R>1?'<span style="color:var(--amber)">32 个线程全挤在 bank '+c+'，要排 '+R+' 轮。</span> 每行 32 个 float，同一列的数在每一行的位置 % 32 都一样。':'<span style="color:var(--good)">32 个线程落在 32 个不同的 bank，1 轮读完。</span> 每行多 1 格，往下一行 bank 就往后挪 1 个：(r × 33 + c) % 32 = (r + c) % 32。';
+ $('w0').style.borderColor=W===32?'var(--accent)':'';$('w1').style.borderColor=W===33?'var(--accent)':''}
+$('w0').onclick=()=>{W=32;draw()};$('w1').onclick=()=>{W=33;draw()};
+$('c').oninput=()=>{c=+$('c').value;$('co').textContent=c;draw()};
+draw();
+})();
+</script>
+      </div>
+
+      <div class="blk" id="m12-s4"><h3>④ 每个线程搬 4 个数（padding 版 90.7 → 184.3 GB/s）</h3>
+        <ul class="plain">
+          <li><strong>瓶颈</strong>：③ 已是 copy 的 89%，但 copy 自己只有约 100 GB/s，是 Orin 上限的一半。每个线程只发 1 个读请求就得等它回来，同时在路上的请求太少。</li>
+          <li><strong>改法</strong>：block 32×32 → 32×8，一个 block 仍负责 32×32 的小块，每个线程循环 4 次，第 i 次处理第 <code>ty + i*8</code> 行。</li>
+        </ul>
+<pre><code>// block(32, 8)；grid 不变：((N+31)/32, (M+31)/32)
+#pragma unroll
+for (int i = 0; i &lt; 4; ++i)
+    if (by+ty + i*8 &lt; M &amp;&amp; bx+tx &lt; N) tile[ty + i*8][tx] = A[(by+ty + i*8)*N + bx+tx];
+__syncthreads();
+#pragma unroll
+for (int i = 0; i &lt; 4; ++i)
+    if (bx+ty + i*8 &lt; N &amp;&amp; by+tx &lt; M) B[(bx+ty + i*8)*M + by+tx] = tile[tx][ty + i*8];</code></pre>
+        <ul class="plain">
+          <li>结果：copy 101.7 → 170.5，padding 版 90.7 → 184.3 GB/s；naive 只到 38.2（它的瓶颈是跳着写，不是请求太少）。</li>
+        </ul>
+        <div class="note"><strong>易错</strong>：① 块的起点要写 <code>blockIdx.y * 32</code>，写成 <code>blockIdx.y * blockDim.y</code> 后 blockDim.y 变成 8，相邻 block 重叠、大部分行没人管；② 边界要判断实际访问的那一行（<code>ar + i*8</code>），只查 <code>ar</code> 会越界，而且测试不一定报错；③ 改分工要同时改 launch 的 block 形状。</div>
+      </div>
+
+      <div class="blk" id="m12-s5"><h3>⑤ <code>__restrict__</code>：让 copy 也能一次发多个读（170.5 → 187.8 GB/s）</h3>
+        <ul class="plain">
+          <li><strong>现象</strong>：④ 之后转置 184.3 比 copy 170.5 还快，工作量不比 copy 少，说明 copy 没写到最快。</li>
+          <li><strong>SASS</strong>：copy 是 <code>LDG STG LDG STG…</code>，读一个写一个；转置是 4 个 <code>LDG</code> 连着发出。</li>
+          <li><strong>原因：别名（aliasing）</strong>：编译器不知道 A、B 会不会指向重叠的内存（比如 <code>copy(p, p + N)</code>），写 B 第 0 行可能改到 A 第 1 行，所以不敢把下一个读提前到上一个写之前。转置是读进 shared，写 shared 不可能改到全局的 A，所以敢提前。</li>
+          <li><strong>改法</strong>：<code>const float* __restrict__ A, float* __restrict__ B</code>，承诺两者不重叠。SASS 变成 <code>LDG.E.CONSTANT</code> × 3 连着发出；copy 4096² 170.5 → 187.8，转置是 copy 的 98%。</li>
+          <li><strong>注意</strong>：这个承诺编译器不检查，真的重叠时结果错而且不报错。</li>
+        </ul>
+        <p><strong>动画 · 一个线程的读写时间线（示意）</strong>：每线程 1 个数 / 4 个数读写交替 / 4 个数 + <code>__restrict__</code>。</p>
+<p class="sr-only">示意动画：一个线程的读写指令时间线。每线程 1 个数时每次只有 1 个读请求在路上；每线程 4 个数但读写交替时编译器不敢提前读；加 __restrict__ 或经过 shared 后几个读请求一起发出。</p>
+<div class="anim" id="anim-ti-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+<button id="anim-ti-m0">每线程 1 个数</button><button id="anim-ti-m1">4 个数，读写交替</button><button id="anim-ti-m2">4 个数 + __restrict__</button>
+<span style="flex:1"></span><button id="anim-ti-play">播放</button>
+</div>
+<svg id="anim-ti-sv" viewBox="0 0 680 170" width="100%" role="img" aria-label="读请求时间线"></svg>
+<div id="anim-ti-res" style="font-size:14px;margin-top:4px;line-height:1.7"></div>
+<div class="small muted">示意图：横轴是时间，长度不按实际周期比例；"等"是读请求从 DRAM 回来之前的空等。</div>
+</div>
+<script>
+(function(){
+const PFX='anim-ti-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');const LAT=8,X0=110,U=7;let mode=2,tnow=99,tm=null;
+function el(t,a,x){const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;sv.appendChild(e);return e}
+function plan(){const ev=[];if(mode===0){ev.push({s:0,d:1,row:0,c:'var(--accent)',t:'LDG'},{s:1,d:LAT,row:1,c:'var(--amber-soft)',t:'等数据'},{s:1+LAT,d:1,row:0,c:'var(--good)',t:'STG'});return {ev,end:2+LAT,label:'一个线程只搬 1 个数：读一个就得等它回来。要靠很多线程同时在等，带宽才能用满；线程不够时用不满（copy 只到约 100 GB/s）'}}
+ if(mode===1){let t=0;for(let i=0;i<4;i++){ev.push({s:t,d:1,row:0,c:'var(--accent)',t:'LDG'},{s:t+1,d:LAT,row:1,c:'var(--amber-soft)',t:'等'},{s:t+1+LAT,d:1,row:0,c:'var(--good)',t:'STG'});t+=2+LAT}return {ev,end:t,label:'copy：LDG STG LDG STG……编译器怕 A、B 重叠（别名），不敢把下一个读提前到上一个写之前，4 次读还是一个一个等'}}
+ let t=0;for(let i=0;i<4;i++)ev.push({s:i,d:1,row:0,c:'var(--accent)',t:'LDG'});ev.push({s:4,d:LAT-3,row:1,c:'var(--amber-soft)',t:'4 个一起等'});for(let i=0;i<4;i++)ev.push({s:4+LAT-3+i,d:1,row:0,c:'var(--good)',t:'STG'});return {ev,end:4+LAT-3+4,label:'加 __restrict__（承诺 A、B 不重叠），或像转置那样读进 shared：4 个读一口气发出，一起等，等待被摊薄'}}
+function draw(){sv.innerHTML='';const p=plan();el('text',{x:4,y:44,fill:'var(--ink)','font-size':12},'指令');el('text',{x:4,y:72,fill:'var(--muted)','font-size':12},'在等');
+ p.ev.forEach(e=>{if(e.s>=tnow)return;const w=Math.min(e.d,tnow-e.s);el('rect',{x:X0+e.s*U,y:30+e.row*28,width:Math.max(w*U-1,0),height:20,rx:3,fill:e.c,stroke:'var(--line)','stroke-width':0.5});if(w===e.d&&e.d*U>24)el('text',{x:X0+(e.s+e.d/2)*U,y:44+e.row*28,'text-anchor':'middle','font-size':10,fill:'var(--ink)'},e.t)});
+ if(tnow>=p.end)el('text',{x:X0+p.end*U+6,y:44,'font-size':12,fill:'var(--muted)'},'用时 '+p.end+' 格');
+ const ref=mode===0?'（只搬了 1 个数）':'（搬了 4 个数）';el('text',{x:X0,y:120,'font-size':11,fill:'var(--muted)'},ref);
+ $('res').textContent=p.label;
+ ['m0','m1','m2'].forEach((id,k)=>{$(id).style.borderColor=k===mode?'var(--accent)':''})}
+function stop(){clearInterval(tm);tm=null}
+['m0','m1','m2'].forEach((id,k)=>$(id).onclick=()=>{stop();mode=k;tnow=99;draw()});
+$('play').onclick=()=>{stop();tnow=0;draw();tm=setInterval(()=>{tnow++;draw();if(tnow>=plan().end)stop()},120)};
+draw();
+})();
+</script>
+        <div class="note good"><strong>和 RMSNorm、GEMM 是同一个道理</strong>：RMSNorm 用编译期常量让循环展开、GEMM 用 double buffering、转置每线程搬 4 个、copy 加 <code>__restrict__</code>，都是为了<strong>让更多读请求同时在路上</strong>，带宽才能用满。</div>
+<pre><code>./build-orin/transpose_bench 4096 4096    # 正确性 + GB/s，对比 copy
+# 确认 bank conflict（需要 sudo）
+sudo .../ncu -k regex:transpose_shared --metrics \
+  l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum ./build-orin/transpose_bench 4096 4096</code></pre>
+      </div>
+
+      <div class="blk iv" id="m12-iv"><h3>面试要求</h3>
+        <p>转置是手写 CUDA 题里最常见的"shared memory + bank conflict"题，也是 padding 的标准例子。</p>
+        <h4>必须会</h4>
+        <ul class="plain">
+          <li>当场手写三版：naive、shared memory 中转、<code>tile[32][33]</code>；下标（行优先、乘的是每行元素数）、块内坐标和全局坐标分开、bx / by 对调、两处不同的边界判断、<code>__syncthreads()</code> 不能放在 if 里。</li>
+          <li>说清为什么 naive 慢（写全局跳着，每个数搬一整个 32 字节扇区）、为什么 shared 版快、为什么还有 32 路冲突、为什么 +1 能消掉（bank = (r + c) % 32）。</li>
+          <li>全局内存和 shared memory 各自"喜欢"什么样的访问；合并访存和 bank conflict 分别发生在哪。</li>
+          <li>一个 warp 是哪 32 个线程：<code>tid = x + y × blockDim.x</code>；32×32、16×16 的 block 各是什么样。</li>
+        </ul>
+        <h4>应该会</h4>
+        <ul class="plain">
+          <li>为什么不能只用寄存器（线程私有）；<code>__shfl_sync</code> 只能在一个 warp 内交换。</li>
+          <li>shared memory 和 L1 在同一块存储上但不是缓存；同地址是广播、同 bank 不同地址才冲突。</li>
+          <li>用数字讲：4096² 下 naive 37.3 → shared 61.9 → padding 91.1 GB/s，copy 101.9；每线程 4 个数后 padding 184.3，copy 加 <code>__restrict__</code> 后 187.8，转置是 copy 的 98%；怎么测的（逐元素按位相等、锁频、GB/s 的定义、copy 当天花板）。</li>
+          <li>每个线程搬多个数为什么快（同时在路上的读请求多）；32×8 block 时 4 次循环怎么不重不漏地盖住 32 行、起点为什么是 × 32 而不是 × blockDim.y、边界要判断实际访问的那一行。</li>
+          <li><code>__restrict__</code>：别名是什么、为什么编译器不敢把读提前、加了以后 SASS 怎么变、为什么写 shared 的版本不需要它、它是不检查的承诺。</li>
+          <li>padding 的 +1 和 GEMM 的 +4 为什么不同。</li>
+        </ul>
+        <h4>加分</h4>
+        <ul class="plain">
+          <li>不用 padding 的修法：斜着存（diagonal / swizzle），知道思路。</li>
+          <li>全局读写用 float4（还没做）；8192² 上转置只有 copy 的 80% 的原因（TLB / DRAM 分页，未验证）。</li>
+          <li>原地转置（in-place）为什么难并行；非方阵的处理。</li>
+        </ul>
+        <p class="small muted">三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+      </div>
+
+      <div class="selftest"><h3>自测</h3><ul class="plain">
+        <li>A 是 M × N，<code>B[j][i]</code> 在一维数组的哪？为什么乘的是 M？</li>
+        <li>naive 版里读和写哪个连续、哪个跳着？跳着写时每个 float 实际搬了多少字节？</li>
+        <li>shared memory 为什么没有 sector 问题？"因为它离得近"这个说法哪里不准确？它和 L1 是什么关系？</li>
+        <li>bank 编号怎么算？<code>tile[32][32]</code> 和 <code>tile[32][33]</code> 里 <code>tile[r][c]</code> 各在哪个 bank？</li>
+        <li>一个 warp 的 32 个请求一定用满 32 个 bank 吗？一条读指令要几个周期由什么决定？什么情况算广播？</li>
+        <li>32×32 的 block 里 warp 3 包含哪些线程？16×16 的 block 里 warp 0 呢？为什么转置要选 32×32？</li>
+        <li>为什么转置不能只用寄存器？4×4 小块里线程 (tx=1, ty=0) 读进来的是哪个数、要写出去的是哪个数？</li>
+        <li><code>tile[y][x] = A[…]; B[x*M+y] = tile[y][x];</code> 为什么没有 bank conflict？它快吗？</li>
+        <li>shared 版第 2 步为什么取 <code>tile[tx][ty]</code>？B 的行、列下标怎么写，bx、by 为什么要对调？怎么自己验证对不对？</li>
+        <li>读 A 和写 B 的边界条件各是什么？为什么方阵测不出 "乘 N 还是乘 M" 的错？</li>
+        <li>padding 版把 <code>by</code> 写成 <code>blockIdx.y * 33</code> 会怎样？padding 到底改了什么？</li>
+        <li>转置用 +1、GEMM 的 As 用 +4，各自是怎么算出来的？</li>
+        <li>4096² 下三版各多少 GB/s？copy 是多少、占 Orin 带宽上限的多少？哪些结论还没用 ncu 验证？</li>
+        <li>block 32×8、每个线程搬 4 行时，<code>ty = threadIdx.y * 8</code> 错在哪？跨步和连续两种分法各怎么写？</li>
+        <li>copy 的起始行写成 <code>blockIdx.y * blockDim.y + threadIdx.y</code>，blockDim.y 改成 8 后会怎样？为什么正好错了约 3/4？</li>
+        <li>边界判断检查 <code>ar</code>、访问 <code>ar + i*8</code>，为什么测试可能不报错？怎么才能抓到？</li>
+        <li>转置比 copy 还快说明什么？SASS 里两者的读写顺序有什么不同？什么是别名，<code>__restrict__</code> 让编译器能做什么、不检查什么？</li>
+      </ul>
+      <h3>面试高频问题</h3><ul class="plain">
+        <li>手写矩阵转置的 CUDA kernel，要求读写都合并访存。</li>
+        <li>你的版本有 bank conflict 吗？几路？怎么消除？为什么是 33？</li>
+        <li>合并访存和 bank conflict 有什么区别？</li>
+        <li>怎么判断转置做得够不够好？（和 copy 比、和 DRAM 带宽比；copy 本身也要先写到最快）</li>
+        <li><code>__restrict__</code> 是什么？什么时候能加？</li>
+      </ul></div>
+    </article>

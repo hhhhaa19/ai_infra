@@ -1,0 +1,1312 @@
+<article class="mod" id="m11" hidden>
+      <div class="eyebrow">模块 11</div>
+      <h2>核心算子：卷积与 GEMM，从手算到分块</h2>
+      <p class="why"><strong>主线</strong>：GEMM 从 naive 一步步优化到 cuBLAS 的 85%。每一版只看三件事：<strong>改了什么、为什么快（或慢）、测出多少</strong>，配一个数据流动画。核心思路只有一句：<strong>让数据搬一次、用多次，并且别让硬件干等。</strong></p>
+
+      <div class="blk" id="m11-s13"><h3>结果总览</h3>
+        <p>Orin，锁频 1300 MHz，FP32，单位 GFLOPS；全部通过正确性检查。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>版本</th><th>改了什么</th><th class="num">4096³</th><th class="num">占 cuBLAS</th><th>相比上一版</th></tr></thead>
+          <tbody>
+            <tr><td>① naive</td><td>一个线程算一个 C，直接读全局</td><td class="num">408</td><td class="num">12%</td><td>—</td></tr>
+            <tr><td>② shared 分块</td><td>block 合作把 A、B 小块搬进 shared</td><td class="num">614</td><td class="num">18%</td><td>1.5×</td></tr>
+            <tr><td>③ 寄存器分块</td><td>一个线程算 8×8，外积</td><td class="num">1744</td><td class="num">51%</td><td>2.8×</td></tr>
+            <tr><td>④ 交错分工</td><td>线程隔 16 列取一列，消除 bank conflict</td><td class="num">2091</td><td class="num">61%</td><td>+20%</td></tr>
+            <tr><td>⑤ float4 + As 转置</td><td>一条指令读 4 个 float</td><td class="num">1790</td><td class="num">52%</td><td><strong>−15%</strong></td></tr>
+            <tr><td>⑥ + padding + 展开 kk</td><td>As 每行 +4、kk 循环完全展开</td><td class="num">2366</td><td class="num">70%</td><td>+32%</td></tr>
+            <tr><td>⑦ + double buffering</td><td>As / Bs 各两份，算这一块时下一块已经在读</td><td class="num win">2895</td><td class="num win">85%</td><td>+22%</td></tr>
+            <tr><td>cuBLAS</td><td><code>cublasSgemm</code></td><td class="num">3415</td><td class="num">100%</td><td>—</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li><strong>上限</strong>：Orin 峰值 16 SM × 128 核 × 2 × 1.3 GHz ≈ 5325 GFLOPS；带宽 204.8 GB/s，拐点 ≈ 26 FLOP/字节。大 GEMM 远高于 26 → 理论上是算力瓶颈；2366 约是峰值的 44%，2895 约 54%，cuBLAS 自己也只到 64%。</li>
+          <li>⑦ 和 ⑥ 是同一次运行里对比的（那次 ⑥ 测到 2382，和表里的 2366 是两次运行的差别）；1024³ / 2048³ 下 ⑦ 是 2756 / 2840，占 cuBLAS 87% / 83%。</li>
+          <li><strong>测法</strong>：C 先填 NaN 查漏写；小形状和 CPU double 比、大形状和 cuBLAS 比，rel_l2 &lt; 1e-5；<code>jetson_clocks</code> 锁频，预热 5 次、CUDA event 计 20 次取中位数；GFLOPS = 2·M·N·K / 时间。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>卷积：一个线程一个输出 → shared 分块</h3>
+        <p>和 GEMM 是同一条路，先在卷积上看一遍。一个输出 = 窗口和卷积核对应相乘再相加（C × 3 × 3 次乘加）：</p>
+<pre><code>y[o, i, j] = b[o] + Σ_c Σ_u Σ_v  w[o, c, u, v] × x[c, i·s + u − p, j·s + v − p]
+权重形状 = 输出通道 × 输入通道 × k × k，例：layer1 是 64 × 64 × 3 × 3
+
+ACT layer1：输入 64×120×160，64 个 64×3×3 核，p=1, s=1
+每个输出 64×3×3 = 576 次乘加，总共 64×120×160×576 ≈ 7.08 亿次乘加</code></pre>
+        <p><strong>朴素版</strong>：一个线程算一个输出。慢在一个输入像素被周围 9 个输出各读一次；同一输出通道 256 个线程用同一组 576 个权重，却各读一遍。</p>
+<pre><code>__global__ void conv2d_naive(const float* x, const float* w, float* y,
+                             int C, int H, int W, int O) {
+    int o = blockIdx.z;                                  // 输出通道
+    int i = blockIdx.y * blockDim.y + threadIdx.y;       // 输出行
+    int j = blockIdx.x * blockDim.x + threadIdx.x;       // 输出列
+    if (i &gt;= H || j &gt;= W) return;
+    float sum = 0.0f;
+    for (int c = 0; c &lt; C; ++c)
+        for (int u = 0; u &lt; 3; ++u)
+            for (int v = 0; v &lt; 3; ++v) {
+                int hi = i + u - 1, wi = j + v - 1;      // padding = 1
+                if (hi &gt;= 0 &amp;&amp; hi &lt; H &amp;&amp; wi &gt;= 0 &amp;&amp; wi &lt; W)
+                    sum += w[((o * C + c) * 3 + u) * 3 + v] * x[(c * H + hi) * W + wi];
+            }
+    y[(o * H + i) * W + j] = sum;
+}
+dim3 block(16, 16);                               // 16 × 16 = 256 个线程
+dim3 grid((W + 15) / 16, (H + 15) / 16, O);       // 盖住整张输出图，z 放输出通道
+// layer1：grid = 10 × 8 × 64 = 5120 个 block（120/16 = 7.5 向上取整为 8）</code></pre>
+        <p><strong>shared 分块</strong>：一个 block 负责 16×16 输出，先合作把 18×18 输入块（多出的一圈叫 halo）和 9 个权重搬进 shared，同步，再从 shared 算。每个输入从读 9 次降到约 1 次。</p>
+<pre><code>#define TILE 16
+__global__ void conv2d_tiled(const float* x, const float* w, float* y, int C, int H, int W, int O) {
+    __shared__ float xs[TILE + 2][TILE + 2];   // 18 × 18 输入块
+    __shared__ float ws[9];                     // 一个通道的 3 × 3 权重
+    int o = blockIdx.z, tx = threadIdx.x, ty = threadIdx.y;
+    int i = blockIdx.y * TILE + ty, j = blockIdx.x * TILE + tx;    // 输出位置
+    int i0 = blockIdx.y * TILE - 1, j0 = blockIdx.x * TILE - 1;    // 输入块左上角（含 halo）
+    float sum = 0.0f;
+    for (int c = 0; c &lt; C; ++c) {
+        for (int r = ty; r &lt; TILE + 2; r += TILE)            // ① 256 个线程一起搬 324 个数
+            for (int s = tx; s &lt; TILE + 2; s += TILE) {
+                int hi = i0 + r, wi = j0 + s;
+                xs[r][s] = (hi &gt;= 0 &amp;&amp; hi &lt; H &amp;&amp; wi &gt;= 0 &amp;&amp; wi &lt; W) ? x[(c * H + hi) * W + wi] : 0.0f;
+            }
+        int t = ty * TILE + tx;
+        if (t &lt; 9) ws[t] = w[(o * C + c) * 9 + t];          // ② 前 9 个线程搬权重
+        __syncthreads();                                     // 没搬完不许算
+        if (i &lt; H &amp;&amp; j &lt; W)
+            for (int u = 0; u &lt; 3; ++u)
+                for (int v = 0; v &lt; 3; ++v)
+                    sum += ws[u * 3 + v] * xs[ty + u][tx + v];   // ③ 从 shared memory 算
+        __syncthreads();                                     // 没算完不许覆盖 xs
+    }
+    if (i &lt; H &amp;&amp; j &lt; W) y[(o * H + i) * W + j] = sum;
+}</code></pre>
+        <ul class="plain">
+          <li>halo = 核大小 / 2，输入块边长 = 输出块边长 + 核大小 − 1（3×3 → 18×18，5×5 → 20×20）。</li>
+          <li>库里的做法：im2col + GEMM（展开成矩阵，A 是原输入的 9 倍大）、implicit GEMM（不展开，搬数据时现场算下标，cuDNN / TensorRT 主流）、Winograd（3×3 乘法少 2.25 倍）。所以卷积最终也落到 GEMM。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>① naive：一个线程算一个 C（408）</h3>
+<pre><code>__global__ void gemm_naive(const float* A, const float* B, float* C, int M, int N, int K) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;   // C 的行
+    int j = blockIdx.x * blockDim.x + threadIdx.x;   // C 的列
+    if (i &gt;= M || j &gt;= N) return;
+    float sum = 0.0f;
+    for (int k = 0; k &lt; K; ++k) sum += A[i * K + k] * B[k * N + j];
+    C[i * N + j] = sum;
+}
+dim3 block(16, 16);
+dim3 grid((N + 15) / 16, (M + 15) / 16);   // x 盖 N 列，y 盖 M 行，向上取整
+gemm_naive&lt;&lt;&lt;grid, block, 0, s&gt;&gt;&gt;(A, B, C, M, N, K);
+return true;                               // 测试台看到 false 会当作"没实现"跳过</code></pre>
+        <ul class="plain">
+          <li><strong>数据流</strong>：每个线程沿 k 读 A 的一行、B 的一列，全部直接读全局内存。</li>
+          <li><strong>为什么慢</strong>：A 的每一行被读 N 次、B 的每一列被读 M 次。每次循环读 8 字节做 2 次运算，计算强度 0.25 FLOP/字节，远低于拐点 26。</li>
+          <li>访问方式本身不差：一个 warp 读 A 是同一地址（广播），读 B 是连续地址（合并）。问题只在同样的数被不同 warp、不同 block 反复读。</li>
+        </ul>
+        <p><strong>动画 · naive 的数据流</strong>：点"播放"看一个线程沿 k 读 A、B；点 C 的格子换线程。</p>
+<p class="sr-only">动画：朴素 GEMM 中一个线程沿 k 依次从全局内存读 A 的一行和 B 的一列，以及同一行 8 个线程同时读的地址。</p>
+<div class="anim" id="anim-nv-root">
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+<button id="anim-nv-play">播放 k = 0→7</button>
+<button id="anim-nv-step">下一步</button>
+<button id="anim-nv-reset">重来</button>
+<span style="font-size:13px;color:var(--muted)">点 C 里的格子换一个线程</span>
+</div>
+<svg id="anim-nv-sv" viewBox="0 0 440 420" width="100%" style="max-width:560px" role="img" aria-label="朴素 GEMM 数据流"></svg>
+<div id="anim-nv-res" style="font-size:14px;margin-top:6px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-nv-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv'),N=8,CS=22;
+const AX=20,AY=214,BX=226,BY=22,CX=226,CY=214;
+let ti=2,tj=5,k=-1,tm=null;
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function cell(x,y,fill,stroke,txt,tc){el('rect',{x:x+1,y:y+1,width:CS-2,height:CS-2,rx:3,fill:fill,stroke:stroke||'var(--line)','stroke-width':stroke?2:0.5});if(txt!==undefined)el('text',{x:x+CS/2,y:y+15,'text-anchor':'middle','font-size':10,fill:tc||'var(--ink)'},txt)}
+function draw(){sv.innerHTML='';
+el('text',{x:AX,y:AY-8,fill:'var(--muted)'},'A（全局内存）');el('text',{x:BX,y:BY-8,fill:'var(--muted)'},'B（全局内存）');el('text',{x:CX,y:CY+N*CS+16,fill:'var(--muted)'},'C：每格一个线程');
+for(let r=0;r<N;r++)for(let c=0;c<N;c++){
+ let f='transparent',s=null;
+ if(r===ti&&c<=k)f='var(--accent-soft)';if(r===ti&&c===k){f='var(--accent)';}
+ cell(AX+c*CS,AY+r*CS,f,s);
+ let g='transparent';if(c===tj&&r<=k)g='var(--accent-soft)';if(c===tj&&r===k)g='var(--accent)';
+ if(k>=0&&r===k&&c!==tj)g='var(--good-soft)';
+ cell(BX+c*CS,BY+r*CS,g);
+ let h='transparent',st=null;if(r===ti)h='var(--good-soft)';if(r===ti&&c===tj){h=k>=0?'var(--amber-soft)':'var(--amber-soft)';st='var(--amber)'}
+ cell(CX+c*CS,CY+r*CS,h,st,(r===ti&&c===tj&&k>=0)?'Σ'+(k+1):undefined)}
+if(k>=0){
+ const ax=AX+k*CS+CS/2,ay=AY+ti*CS+CS/2,bx=BX+tj*CS+CS/2,by=BY+k*CS+CS/2,cx=CX+tj*CS+CS/2,cy=CY+ti*CS+CS/2;
+ el('line',{x1:ax,y1:ay,x2:cx,y2:cy,stroke:'var(--accent)','stroke-width':1.5,'stroke-dasharray':'4 3'});
+ el('line',{x1:bx,y1:by,x2:cx,y2:cy,stroke:'var(--accent)','stroke-width':1.5,'stroke-dasharray':'4 3'});
+ el('text',{x:AX,y:AY+N*CS+38,fill:'var(--accent)','font-size':12},'A['+ti+']['+k+'] 被这一行 8 个线程同时读（广播）');
+ el('text',{x:BX-6,y:BY+k*CS+15,'text-anchor':'end',fill:'var(--good)','font-size':12},'这一行线程读 B['+k+'][0..7] →');
+ el('text',{x:BX-6,y:BY+k*CS+30,'text-anchor':'end',fill:'var(--good)','font-size':11},'连续 8 个地址，合并访问')}
+const reads=2*(k+1);
+$('res').innerHTML=(k<0?'线程 ('+ti+','+tj+') 负责 C['+ti+']['+tj+']：沿 k 走 8 步，每步从<strong>全局内存</strong>读 A 一个数、B 一个数，做 1 次乘加。':
+ 'k = '+k+'：这个线程读 A['+ti+']['+k+'] 和 B['+k+']['+tj+']，累加进寄存器里的 sum。已读全局 <strong>'+reads+'</strong> 次，做了 '+(k+1)+' 次乘加。')+
+ '<br><span style="color:var(--muted)">整个 C 一共读全局 2·M·N·K = 2·8·8·8 = 1024 次，A、B 实际只有 128 个数：<strong style="color:var(--amber)">每个数被读 8 次</strong>（= N 或 M）。4096³ 时每个数被读 4096 次，计算强度只有 0.25 FLOP/字节。</span>'}
+function stop(){clearInterval(tm);tm=null}
+$('step').onclick=()=>{stop();k=k>=N-1?-1:k+1;draw()};
+$('reset').onclick=()=>{stop();k=-1;draw()};
+$('play').onclick=()=>{stop();k=-1;draw();tm=setInterval(()=>{k++;draw();if(k>=N-1)stop()},700)};
+sv.addEventListener('click',e=>{const p=sv.createSVGPoint();p.x=e.clientX;p.y=e.clientY;const q=p.matrixTransform(sv.getScreenCTM().inverse());
+ const c=Math.floor((q.x-CX)/CS),r=Math.floor((q.y-CY)/CS);if(r>=0&&r<N&&c>=0&&c<N){ti=r;tj=c;stop();k=-1;draw()}});
+draw();
+})();
+</script>
+      </div>
+
+      <div class="blk"><h3>② shared memory 分块（614，1.5×）</h3>
+<pre><code>template &lt;int TILE&gt;
+__global__ void gemm_tiled(const float* A, const float* B, float* C, int M, int N, int K) {
+    __shared__ float As[TILE][TILE], Bs[TILE][TILE];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int i = blockIdx.y * TILE + ty, j = blockIdx.x * TILE + tx;     // 全局坐标：带上 block 偏移
+    float sum = 0.0f;                                               // 在所有段之外，一直累加在寄存器里
+    for (int t = 0; t &lt; (K + TILE - 1) / TILE; ++t) {              // 段数，不是 K
+        int ak = t * TILE + tx, bk = t * TILE + ty;
+        As[ty][tx] = (i &lt; M &amp;&amp; ak &lt; K) ? A[i * K + ak] : 0.0f;      // 越界补 0
+        Bs[ty][tx] = (bk &lt; K &amp;&amp; j &lt; N) ? B[bk * N + j] : 0.0f;
+        __syncthreads();                                            // 没搬完不许算
+        for (int k = 0; k &lt; TILE; ++k) sum += As[ty][k] * Bs[k][tx];
+        __syncthreads();                                            // 没算完不许搬下一段
+    }
+    if (i &lt; M &amp;&amp; j &lt; N) C[i * N + j] = sum;                       // 最后只写一次
+}</code></pre>
+        <ul class="plain">
+          <li><strong>改了什么</strong>：一个 block 负责 C 的 TILE × TILE 块，沿 K 切成每段 TILE 宽。每段：一起搬 A、B 小块进 shared → <code>__syncthreads()</code> → 各自从 shared 做 TILE 次乘加 → <code>__syncthreads()</code>。</li>
+          <li><strong>为什么快</strong>：每个从全局搬进来的数被 TILE 个线程用，全局读取降到 1/TILE（TILE = 16 → 1/16）。</li>
+          <li><strong>为什么只快 1.5 倍</strong>：naive 的很多读取本来就命中 L1 / L2；而且新瓶颈变成 shared 本身：每次乘加仍要读 2 个 shared 数，读和算 1 : 1。</li>
+          <li><strong>两个同步</strong>：没搬完不许算，没算完不许搬下一段。越界线程不能提前 return，要参加搬运（填 0）和同步。</li>
+          <li><strong>TILE 加大的上限</strong>：一个线程只算一个 C，TILE = 32 已经 1024 个线程，到 block 上限 → 只能让一个线程算多个 C。</li>
+        </ul>
+        <p><strong>动画 · shared 分块的数据流</strong>：一步一步看"搬进 shared → 从 shared 算"，下面的计数对比全局读取量。</p>
+<p class="sr-only">动画：shared memory 分块 GEMM 中一个 block 沿 K 分两段，每段先合作把 A、B 的小块搬进 shared memory，再各线程从 shared 读数据计算。</p>
+<div class="anim" id="anim-sh-root">
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+<button id="anim-sh-play">播放全部</button>
+<button id="anim-sh-step">下一步</button>
+<button id="anim-sh-reset">重来</button>
+<span style="font-size:13px;color:var(--muted)">点 C 里的格子换一个 block / 线程</span>
+</div>
+<div id="anim-sh-stage" style="font-size:14px;font-weight:500;margin-bottom:4px"></div>
+<svg id="anim-sh-sv" viewBox="0 0 560 416" width="100%" style="max-width:680px" role="img" aria-label="shared memory 分块 GEMM 数据流"></svg>
+<div id="anim-sh-res" style="font-size:14px;margin-top:6px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-sh-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv'),N=8,T=4,CS=22;
+const AX=20,AY=214,BX=226,BY=22,CX=226,CY=214,SX=440,ASY=214,BSY=110;
+let bi=0,bj=1,ty=1,tx=2,st=-1,tm=null;
+const S=[];for(let t=0;t<2;t++){S.push({t,a:'load'});for(let kk=0;kk<T;kk++)S.push({t,a:'calc',kk})}S.push({a:'write'});
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function cell(x,y,f,s,txt){el('rect',{x:x+1,y:y+1,width:CS-2,height:CS-2,rx:3,fill:f,stroke:s||'var(--line)','stroke-width':s?2:0.5});if(txt!==undefined)el('text',{x:x+CS/2,y:y+15,'text-anchor':'middle','font-size':10,fill:'var(--ink)'},txt)}
+function draw(){sv.innerHTML='';const s=st>=0?S[st]:null,t=s&&s.t!==undefined?s.t:-1;
+el('text',{x:AX,y:AY-8,fill:'var(--muted)'},'A（全局）');el('text',{x:BX,y:BY-8,fill:'var(--muted)'},'B（全局）');
+el('text',{x:SX,y:BSY-8,fill:'var(--muted)'},'Bs（shared）');el('text',{x:SX,y:ASY-8,fill:'var(--muted)'},'As（shared）');
+el('text',{x:CX,y:CY+N*CS+16,fill:'var(--muted)'},'C：粗框是一个 block（4×4 线程）');
+const inAt=(r,c)=>t>=0&&r>=bi*T&&r<bi*T+T&&c>=t*T&&c<t*T+T, inBt=(r,c)=>t>=0&&c>=bj*T&&c<bj*T+T&&r>=t*T&&r<t*T+T;
+for(let r=0;r<N;r++)for(let c=0;c<N;c++){
+ let f='transparent';if(inAt(r,c))f=s.a==='load'?'var(--accent)':'var(--accent-soft)';cell(AX+c*CS,AY+r*CS,f);
+ let g='transparent';if(inBt(r,c))g=s.a==='load'?'var(--accent)':'var(--accent-soft)';cell(BX+c*CS,BY+r*CS,g);
+ const inBlk=Math.floor(r/T)===bi&&Math.floor(c/T)===bj,me=r===bi*T+ty&&c===bj*T+tx;
+ cell(CX+c*CS,CY+r*CS,me?'var(--amber-soft)':(inBlk?'var(--good-soft)':'transparent'),me?'var(--amber)':null)}
+el('rect',{x:CX+bj*T*CS,y:CY+bi*T*CS,width:T*CS,height:T*CS,fill:'none',stroke:'var(--good)','stroke-width':2.5,rx:3});
+for(let r=0;r<T;r++)for(let c=0;c<T;c++){
+ let fa='transparent',fb='transparent',sa=null,sb=null;
+ if(s&&s.a!=='write'&&t>=0){fa='var(--accent-soft)';fb='var(--accent-soft)'}
+ if(s&&s.a==='calc'){if(r===ty&&c===s.kk){fa='var(--accent)';sa='var(--amber)'}if(c===tx&&r===s.kk){fb='var(--accent)';sb='var(--amber)'}}
+ cell(SX+c*CS,ASY+r*CS,fa,sa);cell(SX+c*CS,BSY+r*CS,fb,sb)}
+if(s&&s.a==='load'){for(const [x1,y1,x2,y2] of [[AX+(t*T+2)*CS,AY+(bi*T+2)*CS,SX,ASY+2*CS],[BX+(bj*T+2)*CS,BY+(t*T+2)*CS,SX,BSY+2*CS]])el('line',{x1,y1,x2,y2,stroke:'var(--accent)','stroke-width':1.5,'stroke-dasharray':'5 4'})}
+if(s&&s.a==='calc'){el('line',{x1:SX,y1:ASY+ty*CS+CS/2,x2:CX+(bj*T+tx)*CS+CS,y2:CY+(bi*T+ty)*CS+CS/2,stroke:'var(--amber)','stroke-width':1.5,'stroke-dasharray':'4 3'});
+ el('line',{x1:SX+tx*CS+CS/2,y1:BSY+T*CS,x2:CX+(bj*T+tx)*CS+CS/2,y2:CY+(bi*T+ty)*CS,stroke:'var(--amber)','stroke-width':1.5,'stroke-dasharray':'4 3'})}
+const loads=s?(s.a==='write'?2:t+1):0,gl=loads*2*T*T;
+let stage='',txt='';
+if(!s){stage='准备';txt='block ('+bi+','+bj+') 负责 C 的一个 4×4 块。K = 8 被切成 2 段，每段宽 TILE = 4。'}
+else if(s.a==='load'){stage='第 '+t+' 段 · ① 16 个线程一起搬，然后 __syncthreads()';txt='每个线程搬 1 个 A、1 个 B：A 的第 '+(bi*T)+'～'+(bi*T+3)+' 行 × 第 '+(t*T)+'～'+(t*T+3)+' 列 → As；B 的第 '+(t*T)+'～'+(t*T+3)+' 行 × 第 '+(bj*T)+'～'+(bj*T+3)+' 列 → Bs。'}
+else if(s.a==='calc'){stage='第 '+t+' 段 · ② 各算各的（kk = '+s.kk+'），算完再 __syncthreads()';txt='线程 ('+ty+','+tx+') 读 As['+ty+']['+s.kk+'] 和 Bs['+s.kk+']['+tx+']（都在 shared），累加进 sum。同一时刻 block 里 16 个线程都在读 As、Bs，不碰全局内存。'}
+else{stage='③ 两段算完，每个线程把 sum 写回 C（只写一次）';txt='写回前判断越界。'}
+$('stage').textContent=stage;
+$('res').innerHTML=txt+'<br><span style="color:var(--muted)">这个 block 读全局：<strong style="color:var(--ink)">'+gl+'</strong> 次（每段 2×16）。朴素版 16 个线程各读 2×8 = 256 次 → 降到 <strong style="color:var(--good)">1/TILE = 1/4</strong>。TILE = 16 时降到 1/16，但每次乘加仍要读 2 个 shared 数，读和算 1 : 1。</span>'}
+function stop(){clearInterval(tm);tm=null}
+$('step').onclick=()=>{stop();st=st>=S.length-1?-1:st+1;draw()};
+$('reset').onclick=()=>{stop();st=-1;draw()};
+$('play').onclick=()=>{stop();st=-1;draw();tm=setInterval(()=>{st++;draw();if(st>=S.length-1)stop()},1000)};
+sv.addEventListener('click',e=>{const p=sv.createSVGPoint();p.x=e.clientX;p.y=e.clientY;const q=p.matrixTransform(sv.getScreenCTM().inverse());
+ const c=Math.floor((q.x-CX)/CS),r=Math.floor((q.y-CY)/CS);if(r>=0&&r<N&&c>=0&&c<N){bi=Math.floor(r/T);bj=Math.floor(c/T);ty=r%T;tx=c%T;draw()}});
+draw();
+})();
+</script>
+      </div>
+
+      <div class="blk"><h3>③ 寄存器分块：一个线程算 8×8（1744，2.8×）</h3>
+        <p><strong>核心想法</strong>：一个线程多算几个 C，读进寄存器的数就能重复用。</p>
+<pre><code>sum0 += As[i][s] * Bs[s][j]
+sum1 += As[i][s] * Bs[s][j+1]        ← As[i][s] 在两行里是同一个数
+
+a = As[i][s]                          ← 读 1 次，存进寄存器
+sum0 += a * Bs[s][j]                  ← 读 1 次
+sum1 += a * Bs[s][j+1]                ← 读 1 次
+算 2 个元素：原来读 4 次，现在 3 次，乘加还是 2 次</code></pre>
+        <p>放大到 8×8，配置是：</p>
+<pre><code>一个 block 256 个线程，负责 C 的 128 × 128（BM = BN = 128）
+一个线程 8 × 8 = 64 个元素（TM = TN = 8），16 × 16 个线程 × 8 × 8 = 128 × 128
+沿 K 每段 BK = 8；shared：As 128×8 + Bs 8×128 = 2048 个 float = 8 KB
+
+for k0 in 0, BK, 2BK…：
+  ① 256 个线程合作搬 As[BM][BK]、Bs[BK][BN]（各 1024 个，每人各搬 4 个，越界补 0）→ __syncthreads()
+  ② for kk in 0..BK-1：a[0..7] ← As 的一小列，b[0..7] ← Bs 的一小行，c[8][8] += a ⊗ b（外积）
+  → __syncthreads()
+③ 写回 64 个结果（越界跳过）。启动：dim3 block(256); dim3 grid((N+127)/128, (M+127)/128)</code></pre>
+        <ul class="plain">
+          <li><strong>外积</strong>：每个 kk 从 As 读一小列 8 个数进 <code>a[8]</code>，从 Bs 读一小行 8 个数进 <code>b[8]</code>，做 <code>c[m][n] += a[m]·b[n]</code>。读 16 次、算 64 次，读 : 算从 2 : 1 变成 1 : 4，这就是 2.8 倍的来源。</li>
+          <li><strong>c[8][8] 必须在寄存器里</strong>：TM、TN 要是模板参数、小循环完全展开，下标才是编译期常量，否则会溢出到 local memory（显存）。<code>-Xptxas -v</code>：119 个寄存器、0 溢出。</li>
+          <li><strong>搬和算分开</strong>：搬的时候 256 个线程按一维 tid 平分 As、Bs 的 1024 个数；算的时候按二维 (ty, tx) 决定负责哪个 8×8。</li>
+          <li><strong>代价</strong>：寄存器用得多，每个 SM 放的 warp 变少（后面 ncu 看到占用率 33%）。</li>
+        </ul>
+        <p><strong>动画 · 一个线程的外积</strong>：每个 kk 先读 16 个数进寄存器，再在寄存器里更新 64 个 c。</p>
+<p class="sr-only">动画：寄存器分块 GEMM 中一个线程在每个 kk 从 As 读一小列 8 个数进 a[8]、从 Bs 读一小行 8 个数进 b[8]，然后在寄存器里做 8×8 外积更新 c[8][8]。</p>
+<div class="anim" id="anim-rg-root">
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+<button id="anim-rg-play">播放 kk = 0→7</button>
+<button id="anim-rg-step">下一步</button>
+<button id="anim-rg-reset">重来</button>
+</div>
+<div id="anim-rg-stage" style="font-size:14px;font-weight:500;margin-bottom:4px"></div>
+<svg id="anim-rg-sv" viewBox="0 0 440 440" width="100%" style="max-width:560px" role="img" aria-label="寄存器分块外积数据流"></svg>
+<div id="anim-rg-res" style="font-size:14px;margin-top:6px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-rg-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv'),CS=20;
+const BSX=230,BSY=26,BRY=196,ASX=20,ASY=236,ARX=190,CX=230,CY=236;
+let kk=-1,ph=0,tm=null;
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function cell(x,y,f,s,txt){el('rect',{x:x+1,y:y+1,width:CS-2,height:CS-2,rx:3,fill:f,stroke:s||'var(--line)','stroke-width':s?2:0.5});if(txt!==undefined)el('text',{x:x+CS/2,y:y+14,'text-anchor':'middle','font-size':9,fill:'var(--ink)'},txt)}
+function draw(){sv.innerHTML='';
+el('text',{x:BSX,y:BSY-8,fill:'var(--muted)','font-size':12},'Bs（shared）：第 kk 行里本线程的 8 列');
+el('text',{x:ASX,y:ASY-8,fill:'var(--muted)','font-size':12},'As（shared）：本线程的 8 行');el('text',{x:ASX,y:ASY+8*CS+34,fill:'var(--muted)','font-size':11},'a[8]、b[8]、c[8][8] 都在寄存器里');
+el('text',{x:BSX+8*CS+4,y:BRY+14,fill:'var(--muted)','font-size':11},'b[8]');
+el('text',{x:ARX-2,y:ASY-8,fill:'var(--muted)','font-size':11},'a[8]');
+el('text',{x:CX,y:CY+8*CS+16,fill:'var(--muted)','font-size':11},'c[8][8]：64 个累加值');
+for(let r=0;r<8;r++)for(let c=0;c<8;c++){
+ cell(BSX+c*CS,BSY+r*CS,r===kk?(ph===0?'var(--accent)':'var(--accent-soft)'):(r<kk?'var(--code-bg)':'transparent'));
+ cell(ASX+c*CS,ASY+r*CS,c===kk?(ph===0?'var(--accent)':'var(--accent-soft)'):(c<kk?'var(--code-bg)':'transparent'));
+ const done=kk>=0;cell(CX+c*CS,CY+r*CS,done?'var(--good-soft)':'transparent',done&&ph===1?'var(--good)':null)}
+for(let i=0;i<8;i++){cell(BSX+i*CS,BRY,kk>=0?'var(--amber-soft)':'transparent',kk>=0?'var(--amber)':null,kk>=0?'b'+i:undefined);
+ cell(ARX,ASY+i*CS,kk>=0?'var(--amber-soft)':'transparent',kk>=0?'var(--amber)':null,kk>=0?'a'+i:undefined)}
+el('text',{x:ASX-2,y:ASY+8*CS+16,fill:'var(--muted)','font-size':10},'列 = kk 0..7');
+el('text',{x:BSX+8*CS+4,y:BSY+12,fill:'var(--muted)','font-size':10},'行 =');el('text',{x:BSX+8*CS+4,y:BSY+24,fill:'var(--muted)','font-size':10},'kk');
+if(kk>=0&&ph===0){el('line',{x1:BSX+4*CS,y1:BSY+kk*CS+CS,x2:BSX+4*CS,y2:BRY,stroke:'var(--accent)','stroke-width':2,'marker-end':''});
+ el('line',{x1:ASX+kk*CS+CS,y1:ASY+4*CS,x2:ARX,y2:ASY+4*CS,stroke:'var(--accent)','stroke-width':2})}
+if(kk>=0&&ph===1){el('text',{x:CX+4*CS,y:CY+4*CS+5,'text-anchor':'middle','font-size':22,'font-weight':600,fill:'var(--good)',stroke:'var(--bg)','stroke-width':4,'paint-order':'stroke'},'a ⊗ b')}
+const reads=kk<0?0:16*(kk+1)-(ph===0?0:0),fma=kk<0?0:64*(kk+(ph===1?1:0));
+$('stage').textContent=kk<0?'准备：c[8][8] 清零':(ph===0?'kk = '+kk+' · ① 从 shared 读 16 个数进寄存器':'kk = '+kk+' · ② 外积：64 次乘加，只用寄存器');
+$('res').innerHTML=(kk<0?'一个线程负责 C 的 8×8 = 64 个元素。每个 kk：从 As 读一小列 8 个数（a），从 Bs 读一小行 8 个数（b），做 c[m][n] += a[m]·b[n]。':
+ (ph===0?'这 16 个数各自会被用 8 次。':'每个 a[m] 被 8 个 c 用，每个 b[n] 也被 8 个 c 用。'))+
+ '<br><span style="color:var(--muted)">累计：读 shared <strong style="color:var(--ink)">'+(kk<0?0:16*(kk+1))+'</strong> 次，乘加 <strong style="color:var(--ink)">'+fma+'</strong> 次。读 : 算 = 16 : 64 = <strong style="color:var(--good)">1 : 4</strong>；shared 版是 2 : 1（每次乘加读 2 个）→ 每次读支撑的乘加提高 8 倍。</span>'}
+function next(){if(kk<0){kk=0;ph=0}else if(ph===0){ph=1}else if(kk<7){kk++;ph=0}else{kk=-1;ph=0}draw()}
+function stop(){clearInterval(tm);tm=null}
+$('step').onclick=()=>{stop();next()};
+$('reset').onclick=()=>{stop();kk=-1;ph=0;draw()};
+$('play').onclick=()=>{stop();kk=-1;ph=0;draw();tm=setInterval(()=>{next();if(kk===7&&ph===1)stop()},650)};
+draw();
+})();
+</script>
+      </div>
+
+      <div class="blk" id="m11-s14"><h3>④ 交错分工：消除 bank conflict（2091，+20%）</h3>
+        <ul class="plain">
+          <li><strong>bank</strong>：shared 分 32 个 bank，第 n 个 float 在 bank n % 32，每个 bank 每周期送 1 个 float。一个 warp 里多个线程落在同一 bank 的不同地址 → 排队，几个就几轮。读同一地址是广播，不算冲突。</li>
+          <li><strong>③ 的问题</strong>：每个线程负责<strong>连续 8 列</strong>。要"竖着看"——同一时刻 16 个线程读的是第 0、8、16、24… 列，只落在 4 个 bank → 读 Bs 4 路冲突；读 As 两排 ty 相差 64 个 float → 2 路冲突。</li>
+        </ul>
+<pre><code>              tj=0  tj=1 ...  tj=7
+tx=0  读的列:    0     1  ...    7     ← 横着看：一个线程，连续
+tx=1  读的列:    8     9  ...   15
+tx=2  读的列:   16    17  ...   23
+...
+                ↑ 竖着看：同一时刻读 0, 8, 16, 24, 32 ...，bank 只有 0、8、16、24</code></pre>
+        <p><strong>动画 · bank 和排队轮数</strong>：选预设看不同访问模式要排几轮；对比"寄存器版 Bs（隔 8）"和"修复后（交错）"。</p>
+<p class="sr-only">动画演示一个 warp 的 32 个线程读 shared memory 时，地址如何落到 32 个 bank 上，以及冲突时需要排队几轮。</p>
+<div class="anim" id="anim-bank-root">
+<div id="anim-bank-presets" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px"></div>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap">
+<button id="anim-bank-play">播放</button>
+<button id="anim-bank-reset">重来</button>
+<span id="anim-bank-status" style="font-size:14px;color:var(--muted)"></span>
+</div>
+<div id="anim-bank-formula" style="font-family:var(--f-mono);font-size:13px;color:var(--muted);margin-bottom:6px"></div>
+<svg id="anim-bank-sv" viewBox="0 0 680 330" width="100%" role="img" aria-label="线程到 bank 的映射">
+<text x="4" y="18" fill="var(--muted)">线程</text>
+<text x="4" y="248" fill="var(--muted)">bank</text>
+<g id="anim-bank-lines"></g><g id="anim-bank-threads"></g><g id="anim-bank-banks"></g>
+</svg>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-top:8px">
+<div style="background:var(--code-bg);border-radius:8px;padding:0.75rem 1rem"><div style="font-size:13px;color:var(--muted)">用到的 bank 数</div><div id="anim-bank-m1" style="font-size:24px;font-weight:500">-</div></div>
+<div style="background:var(--code-bg);border-radius:8px;padding:0.75rem 1rem"><div style="font-size:13px;color:var(--muted)">需要排队几轮</div><div id="anim-bank-m2" style="font-size:24px;font-weight:500">-</div></div>
+<div style="background:var(--code-bg);border-radius:8px;padding:0.75rem 1rem"><div style="font-size:13px;color:var(--muted)">结论</div><div id="anim-bank-m3" style="font-size:16px;font-weight:500;margin-top:6px">-</div></div>
+</div>
+</div>
+<script>
+(function(){
+const PFX='anim-bank-',$=i=>document.getElementById(PFX+i);
+const P=[
+{n:'连续读 (shared 版 Bs)',f:'线程 t 读第 t 个 float',a:t=>t},
+{n:'寄存器版 Bs (隔 8)',f:'两排 ty 共用：线程 t 读第 8*(t%16) 个',a:t=>8*(t%16)},
+{n:'修复后 (交错)',f:'两排 ty 共用：线程 t 读第 t%16 个',a:t=>t%16},
+{n:'隔 2 个读',f:'线程 t 读第 2*t 个 float',a:t=>2*t},
+{n:'全部读同一个',f:'所有线程读第 5 个 float（广播）',a:t=>5},
+{n:'隔 32 个读',f:'线程 t 读第 32*t 个 float',a:t=>32*t}];
+const RC=['#1D9E75','#378ADD','#D85A30','#7F77DD','#D4537E','#BA7517','#639922','#888780'];
+let cur=0,round=-1,timer=null,info=null;
+const W=680,X0=40,CW=(W-X0-4)/32;
+const ns='http://www.w3.org/2000/svg';
+function el(t,a,p){const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);p.appendChild(e);return e}
+function compute(){const p=P[cur];const addr=[...Array(32).keys()].map(p.a);const banks={};addr.forEach(a=>{const b=a%32;(banks[b]=banks[b]||[]);if(!banks[b].includes(a))banks[b].push(a)});const rnd=addr.map(a=>banks[a%32].indexOf(a));const R=Math.max(...Object.values(banks).map(v=>v.length));return{addr,banks,rnd,R,used:Object.keys(banks).length}}
+function draw(){const g1=$('threads'),g2=$('banks'),gl=$('lines');g1.innerHTML='';g2.innerHTML='';gl.innerHTML='';const {addr,banks,rnd}=info;
+for(let t=0;t<32;t++){const x=X0+t*CW;const served=round>=0&&rnd[t]<=round;const active=rnd[t]===round;const col=RC[rnd[t]%RC.length];
+el('rect',{x:x+1,y:26,width:CW-2,height:22,rx:3,fill:served?col:'transparent',stroke:active?col:'var(--line)','stroke-width':active?2:0.5},g1);
+const tx=el('text',{x:x+CW/2,y:41,'text-anchor':'middle','font-size':11,fill:served?'#fff':'var(--ink)'},g1);tx.textContent=t;
+const bx=X0+(addr[t]%32)*CW+CW/2;el('line',{x1:x+CW/2,y1:48,x2:bx,y2:226,stroke:served||active?col:'var(--line)','stroke-width':active?1.6:0.6,opacity:round<0?0.5:(active?1:(served?0.35:0.15))},gl)}
+for(let b=0;b<32;b++){const x=X0+b*CW;el('rect',{x:x+1,y:228,width:CW-2,height:22,rx:3,fill:banks[b]?'var(--code-bg)':'transparent',stroke:'var(--line)','stroke-width':0.5},g2);const t=el('text',{x:x+CW/2,y:243,'text-anchor':'middle',fill:'var(--muted)','font-size':11},g2);t.textContent=b;
+(banks[b]||[]).forEach((a,k)=>{const done=round>=k;const col=RC[k%RC.length];el('rect',{x:x+2,y:256+k*17,width:CW-4,height:15,rx:2,fill:done?col:'transparent',stroke:col,'stroke-width':0.8},g2);const tt=el('text',{x:x+CW/2,y:267+k*17,'text-anchor':'middle','font-size':a>99?8:10,fill:done?'#fff':col},g2);tt.textContent=a})}}
+function setStatus(){const s=$('status');if(round<0)s.textContent='每个 bank 下面的小方块是它要提供的不同地址；点播放看排队过程';else if(round<info.R)s.textContent='第 '+(round+1)+' 轮：每个 bank 这一轮只能提供 1 个地址（同色线程拿到数据）';if(round>=info.R-1&&round>=0)s.textContent='全部完成，共 '+info.R+' 轮'}
+function load(i){cur=i;round=-1;clearInterval(timer);timer=null;info=compute();$('formula').textContent=P[i].f+'   bank = 地址 % 32';
+$('m1').textContent=info.used+' / 32';$('m2').textContent=info.R+' 轮';$('m3').textContent=info.R===1?(info.used===1?'广播，无冲突':'无冲突'):info.R+' 路 bank conflict';
+document.querySelectorAll('#anim-bank-presets button').forEach((b,k)=>{b.style.borderColor=k===i?'var(--accent)':'';b.style.color=k===i?'var(--accent)':''});draw();setStatus()}
+P.forEach((p,i)=>{const b=document.createElement('button');b.textContent=p.n;b.onclick=()=>load(i);$('presets').appendChild(b)});
+$('play').onclick=()=>{clearInterval(timer);round=-1;draw();setStatus();timer=setInterval(()=>{round++;draw();setStatus();if(round>=info.R-1){clearInterval(timer);timer=null}},900)};
+$('reset').onclick=()=>load(cur);
+load(1);
+})();
+</script>
+        <ul class="plain">
+          <li><strong>修复</strong>：让 tx 负责第 <code>tx, tx+16, tx+32 …</code> 列（步长 = 这个方向的线程数 BN/TN），同一时刻 16 个线程读连续 16 个地址。</li>
+          <li>读 a、读 b、写回 C 三处公式要一起改：<code>Bs[kk][j + tj*(BN/TN)]</code>、<code>As[i + ti*(BM/TM)][kk]</code>，写回用同样的行列公式。</li>
+        </ul>
+        <p><strong>动画 · 横着看 vs 竖着看</strong>：拖 tj 看同一时刻 16 个线程读的列，切换原写法和交错写法。</p>
+<p class="sr-only">表格展示寄存器版 GEMM 中 16 个线程在 8 次循环里读 Bs 的列号，高亮同一时刻的一列，并显示这一列落在 32 个 bank 上的情况，可切换原写法和交错写法。</p>
+<div class="anim" id="anim-hv-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+<button id="anim-hv-bo">原写法：tj + tx*8</button>
+<button id="anim-hv-bi">交错写法：tx + tj*16</button>
+</div>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+<label style="font-size:14px;color:var(--muted)">同一时刻 tj =</label>
+<input type="range" min="0" max="7" step="1" value="0" id="anim-hv-tj" style="flex:1">
+<span id="anim-hv-tjo" style="font-size:14px;font-weight:500;min-width:16px">0</span>
+<button id="anim-hv-pl">播放 tj=0→7</button>
+</div>
+<svg id="anim-hv-sv" viewBox="0 0 680 470" width="100%" role="img" aria-label="线程读取列号表格"></svg>
+<div id="anim-hv-res" style="font-size:15px;margin-top:4px"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-hv-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');
+let mode=0,tj=0,tm=null;
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function colOf(tx,j){return mode===0?j+tx*8:tx+j*16}
+function draw(){sv.innerHTML='';const X0=70,CW=62,RH=18,Y0=36;
+el('text',{x:4,y:22,fill:'var(--muted)'},'线程 \\ tj');
+for(let j=0;j<8;j++){el('text',{x:X0+j*CW+CW/2,y:22,'text-anchor':'middle',fill:'var(--muted)','font-weight':j===tj?500:400},'tj='+j)}
+el('rect',{x:X0+tj*CW+1,y:Y0-4,width:CW-2,height:16*RH+6,rx:4,fill:'none',stroke:'#378ADD','stroke-width':2});
+const banks={};for(let tx=0;tx<16;tx++){const c=colOf(tx,tj);const b=c%32;(banks[b]=banks[b]||[]).push(c)}
+for(let tx=0;tx<16;tx++){const y=Y0+tx*RH;el('text',{x:4,y:y+12,fill:'var(--muted)'},'tx='+tx);
+for(let j=0;j<8;j++){const c=colOf(tx,j);const on=j===tj;const bad=on&&banks[c%32].length>1;
+if(on)el('rect',{x:X0+j*CW+4,y:y,width:CW-8,height:RH-3,rx:3,fill:bad?'#F7C1C1':'#9FE1CB'});
+el('text',{x:X0+j*CW+CW/2,y:y+12,'text-anchor':'middle','font-size':12,fill:on?(bad?'#791F1F':'#085041'):'var(--muted)'},on?c+' →b'+(c%32):c)}}
+const BY=Y0+16*RH+40,BW=(680-70)/32;el('text',{x:4,y:BY+12,fill:'var(--muted)'},'32 个 bank');
+el('text',{x:4,y:BY-14,fill:'var(--muted)'},'这一时刻每个 bank 被几个线程（不同地址）占用：');
+for(let b=0;b<32;b++){const n=(banks[b]||[]).length;const x=70+b*BW;
+el('rect',{x:x+1,y:BY,width:BW-2,height:18,rx:2,fill:n===0?'transparent':(n>1?'#F09595':'#5DCAA5'),stroke:'var(--line)','stroke-width':0.5});
+el('text',{x:x+BW/2,y:BY+13,'text-anchor':'middle','font-size':10,fill:n?(n>1?'#501313':'#04342C'):'var(--muted)'},b);
+if(n)el('text',{x:x+BW/2,y:BY+34,'text-anchor':'middle','font-size':12,fill:n>1?'var(--amber)':'var(--good)','font-weight':500},'×'+n)}
+const used=Object.keys(banks).length,R=Math.max(...Object.values(banks).map(v=>v.length));
+$('res').innerHTML=R>1?'<span style="color:var(--amber)">同一时刻 16 个线程只用到 '+used+' 个 bank，每个挤 '+R+' 个 → '+R+' 路冲突，要排 '+R+' 轮</span>':'<span style="color:var(--good)">同一时刻 16 个线程用到 '+used+' 个不同 bank → 没有冲突，1 轮读完</span>';
+$('bo').style.borderColor=mode===0?'var(--accent)':'';$('bo').style.color=mode===0?'var(--accent)':'';
+$('bi').style.borderColor=mode===1?'var(--accent)':'';$('bi').style.color=mode===1?'var(--accent)':''}
+$('bo').onclick=()=>{mode=0;draw()};$('bi').onclick=()=>{mode=1;draw()};
+const s=$('tj');s.oninput=()=>{tj=+s.value;$('tjo').textContent=tj;draw()};
+$('pl').onclick=()=>{clearInterval(tm);let k=0;tm=setInterval(()=>{tj=k;s.value=k;$('tjo').textContent=k;draw();k++;if(k>7)clearInterval(tm)},800)};
+draw();
+})();
+</script>
+        <div class="tablewrap"><table>
+          <thead><tr><th>ncu（1024³）</th><th class="num">③</th><th class="num">④</th></tr></thead>
+          <tbody>
+            <tr><td>bank conflict 次数</td><td class="num">8,389,540</td><td class="num win">1,218</td></tr>
+            <tr><td>wavefront（shared 实际工作轮数）</td><td class="num">16,778,870</td><td class="num">8,390,194</td></tr>
+            <tr><td>读 shared 指令数</td><td class="num">5,242,880</td><td class="num">8,388,608</td></tr>
+          </tbody>
+        </table></div>
+        <div class="note good"><strong>指令多了 60% 却快了 20%</strong>：③ 里每个线程读的 8 个 b 连续，编译器自动合并成 2 条 <code>LDS.128</code>；交错后不连续，变成 16 条 <code>LDS</code>。但 wavefront 少了一半。<strong>看硬件工作了多少轮，不看指令数。</strong></div>
+      </div>
+
+      <div class="blk" id="m11-s15"><h3>⑤ float4 + As 转置：反而变慢（1790，−15%）</h3>
+        <ul class="plain">
+          <li><strong>想法</strong>：既要无冲突，又要像 ③ 那样用 128 位读取。float4 只要求 4 个连续、16 字节对齐，所以每个线程读"两段、每段 4 个连续"：</li>
+        </ul>
+<pre><code>tx 负责的列 = [tx*4 .. tx*4+3] 和 [64 + tx*4 .. 64 + tx*4+3]
+通用：第 q 段第 e 个 = q*(BN/TN)*4 + tx*4 + e      (q = 0..TN/4-1, e = 0..3)</code></pre>
+<pre><code>float4 v = *reinterpret_cast&lt;const float4*&gt;(&amp;Bs[kk][q*(BN/TN)*4 + j*4]);
+b[q*4+0] = v.x;  b[q*4+1] = v.y;  b[q*4+2] = v.z;  b[q*4+3] = v.w;</code></pre>
+        <ul class="plain">
+          <li>硬件按 8 个线程一组处理 float4（8 × 16 字节 = 128 字节），一组正好覆盖 32 个 bank，无冲突。</li>
+        </ul>
+        <p><strong>动画 · 三种读 Bs 的写法</strong>：对比 ③ 的连续 8 列、④ 的交错标量、⑤ 的 float4 两段，每条指令分几轮完成。</p>
+<p class="sr-only">动画对比三种读 Bs 的写法：旧版连续 8 列、交错标量、float4 两段，逐条指令逐个 wavefront 显示哪些线程读哪些 float、落在哪些 bank。</p>
+<div class="anim" id="anim-f4w-root">
+<div id="anim-f4w-modes" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"></div>
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">
+<span style="font-size:14px;color:var(--muted)">指令</span><span id="anim-f4w-ins" style="display:flex;gap:6px;flex-wrap:wrap"></span>
+<button id="anim-f4w-play">播放这条指令</button>
+</div>
+<div id="anim-f4w-st" style="font-size:14px;color:var(--muted);min-height:22px;margin-bottom:4px"></div>
+<svg id="anim-f4w-sv" viewBox="0 0 680 300" width="100%" role="img" aria-label="线程、float 与 bank 的对应"></svg>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:6px">
+<div style="background:var(--code-bg);border-radius:8px;padding:0.75rem 1rem"><div style="font-size:13px;color:var(--muted)">每次 kk 读 b 的指令数</div><div id="anim-f4w-k1" style="font-size:24px;font-weight:500"></div></div>
+<div style="background:var(--code-bg);border-radius:8px;padding:0.75rem 1rem"><div style="font-size:13px;color:var(--muted)">这条指令的 wavefront</div><div id="anim-f4w-k2" style="font-size:24px;font-weight:500"></div></div>
+<div style="background:var(--code-bg);border-radius:8px;padding:0.75rem 1rem"><div style="font-size:13px;color:var(--muted)">特点</div><div id="anim-f4w-k3" style="font-size:15px;font-weight:500;margin-top:6px"></div></div>
+</div>
+</div>
+<script>
+(function(){
+const PFX='anim-f4w-',$=i=>document.getElementById(PFX+i);
+const M=[
+{n:'旧版：连续 8 列',v:4,ni:2,f:(tx,k)=>[0,1,2,3].map(e=>tx*8+4*k+e),t:'指令少，但有冲突'},
+{n:'交错：每隔 16 列',v:1,ni:8,f:(tx,k)=>[tx+16*k],t:'无冲突，但指令多'},
+{n:'float4 两段',v:4,ni:2,f:(tx,k)=>[0,1,2,3].map(e=>64*k+tx*4+e),t:'指令少，也无冲突'}];
+const CL=['#1D9E75','#378ADD','#D85A30','#7F77DD','#D4537E','#BA7517','#639922','#0F6E56','#185FA5','#993C1D','#534AB7','#993556','#854F0B','#3B6D11','#5F5E5A','#A32D2D'];
+let m=0,ins=0,wf=-1,tm=null,plan=null;
+const sv=$('sv'),ns='http://www.w3.org/2000/svg';
+function el(t,a,x){const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;sv.appendChild(e);return e}
+function build(){const md=M[m];const phases=md.v===4?[[0,1,2,3,4,5,6,7],[8,9,10,11,12,13,14,15]]:[[...Array(16).keys()]];const w=[];
+phases.forEach(ph=>{const bk={};ph.forEach(tx=>md.f(tx,ins).forEach(a=>{const b=a%32;(bk[b]=bk[b]||[]);if(!bk[b].includes(a))bk[b].push(a)}));const R=Math.max(...Object.values(bk).map(x=>x.length));for(let r=0;r<R;r++){w.push({ph,addr:new Set(Object.values(bk).filter(x=>x.length>r).map(x=>x[r]))})}});return w}
+function draw(){sv.innerHTML='';const md=M[m];const own={};for(let tx=0;tx<16;tx++)md.f(tx,ins).forEach(a=>own[a]=tx);
+const cur=wf>=0?plan[wf]:null;const done=new Set();for(let q=0;q<=wf;q++)plan[q].addr.forEach(a=>done.add(a));
+el('text',{x:0,y:14,fill:'var(--muted)'},'Bs 的一行（128 个 float，按 4 个一格画出边框）');
+const CW=680/128;for(let c=0;c<128;c++){const t=own[c];const on=cur&&cur.addr.has(c);el('rect',{x:c*CW,y:22,width:CW-0.6,height:26,fill:t===undefined?'transparent':(done.has(c)||on?CL[t]:'var(--code-bg)'),stroke:on?'var(--ink)':'var(--line)','stroke-width':on?1.2:0.4});if(c%4===0)el('line',{x1:c*CW,y1:20,x2:c*CW,y2:50,stroke:'var(--line)','stroke-width':0.6})}
+[0,32,64,96].forEach(c=>el('text',{x:c*CW+1,y:62,fill:'var(--muted)','font-size':11},c));
+el('text',{x:0,y:90,fill:'var(--muted)'},'16 个线程 tx（另一排 ty 读相同地址）');const TW=680/16;
+for(let tx=0;tx<16;tx++){const act=cur&&cur.ph.includes(tx)&&md.f(tx,ins).some(a=>cur.addr.has(a));el('rect',{x:tx*TW+2,y:98,width:TW-4,height:24,rx:4,fill:act?CL[tx]:'transparent',stroke:CL[tx],'stroke-width':act?0:1});el('text',{x:tx*TW+TW/2,y:114,'text-anchor':'middle','font-size':12,fill:act?'#fff':CL[tx]},tx)}
+el('text',{x:0,y:156,fill:'var(--muted)'},'32 个 bank（这一轮各送出 1 个 float）');const BW=680/32;
+const served={};if(cur)cur.addr.forEach(a=>served[a%32]=a);
+for(let b=0;b<32;b++){const a=served[b];el('rect',{x:b*BW+1,y:164,width:BW-2,height:24,rx:3,fill:a!==undefined?CL[own[a]]:'transparent',stroke:'var(--line)','stroke-width':0.5});el('text',{x:b*BW+BW/2,y:180,'text-anchor':'middle','font-size':10,fill:a!==undefined?'#fff':'var(--muted)'},b)}
+if(cur){cur.addr.forEach(a=>{el('line',{x1:a*CW+CW/2,y1:50,x2:(a%32)*BW+BW/2,y2:164,stroke:CL[own[a]],'stroke-width':0.8,opacity:0.55})})}
+const used=cur?Object.keys(served).length:0;el('text',{x:0,y:220,fill:'var(--muted)'},cur?('第 '+(wf+1)+' / '+plan.length+' 轮：用到 '+used+' 个 bank'):'点播放，一轮一轮看');
+$('k1').textContent=md.ni+' 条';$('k2').textContent=plan.length+' 轮';$('k3').textContent=md.t;
+$('st').textContent=md.v===4?'float4 指令：硬件按 8 个线程一组处理（8 × 16 字节 = 128 字节 = 一轮的上限）':'标量指令：16 个线程一起处理，每人 4 字节'}
+function load(){clearInterval(tm);wf=-1;plan=build();
+document.querySelectorAll('#anim-f4w-modes button').forEach((b,k)=>{b.style.borderColor=k===m?'var(--accent)':'';b.style.color=k===m?'var(--accent)':''});
+const box=$('ins');box.innerHTML='';for(let k=0;k<M[m].ni;k++){const b=document.createElement('button');b.textContent=k;b.style.minWidth='34px';if(k===ins){b.style.borderColor='var(--accent)';b.style.color='var(--accent)'}b.onclick=()=>{ins=k;load()};box.appendChild(b)}draw()}
+M.forEach((d,i)=>{const b=document.createElement('button');b.textContent=d.n;b.onclick=()=>{m=i;ins=0;load()};$('modes').appendChild(b)});
+$('play').onclick=()=>{clearInterval(tm);wf=-1;draw();tm=setInterval(()=>{wf++;draw();if(wf>=plan.length-1)clearInterval(tm)},1000)};
+load();
+})();
+</script>
+        <ul class="plain">
+          <li><strong>As 要转置</strong>：读 a 要 As 同一列的连续 4 行，<code>As[BM][BK]</code> 里同一列每隔 8 个才一个，没法 float4。改成 <code>As[BK][BM]</code>，同一个 kk 的 128 行挨在一起。B 不用转置。</li>
+          <li>全局 A 的读法不变，只换写进 shared 的位置（写成 <code>A[ak*K + ar]</code> 就读成了 Aᵀ，结果全错）：</li>
+        </ul>
+<pre><code>__shared__ float As[BK][BM];
+As[local_j][local_i] = (ar &lt; M &amp;&amp; ak &lt; K) ? A[ar*K + ak] : 0.0f;   // 全局 A 照旧，只换 shared 里的位置
+a: float4 v = *reinterpret_cast&lt;const float4*&gt;(&amp;As[kk][q*(BM/TM)*4 + i*4]);</code></pre>
+        <p><strong>动画 · 为什么转置后能用 float4（缩小版）</strong></p>
+<p class="sr-only">缩小版演示：As 按 [BM][BK] 存放时，一个线程在某个 kk 需要的 4 个数在内存里是分散的；转置成 [BK][BM] 后这 4 个数连续，可以用一个 float4 读出。</p>
+<div class="anim" id="anim-tr-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+<button id="anim-tr-l0">原存法 As[BM][BK]</button><button id="anim-tr-l1">转置 As[BK][BM]</button>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px">
+<label style="font-size:14px;color:var(--muted)">kk</label><input type="range" min="0" max="3" step="1" value="0" id="anim-tr-kk" style="width:120px"><span id="anim-tr-kko" style="font-weight:500">0</span>
+<label style="font-size:14px;color:var(--muted)">线程 i</label><input type="range" min="0" max="3" step="1" value="1" id="anim-tr-ti" style="width:120px"><span id="anim-tr-tio" style="font-weight:500">1</span>
+<button id="anim-tr-pl">依次看 4 个线程</button>
+</div>
+<svg id="anim-tr-sv" viewBox="0 0 680 400" width="100%" role="img" aria-label="As 的逻辑形状和内存排列"></svg>
+<div id="anim-tr-res" style="font-size:15px;margin-top:4px"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-tr-',$=i=>document.getElementById(PFX+i);
+const BM=16,BK=4,sv=$('sv'),ns='http://www.w3.org/2000/svg';
+let L=0,kk=0,ti=1,tm=null;
+const TC=['#1D9E75','#378ADD','#D85A30','#7F77DD'];
+function el(t,a,x){const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;sv.appendChild(e);return e}
+function addr(r,c){return L===0?r*BK+c:c*BM+r}
+function draw(){sv.innerHTML='';const need=[0,1,2,3].map(e=>ti*4+e);
+el('text',{x:0,y:14,fill:'var(--muted)'},'A 的这一块（逻辑形状 16 行 × 4 列，缩小版）');
+const cw=34,ch=19,x0=30,y0=24;
+for(let c=0;c<BK;c++)el('text',{x:x0+c*cw+cw/2,y:y0+8,'text-anchor':'middle','font-size':11,fill:'var(--muted)'},'k'+c);
+for(let r=0;r<BM;r++){el('text',{x:x0-6,y:y0+16+r*ch+13,'text-anchor':'end','font-size':11,fill:'var(--muted)'},'r'+r);
+for(let c=0;c<BK;c++){const hit=c===kk&&need.includes(r);const own=Math.floor(r/4);
+el('rect',{x:x0+c*cw+1,y:y0+16+r*ch+1,width:cw-2,height:ch-2,rx:2,fill:hit?TC[ti]:(c===kk?'var(--code-bg)':'transparent'),stroke:'var(--line)','stroke-width':0.5});
+el('text',{x:x0+c*cw+cw/2,y:y0+16+r*ch+13,'text-anchor':'middle','font-size':10,fill:hit?'#fff':'var(--muted)'},addr(r,c))}}
+el('text',{x:x0,y:y0+16+BM*ch+16,'font-size':11,fill:'var(--muted)'},'格子里的数 = 它在内存里的位置');
+const mx=210;el('text',{x:mx,y:14,fill:'var(--muted)'},L===0?'内存里的排列（按 As[r][k] 行优先）':'内存里的排列（按 As[k][r] 行优先）');
+const mw=28,mh=26;for(let p=0;p<BM*BK;p++){const row=Math.floor(p/16),col=p%16;let r,c;if(L===0){r=Math.floor(p/BK);c=p%BK}else{c=Math.floor(p/BM);r=p%BM}
+const hit=c===kk&&need.includes(r);const x=mx+col*mw,y=28+row*(mh+30);
+el('rect',{x:x+1,y:y,width:mw-2,height:mh,rx:2,fill:hit?TC[ti]:'transparent',stroke:'var(--line)','stroke-width':0.5});
+el('text',{x:x+mw/2,y:y+11,'text-anchor':'middle','font-size':9,fill:hit?'#fff':'var(--muted)'},p);
+el('text',{x:x+mw/2,y:y+22,'text-anchor':'middle','font-size':9,fill:hit?'#fff':'var(--muted)'},'r'+r+'k'+c);
+if(col%4===0)el('line',{x1:x,y1:y-3,x2:x,y2:y+mh+3,stroke:'var(--muted)','stroke-width':0.8})}
+const ps=need.map(r=>addr(r,kk)).sort((a,b)=>a-b);const contig=ps[3]-ps[0]===3&&ps[0]%4===0;
+if(contig){const p=ps[0],row=Math.floor(p/16),col=p%16;el('rect',{x:mx+col*mw-1,y:28+row*(mh+30)-4,width:4*mw+2,height:mh+8,rx:5,fill:'none',stroke:TC[ti],'stroke-width':2});el('text',{x:mx+col*mw+2*mw,y:28+row*(mh+30)+mh+18,'text-anchor':'middle','font-size':12,fill:TC[ti],'font-weight':500},'1 个 float4')}
+el('text',{x:mx,y:28+4*(mh+30)+4,'font-size':11,fill:'var(--muted)'},'粗竖线把内存每 4 个分成一格（16 字节对齐的 float4 边界）');
+$('res').innerHTML='线程 i='+ti+' 在 kk='+kk+' 要读 r'+need[0]+'~r'+need[3]+' 这 4 个数，内存位置 '+ps.join('、')+'：'+(contig?'<span style="color:var(--good)">连续且对齐 → 1 条 float4 指令</span>':'<span style="color:var(--amber)">每隔 '+(ps[1]-ps[0])+' 个才有一个 → 只能 4 条单独读取</span>');
+['l0','l1'].forEach((id,k)=>{const b=$(id);b.style.borderColor=k===L?'var(--accent)':'';b.style.color=k===L?'var(--accent)':''})}
+$('l0').onclick=()=>{L=0;draw()};$('l1').onclick=()=>{L=1;draw()};
+const s1=$('kk'),s2=$('ti');
+s1.oninput=()=>{kk=+s1.value;$('kko').textContent=kk;draw()};
+s2.oninput=()=>{ti=+s2.value;$('tio').textContent=ti;draw()};
+$('pl').onclick=()=>{clearInterval(tm);let k=0;tm=setInterval(()=>{ti=k;s2.value=k;$('tio').textContent=k;draw();k++;if(k>3)clearInterval(tm)},900)};
+draw();
+})();
+</script>
+        <p><strong>动画 · 一个线程读 a：8 条 LDS vs 2 条 LDS.128</strong></p>
+<p class="sr-only">展示一个线程在某个 kk 从 As 读 8 个数：As[BM][BK] 存法下每个数在内存里相隔很远，要 8 条单独的读取指令；转置后可以用 2 条 float4 指令读完。</p>
+<div class="anim" id="anim-a8-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+<button id="anim-a8-m0">现在：As[128][8]，一个个读</button><button id="anim-a8-m1">转置 As[8][128] + float4</button>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px">
+<label style="font-size:14px;color:var(--muted)">线程 ty</label><input type="range" min="0" max="15" step="1" value="1" id="anim-a8-ty" style="width:140px"><span id="anim-a8-tyo" style="font-weight:500">1</span>
+<label style="font-size:14px;color:var(--muted)">kk</label><input type="range" min="0" max="7" step="1" value="0" id="anim-a8-kk" style="width:100px"><span id="anim-a8-kko" style="font-weight:500">0</span>
+<button id="anim-a8-pl">一条一条执行</button>
+</div>
+<svg id="anim-a8-sv" viewBox="-22 0 702 356" width="100%" role="img" aria-label="As 在 shared memory 中的 1024 个位置"></svg>
+<div id="anim-a8-log" style="font-family:var(--f-mono);font-size:13px;color:var(--muted);line-height:1.7;min-height:60px"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-a8-',$=i=>document.getElementById(PFX+i);
+const sv=$('sv'),ns='http://www.w3.org/2000/svg';
+let m=0,ty=1,kk=0,step=99,tm=null;
+const IC=['#1D9E75','#378ADD','#D85A30','#7F77DD','#D4537E','#BA7517','#639922','#185FA5'];
+function el(t,a,x){const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;sv.appendChild(e);return e}
+function instrs(){if(m===0){return [...Array(8).keys()].map(t=>{const r=ty+t*16;return{lab:'LDS     a['+t+'] = As['+r+']['+kk+']',rows:[r],cells:[r*8+kk]}})}
+return [0,1].map(q=>{const r0=q*64+ty*4;return{lab:'LDS.128 a['+(q*4)+'..'+(q*4+3)+'] = As['+kk+']['+r0+'..'+(r0+3)+']',rows:[r0,r0+1,r0+2,r0+3],cells:[0,1,2,3].map(e=>kk*128+r0+e)}})}
+function draw(){sv.innerHTML='';const I=instrs();const own={};I.forEach((ins,k)=>{if(k<step)ins.cells.forEach(c=>own[c]=k)});
+el('text',{x:0,y:14,fill:'var(--muted)'},'As 在 shared memory 里的 1024 个 float（每行画 64 个，粗线 = 每 4 个一个 float4 格）');
+const CW=680/64,CH=15,Y0=24;
+for(let p=0;p<1024;p++){const row=Math.floor(p/64),col=p%64;const k=own[p];
+el('rect',{x:col*CW+0.3,y:Y0+row*(CH+2),width:CW-0.6,height:CH,fill:k===undefined?'var(--code-bg)':IC[k],stroke:'none'})}
+for(let row=0;row<16;row++)for(let col=0;col<=64;col+=4)el('line',{x1:col*CW,y1:Y0+row*(CH+2)-1,x2:col*CW,y2:Y0+row*(CH+2)+CH+1,stroke:'var(--line)','stroke-width':0.5});
+for(let row=0;row<16;row+=2)el('text',{x:-2,y:Y0+row*(CH+2)+11,'text-anchor':'end','font-size':9,fill:'var(--muted)'},row*64);
+const done=Math.min(step,I.length);const Y1=Y0+16*(CH+2)+22;
+el('text',{x:0,y:Y1,fill:'var(--muted)'},m===0?'每个元素 As[r][k] 在位置 r×8 + k：相邻要读的两行相隔 16 行 = 128 个 float':'每个元素 As[k][r] 在位置 k×128 + r：同一个 kk 的连续 4 行挨在一起');
+el('text',{x:0,y:Y1+24,'font-size':16,'font-weight':500,fill:'var(--ink)'},'已执行 '+done+' / '+I.length+' 条读取指令，读到 '+I.slice(0,done).reduce((s,x)=>s+x.cells.length,0)+' / 8 个数');
+$('log').innerHTML=I.map((ins,k)=>'<div style="color:'+(k<step?IC[k]:'var(--muted)')+'">'+ins.lab+'   位置 '+ins.cells.join(',')+'</div>').join('');
+['m0','m1'].forEach((id,k)=>{const b=$(id);b.style.borderColor=k===m?'var(--accent)':'';b.style.color=k===m?'var(--accent)':''})}
+function set(){draw()}
+$('m0').onclick=()=>{m=0;step=99;draw()};$('m1').onclick=()=>{m=1;step=99;draw()};
+const s1=$('ty'),s2=$('kk');
+s1.oninput=()=>{ty=+s1.value;$('tyo').textContent=ty;step=99;draw()};
+s2.oninput=()=>{kk=+s2.value;$('kko').textContent=kk;step=99;draw()};
+$('pl').onclick=()=>{clearInterval(tm);step=0;draw();const n=instrs().length;tm=setInterval(()=>{step++;draw();if(step>=n)clearInterval(tm)},700)};
+draw();
+})();
+</script>
+        <p><strong>动画 · ⑤ 一轮 t 的完整数据流</strong>：全局 A 转置搬进 As → 全局 B 搬进 Bs → float4 读 a、b → 外积 → 写回 C。</p>
+<p class="sr-only">分步动画展示 float4 寄存器 GEMM 的完整数据流：全局 A 转置搬进 As、全局 B 搬进 Bs、一个线程用 float4 读 a 和 b、做外积、写回 C 的 64 个位置。</p>
+<div class="anim" id="anim-df-root">
+<div id="anim-df-steps" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px"></div>
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;font-size:14px;color:var(--muted)">
+<span>线程 ty</span><input type="range" id="anim-df-ty" min="0" max="15" step="1" value="1" style="width:90px"><span id="anim-df-tyo" style="color:var(--ink);font-weight:500;min-width:16px">1</span>
+<span>tx</span><input type="range" id="anim-df-tx" min="0" max="15" step="1" value="0" style="width:90px"><span id="anim-df-txo" style="color:var(--ink);font-weight:500;min-width:16px">0</span>
+<span>kk</span><input type="range" id="anim-df-kk" min="0" max="7" step="1" value="0" style="width:80px"><span id="anim-df-kko" style="color:var(--ink);font-weight:500">0</span>
+<button id="anim-df-all">播放全部</button>
+</div>
+<div id="anim-df-info" style="font-size:14px;line-height:1.6;min-height:46px;margin-bottom:4px"></div>
+<svg id="anim-df-sv" viewBox="0 0 680 486" width="100%" role="img" aria-label="GEMM 数据流"></svg>
+</div>
+<script>
+(function(){
+const PFX='anim-df-',$=i=>document.getElementById(PFX+i);
+const sv=$('sv'),ns='http://www.w3.org/2000/svg';
+const TA='#1D9E75',TB='#7F77DD',TC='#D85A30';
+let st=0,ty=1,tx=0,kk=0,batch=-1,tm=null,flash=0;
+function el(t,a,x){const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;sv.appendChild(e);return e}
+const G={A:{x:20,y:40,cw:6,ch:1.5,R:128,C:8,lab:'全局 A 的这一块（128 行 × 8）'},B:{x:200,y:40,cw:3.5,ch:6,R:8,C:128,lab:'全局 B 的这一块（8 × 128）'},Bs:{x:200,y:130,cw:3.5,ch:6,R:8,C:128,lab:'Bs[8][128]（shared）'},As:{x:200,y:220,cw:3.5,ch:6,R:8,C:128,lab:'As[8][128]（shared，转置存放）'}};
+function grid(g){el('text',{x:g.x,y:g.y-8,fill:'var(--muted)','font-size':12},g.lab);el('rect',{x:g.x,y:g.y,width:g.C*g.cw,height:g.R*g.ch,fill:'var(--code-bg)',stroke:'var(--line)','stroke-width':0.5});
+if(g.C===128)for(let c=0;c<=128;c+=16)el('line',{x1:g.x+c*g.cw,y1:g.y,x2:g.x+c*g.cw,y2:g.y+g.R*g.ch,stroke:'var(--line)','stroke-width':0.5});
+if(g.R===128)for(let r=0;r<=128;r+=16)el('line',{x1:g.x,y1:g.y+r*g.ch,x2:g.x+g.C*g.cw,y2:g.y+r*g.ch,stroke:'var(--line)','stroke-width':0.5})}
+function cell(g,r,c,col,op){el('rect',{x:g.x+c*g.cw,y:g.y+r*g.ch,width:g.cw,height:g.ch,fill:col,opacity:op===undefined?1:op})}
+function cen(g,r,c){return[g.x+(c+0.5)*g.cw,g.y+(r+0.5)*g.ch]}
+function arrow(p,q,col){el('line',{x1:p[0],y1:p[1],x2:q[0],y2:q[1],stroke:col,'stroke-width':1.2,'stroke-dasharray':'4 3'})}
+function regs(){const y=300;el('text',{x:20,y:y-8,fill:'var(--muted)','font-size':12},'寄存器 a[8]');el('text',{x:150,y:y-8,fill:'var(--muted)','font-size':12},'寄存器 b[8]');el('text',{x:280,y:y-8,fill:'var(--muted)','font-size':12},'寄存器 c[8][8]');
+for(let k=0;k<8;k++){el('rect',{x:20,y:y+k*14,width:40,height:12,rx:2,fill:st>=2?TA:'transparent',stroke:TA,'stroke-width':0.8,opacity:st>=2?0.9:1});el('rect',{x:150+k*14,y:y,width:12,height:40,rx:2,fill:st>=3?TB:'transparent',stroke:TB,'stroke-width':0.8})}
+for(let a=0;a<8;a++)for(let b=0;b<8;b++)el('rect',{x:280+b*14,y:y+a*14,width:12,height:12,rx:2,fill:st>=4?TC:'transparent',stroke:TC,'stroke-width':0.8,opacity:st===4?(0.5+0.5*((a+b+flash)%2)):1});
+for(let k=0;k<8;k++){el('text',{x:66,y:y+k*14+10,'font-size':10,fill:'var(--muted)'},'行 '+rowOf(k));}
+}
+function rowOf(t){return Math.floor(t/4)*64+ty*4+t%4}
+function colOf(t){return Math.floor(t/4)*64+tx*4+t%4}
+function cblock(){const x=470,y=292,s=1.3;el('text',{x:x,y:y-8,fill:'var(--muted)','font-size':12},'C 的这一块（128 × 128）');el('rect',{x:x,y:y,width:128*s,height:128*s,fill:'var(--code-bg)',stroke:'var(--line)','stroke-width':0.5});
+for(let v=0;v<=128;v+=64){el('line',{x1:x+v*s,y1:y,x2:x+v*s,y2:y+128*s,stroke:'var(--line)','stroke-width':0.5});el('line',{x1:x,y1:y+v*s,x2:x+128*s,y2:y+v*s,stroke:'var(--line)','stroke-width':0.5})}
+if(st>=5)for(let a=0;a<8;a++)for(let b=0;b<8;b++)el('rect',{x:x+colOf(b)*s,y:y+rowOf(a)*s,width:s,height:s,fill:TC});
+if(st>=5)el('text',{x:x,y:y+128*s+16,'font-size':11,fill:'var(--muted)'},'这个线程的 64 个元素 = 4 个 4×4 小方块');return[x+(tx*4+2)*s,y+(ty*4+2)*s]}
+const INFO=[
+'① 搬 A：256 个线程按 idx 平分 1024 个数（8 个 warp × 每人 4 次）。高亮的是当前这批 32 个线程：从全局 A 读 4 行 × 连续 8 个（合并良好），写进 As 时行列对调，只落在 4 个 bank → 写入有 8 路冲突（代价，每轮只做一次）。',
+'② 搬 B：同样平分 1024 个数。当前这批 32 个线程从全局 B 读同一行连续 32 个（完全合并），写进 Bs 连续 32 个位置 → 32 个 bank，无冲突。',
+'③ 读 a：这个线程从 As 第 kk 行取 2 个 float4：第 ty*4 ~ ty*4+3 列 和 第 64+ty*4 ~ +3 列。同一排 16 个 tx 读同一个 float4 → 广播，无冲突。',
+'④ 读 b：从 Bs 第 kk 行取 2 个 float4：第 tx*4 ~ +3 列 和 第 64+tx*4 ~ +3 列。16 个 tx 合起来覆盖连续 64 个 float，每 8 个线程一组铺满 32 个 bank → 无冲突。',
+'⑤ 外积：c[ti][tj] += a[ti] × b[tj]，64 次乘加全在寄存器里。每个 kk：4 条读 shared 指令 + 64 次乘加。8 个 kk 做完后 __syncthreads()，进入下一轮 t。',
+'⑥ 写回：所有 t 跑完后，c[ti][tj] 写到 C 的 (行(ti), 列(tj))，行列公式和 ③④ 完全一致：行 = (ti/4)*64 + ty*4 + ti%4，列 = (tj/4)*64 + tx*4 + tj%4。'];
+const NAMES=['① 搬 A','② 搬 B','③ 读 a','④ 读 b','⑤ 外积','⑥ 写回 C'];
+function draw(){sv.innerHTML='';Object.values(G).forEach(grid);
+const doneA=st>0?1024:(batch+1)*32,doneB=st>1?1024:(st===1?(batch+1)*32:0);
+const order=[];for(let p=0;p<4;p++)for(let w=0;w<8;w++)order.push([w,p]);
+function idxList(n){const out=[];for(let q=0;q<Math.min(n,32);q++){const[w,p]=order[q];for(let l=0;l<32;l++)out.push(p*256+w*32+l)}return out}
+if(st>=0){const fa=st>0?[...Array(1024).keys()]:idxList(batch+1);fa.forEach(id=>{const li=Math.floor(id/8),lj=id%8;cell(G.As,lj,li,TA,0.35)});
+if(st===0&&batch>=0){const[w,p]=order[batch];const ids=[...Array(32).keys()].map(l=>p*256+w*32+l);ids.forEach(id=>{const li=Math.floor(id/8),lj=id%8;cell(G.A,li,lj,TA);cell(G.As,lj,li,TA)});const id0=ids[0];arrow(cen(G.A,Math.floor(id0/8)+2,4),cen(G.As,4,Math.floor(id0/8)+2),TA)}}
+if(st>=1){const fb=st>1?[...Array(1024).keys()]:idxList(batch+1);fb.forEach(id=>{cell(G.Bs,Math.floor(id/128),id%128,TB,0.35)});
+if(st===1&&batch>=0){const[w,p]=order[batch];const ids=[...Array(32).keys()].map(l=>p*256+w*32+l);ids.forEach(id=>{cell(G.B,Math.floor(id/128),id%128,TB);cell(G.Bs,Math.floor(id/128),id%128,TB)});const id0=ids[0];arrow(cen(G.B,Math.floor(id0/128),id0%128+16),cen(G.Bs,Math.floor(id0/128),id0%128+16),TB)}}
+if(st>=2){for(let q=0;q<2;q++)for(let e=0;e<4;e++)cell(G.As,kk,q*64+ty*4+e,TA);el('rect',{x:G.As.x,y:G.As.y+kk*6,width:448,height:6,fill:'none',stroke:TA,'stroke-width':1});if(st===2)arrow(cen(G.As,kk,ty*4+2),[40,300],TA)}
+if(st>=3){for(let q=0;q<2;q++)for(let e=0;e<4;e++)cell(G.Bs,kk,q*64+tx*4+e,TB);el('rect',{x:G.Bs.x,y:G.Bs.y+kk*6,width:448,height:6,fill:'none',stroke:TB,'stroke-width':1});if(st===3)arrow(cen(G.Bs,kk,tx*4+2),[200,300],TB)}
+regs();const cp=cblock();if(st===5)arrow([336,356],cp,TC);
+el('text',{x:200,y:G.As.y+60,'font-size':11,fill:'var(--muted)'},'竖线每 16 列一条；淡色 = 已经搬进 shared 的数据');
+$('info').textContent=INFO[st]+(st<=1&&batch>=0?'（第 '+(batch+1)+' / 32 批）':'');
+document.querySelectorAll('#anim-df-steps button').forEach((b,k)=>{b.style.borderColor=k===st?'var(--accent)':'';b.style.color=k===st?'var(--accent)':''})}
+function go(s,cb){clearInterval(tm);st=s;batch=-1;if(s<=1){tm=setInterval(()=>{batch++;draw();if(batch>=31){clearInterval(tm);cb&&cb()}},90)}else if(s===4){let n=0;tm=setInterval(()=>{flash++;draw();if(++n>5){clearInterval(tm);cb&&cb()}},250)}else{draw();cb&&setTimeout(cb,1400)}}
+NAMES.forEach((n,k)=>{const b=document.createElement('button');b.textContent=n;b.onclick=()=>go(k);$('steps').appendChild(b)});
+$('all').onclick=()=>{const chain=k=>{if(k>5)return;go(k,()=>setTimeout(()=>chain(k+1),500))};chain(0)};
+[['ty','tyo'],['tx','txo'],['kk','kko']].forEach(([id,o])=>{const s=$(id);s.oninput=()=>{if(id==='ty')ty=+s.value;if(id==='tx')tx=+s.value;if(id==='kk')kk=+s.value;$(o).textContent=s.value;if(st<2)st=5,batch=31;draw()}});
+st=5;batch=31;draw();
+})();
+</script>
+        <div class="note">SASS 确认读 a、读 b 各 2 条 <code>LDS.128</code>，指令从 16 条降到 4 条，<strong>速度却慢了 15%</strong>。</div>
+      </div>
+
+      <div class="blk" id="m11-s16"><h3>为什么变慢：ncu 和 SASS</h3>
+        <ul class="plain">
+          <li><strong>占用率 33%</strong>：119 个寄存器 × 256 线程，每个 SM 只放得下 2 个 block = 16 个 warp（上限 48），可轮换的 warp 少，延迟藏不住。</li>
+          <li><strong>warp 在等</strong>：每发一条指令平均间隔从 6.21 周期（④）变成 7.75（⑤）。指令少了，但每个 warp 等得更久。L1 吞吐 43～48%、L2 17%：不是带宽不够，是延迟藏不住。</li>
+        </ul>
+        <div class="tablewrap"><table>
+          <thead><tr><th>stall 原因（⑤）</th><th class="num">周期</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td>long_scoreboard</td><td class="num"><strong>1.81</strong></td><td>等全局内存</td></tr>
+            <tr><td>short_scoreboard</td><td class="num"><strong>1.50</strong></td><td>等 shared memory</td></tr>
+            <tr><td>math_pipe_throttle</td><td class="num">0.14</td><td>计算单元忙不过来：很小，离算力上限还远</td></tr>
+          </tbody>
+        </table></div>
+        <ol class="plain">
+          <li><strong>转置写 As 有 8 路冲突</strong>：一个 warp 写 8 行 × 4 列，As 每行 128 个 float，每行起点都在 bank 0 → 只用 4 个 bank。</li>
+          <li><strong>kk 循环没展开</strong>：SASS 里只有 64 条 FFMA、4 条 <code>LDS.128</code>（一次 kk 的量），每次 kk 都是"读 → 等 → 算"串行。</li>
+        </ol>
+        <div class="note good"><strong>瓶颈会转移</strong>：float4 确实减少了指令，但那时指令数已经不是瓶颈。先用 ncu 的 stall 找最大的一项，再改。</div>
+      </div>
+
+      <div class="blk" id="m11-s17"><h3>⑥ padding + 展开 kk（2366，cuBLAS 的 70%）</h3>
+        <p><strong>padding</strong>：<code>As[BK][BM+4]</code>，每行起点错开 4 个 bank。</p>
+<pre><code>写 As 时 bank = (local_j × 132 + local_i) % 32 = (local_j × 4 + local_i) % 32
+local_j = 0..7，local_i = 0..3 → 正好 0..31，32 个不同的 bank</code></pre>
+        <ul class="plain">
+          <li><strong>+4 不是 +1</strong>：+1 会让行起点不是 4 的倍数，float4 不对齐。代价只有 32 个 float。</li>
+          <li>Bs 不需要：只有写 As 时一个 warp 跨了 8 行。</li>
+        </ul>
+        <p><strong>动画 · 写 As 的 bank 分布</strong>：切换不加 / +1 / +4。</p>
+<p class="sr-only">动画：一个 warp 的 32 个线程把全局 A 转置写进 As[8][128] 时落在哪些 bank；切换不加 padding、加 1、加 4 三种行宽对比冲突。</p>
+<div class="anim" id="anim-pd-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+<button id="anim-pd-b0">As[8][128]（不加）</button>
+<button id="anim-pd-b1">As[8][129]（+1）</button>
+<button id="anim-pd-b4">As[8][132]（+4）</button>
+</div>
+<div style="font-family:var(--f-mono);font-size:13px;color:var(--muted);margin-bottom:6px" id="anim-pd-f"></div>
+<svg id="anim-pd-sv" viewBox="0 0 680 330" width="100%" role="img" aria-label="写 As 时的 bank 分布"></svg>
+<div id="anim-pd-res" style="font-size:15px;margin-top:4px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-pd-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');
+let pad=0;
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function draw(){sv.innerHTML='';const LW=128+pad,X0=70,CW=36,RH=22,Y0=30;
+$('f').textContent='线程 t 写 As[t%8][t/8]，地址 = (t%8)·'+LW+' + t/8，bank = 地址 % 32';
+el('text',{x:4,y:20,fill:'var(--muted)','font-size':12},'As 的 8 行（只画每行前 4 列；格子里是 bank 号，粗框 = 本 warp 写的位置）');
+const banks={};
+for(let r=0;r<8;r++){el('text',{x:4,y:Y0+r*RH+16,fill:'var(--muted)','font-size':12},'行 '+r);
+ el('text',{x:X0+4*CW+12,y:Y0+r*RH+16,fill:'var(--muted)','font-size':11},'行起点 = '+r*LW+(r*LW%4?'（不是 4 的倍数 → float4 不对齐）':''));
+ for(let c=0;c<4;c++){const a=r*LW+c,b=a%32;(banks[b]=banks[b]||[]).push(r*4+c);
+  el('rect',{x:X0+c*CW+1,y:Y0+r*RH+1,width:CW-2,height:RH-2,rx:3,fill:'var(--accent-soft)',stroke:'var(--accent)','stroke-width':1.5});
+  el('text',{x:X0+c*CW+CW/2,y:Y0+r*RH+15,'text-anchor':'middle','font-size':11,fill:'var(--ink)'},'b'+b)}}
+const BY=Y0+8*RH+44,BW=(680-70)/32;
+el('text',{x:4,y:BY-12,fill:'var(--muted)','font-size':12},'32 个 bank：这条写指令里每个 bank 被几个线程占用');
+for(let b=0;b<32;b++){const n=(banks[b]||[]).length,x=70+b*BW;
+ el('rect',{x:x+1,y:BY,width:BW-2,height:18,rx:2,fill:n===0?'transparent':(n>1?'var(--amber-soft)':'var(--good-soft)'),stroke:n>1?'var(--amber)':'var(--line)','stroke-width':n>1?1.5:0.5});
+ el('text',{x:x+BW/2,y:BY+13,'text-anchor':'middle','font-size':9,fill:'var(--muted)'},b);
+ if(n)el('text',{x:x+BW/2,y:BY+34,'text-anchor':'middle','font-size':10,'font-weight':500,fill:n>1?'var(--amber)':'var(--good)'},'×'+n)}
+const used=Object.keys(banks).length,R=Math.max(...Object.values(banks).map(v=>v.length));
+let msg=R>1?'<span style="color:var(--amber)">32 个线程只用到 '+used+' 个 bank，最多挤 '+R+' 个 → '+R+' 路冲突</span>':'<span style="color:var(--good)">32 个线程落在 32 个不同的 bank → 无冲突</span>';
+if(pad===0)msg+='<br>128 % 32 = 0：每一行的起点都在 bank 0，8 行叠在同样 4 个 bank 上。';
+if(pad===1)msg+='<br>+1 能把行错开，但还有冲突；而且行起点 129、258… 不是 4 的倍数，<strong>float4 读 a 会不对齐</strong>，不能用。';
+if(pad===4)msg+='<br>132 % 32 = 4：每行起点错开 4 个 bank，8 行 × 4 列正好铺满 0～31；行起点都是 4 的倍数，float4 照样对齐。代价只有 8×4 = 32 个 float。';
+$('res').innerHTML=msg;
+for(const [id,v] of [['b0',0],['b1',1],['b4',4]]){$(id).style.borderColor=pad===v?'var(--accent)':'';$(id).style.color=pad===v?'var(--accent)':''}}
+$('b0').onclick=()=>{pad=0;draw()};$('b1').onclick=()=>{pad=1;draw()};$('b4').onclick=()=>{pad=4;draw()};
+draw();
+})();
+</script>
+        <p><strong>展开 kk</strong>：<code>#pragma unroll</code> 放在 kk 循环上（次数 BK = 8 是编译期常量），不是外层 t 循环。</p>
+<pre><code>#pragma unroll
+for (int kk = 0; kk &lt; BK; ++kk) {
+    ...   // 读 a、b 各 2 个 float4，做 8×8 外积
+}</code></pre>
+        <ul class="plain">
+          <li>展开后 SASS 是 512 条 FFMA、32 条 <code>LDS.128</code>（8 次 kk），寄存器 119 → 127，无溢出。</li>
+          <li>编译器把下一次 kk 的 LDS 提前到这一次的乘加旁边，读和算重叠；硬件 scoreboard 保证用到数据前会等它到。</li>
+        </ul>
+        <p><strong>动画 · 展开前后的时间线（示意）</strong></p>
+<p class="sr-only">示意动画：kk 循环不展开时每次 kk 都是读 shared、等数据、做 64 次乘加严格串行；展开后下一次 kk 的读取提前发出，等待被计算盖住。</p>
+<div class="anim" id="anim-ur-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center">
+<button id="anim-ur-play">播放</button>
+<button id="anim-ur-reset">重来</button>
+<span style="font-size:13px;color:var(--muted)">示意图，长度不按实际周期比例</span>
+</div>
+<svg id="anim-ur-sv" viewBox="0 0 680 250" width="100%" role="img" aria-label="展开前后时间线"></svg>
+<div id="anim-ur-res" style="font-size:14px;margin-top:4px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-ur-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');
+const L=1,W=5,F=6,K=4,X0=96,U=(680-X0-8)/(K*(L+W+F));
+let tnow=0,tm=null;
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function bars(y,list,label,total){el('text',{x:4,y:y+15,fill:'var(--ink)','font-size':12,'font-weight':500},label);
+ for(const b of list){if(b.s>=tnow)continue;const w=Math.min(b.d,tnow-b.s);
+  el('rect',{x:X0+b.s*U,y:y+(b.row||0)*22,width:Math.max(w*U-1,0),height:18,rx:2,fill:b.c,stroke:'var(--line)','stroke-width':0.5});
+  if(w===b.d&&b.d*U>22)el('text',{x:X0+(b.s+b.d/2)*U,y:y+(b.row||0)*22+13,'text-anchor':'middle','font-size':10,fill:'var(--ink)'},b.t)}
+ el('text',{x:X0+total*U+4>650?650:X0+total*U+4,y:y+56,'font-size':11,fill:'var(--muted)','text-anchor':X0+total*U+4>650?'end':'start'},tnow>=total?'用时 '+total+' 格':'')}
+function draw(){sv.innerHTML='';
+const A=[];let t=0;for(let k=0;k<K;k++){A.push({s:t,d:L,c:'var(--accent)',t:'LDS'});A.push({s:t+L,d:W,c:'var(--amber-soft)',t:'等数据'});A.push({s:t+L+W,d:F,c:'var(--good-soft)',t:'FFMA×64'});t+=L+W+F}
+const TA=t;
+const B=[];B.push({s:0,d:L,c:'var(--accent)',t:'LDS'});B.push({s:L,d:W,c:'var(--amber-soft)',t:'等数据'});let s=L+W;
+for(let k=0;k<K;k++){B.push({s:s,d:F,c:'var(--good-soft)',t:'FFMA×64'});if(k<K-1)B.push({s:s,d:L,c:'var(--accent)',t:'LDS',row:1});s+=F}
+const TB=s;
+el('text',{x:4,y:16,fill:'var(--muted)','font-size':12},'一个 warp 的时间线（只画前 4 次 kk；展开后第二行是提前发出的下一次读取）');
+bars(34,A,'不展开',TA);bars(130,B,'展开 kk',TB);
+el('line',{x1:X0+tnow*U,y1:28,x2:X0+tnow*U,y2:228,stroke:'var(--muted)','stroke-width':1,'stroke-dasharray':'3 3'});
+$('res').innerHTML='<strong>不展开</strong>：编译器只看到一次 kk，"读 → 等 → 算"严格串行，每次 kk 都白等一段（ncu 里的 short_scoreboard）。<br><strong>展开</strong>：编译器看得到全部 8 次 kk，把下一次的 LDS 提前到这一次的 64 次乘加旁边发出，等待被计算盖住。代价是多用一组寄存器放提前读到的数（119 → 127 个）。<br><span style="color:var(--muted)">kk 的次数 BK = 8 是编译期常量才能完全展开；外层 t 循环次数是运行时的 K / BK，展开不了。</span>'}
+function stop(){clearInterval(tm);tm=null}
+$('reset').onclick=()=>{stop();tnow=0;draw()};
+$('play').onclick=()=>{stop();tnow=0;draw();tm=setInterval(()=>{tnow+=1;draw();if(tnow>=K*(L+W+F))stop()},90)};
+tnow=K*(L+W+F);draw();
+})();
+</script>
+        <div class="tablewrap"><table>
+          <thead><tr><th>4096³</th><th class="num">GFLOPS</th></tr></thead>
+          <tbody>
+            <tr><td>⑤ float4</td><td class="num">1790</td></tr>
+            <tr><td>+ padding</td><td class="num">1982</td></tr>
+            <tr><td>+ 展开</td><td class="num">2270</td></tr>
+            <tr><td><strong>+ padding + 展开</strong></td><td class="num win">2366</td></tr>
+          </tbody>
+        </table></div>
+        <div class="note good"><strong>和 RMSNorm 的区别</strong>：RMSNorm 每个数只用一次，是带宽瓶颈（接入 PyTorch 后在 rows=4096、n=8192 的大形状上做到 192 GB/s，即 204.8 GB/s 的 94%；own_reg 在 rows=512、n=4096 是约 153 GB/s），靠合并访存、向量化、展开；GEMM 数据被反复用，是算力瓶颈，靠分块复用。相通的是最后都落到"不让硬件干等"。</div>
+      </div>
+
+      <div class="blk" id="m11-s19"><h3>⑦ double buffering：边算这一块，边读下一块（2895，cuBLAS 的 85%）</h3>
+        <ul class="plain">
+          <li><strong>瓶颈</strong>：⑥ 之后最大的停顿是 long_scoreboard（1.81），也就是等全局内存。出在搬数据那一行：<code>As[..] = A[..]</code> 先 LDG 读全局，紧接着 STS 写 shared，读完立刻就用，只能干等。搬数据时 block 里所有 warp 都在搬，没有计算可以填进来。</li>
+          <li><strong>关键事实</strong>：GPU 读全局内存不阻塞，LDG 发出后接着执行下一条，<strong>用到那个寄存器时</strong>才等。所以把"读下一块"提前到"算这一块"之前，读的延迟就被计算盖住了。</li>
+          <li><strong>为什么要两份 shared</strong>：算这一块时别的线程还在读 As，不能覆盖。As、Bs 各开两份，一份在算，一份接收下一块，每轮交换。</li>
+        </ul>
+<pre><code>准备：第 0 块 → As[0]、Bs[0]；__syncthreads();
+cur = 0
+for t:
+    ① if (还有下一块)  ra[4]、rb[4] ← 全局读下一块      // 只发 LDG，不等结果
+    ② 用 As[cur]、Bs[cur] 做 8 个 kk 的计算             // 512 条 FFMA，盖住 ① 的延迟
+    ③ cur ^= 1;  if (还有下一块)  As[cur]、Bs[cur] ← ra、rb
+    ④ __syncthreads();                                  // 每轮 1 次（原来 2 次）</code></pre>
+        <p><strong>动画 · 有没有 double buffering 的时间线（示意）</strong>：</p>
+<p class="sr-only">示意动画：GEMM 沿 K 的 4 轮循环。不用双缓冲时每轮先读全局、等数据、写 shared、同步、再计算；用双缓冲时下一块的读取和这一块的计算同时进行，两份 shared 轮流使用。</p>
+<div class="anim" id="anim-db-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+<button id="anim-db-m0">⑥ 单份 shared</button><button id="anim-db-m1">⑦ double buffering</button>
+<span style="flex:1"></span><button id="anim-db-play">播放</button>
+</div>
+<svg id="anim-db-sv" viewBox="0 0 680 210" width="100%" role="img" aria-label="double buffering 时间线"></svg>
+<div id="anim-db-res" style="font-size:14px;margin-top:4px;line-height:1.7"></div>
+<div class="small muted">示意图：只画 4 块（K = 32、BK = 8），长度不按实际周期比例。</div>
+</div>
+<script>
+(function(){
+const PFX='anim-db-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');const L=1,W=6,S=1,C=7,B=1,X0=130,U=6.2;let db=true,tnow=999,tm=null;
+const ROW={ldg:0,wait:1,sts:2,calc:3};const NAMES=['发读请求 LDG','等全局数据','写 shared STS','计算 FFMA×512'];
+function el(t,a,v){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(v!==undefined)e.textContent=v;sv.appendChild(e);return e}
+function plan(){const ev=[];let t=0;
+ if(!db){for(let k=0;k<4;k++){ev.push({r:'ldg',s:t,d:L,t:'块'+k},{r:'wait',s:t+L,d:W,t:'等'},{r:'sts',s:t+L+W,d:S,t:'→As'},{r:'calc',s:t+L+W+S+B,d:C,t:'算块'+k});t+=L+W+S+B+C+B}return {ev,end:t}}
+ ev.push({r:'ldg',s:0,d:L,t:'块0'},{r:'wait',s:L,d:W,t:'等'},{r:'sts',s:L+W,d:S,t:'→buf0'});t=L+W+S+B;
+ for(let k=0;k<4;k++){if(k<3){ev.push({r:'ldg',s:t,d:L,t:'块'+(k+1)},{r:'wait',s:t+L,d:W-1,t:'被计算盖住',hid:true})}
+  ev.push({r:'calc',s:t,d:C,t:'算块'+k+'(buf'+(k%2)+')'});t+=C;if(k<3){ev.push({r:'sts',s:t,d:S,t:'→buf'+((k+1)%2)});t+=S}t+=B}
+ return {ev,end:t}}
+function draw(){sv.innerHTML='';const p=plan();
+ NAMES.forEach((n,i)=>el('text',{x:4,y:38+i*36,fill:i===3?'var(--ink)':'var(--muted)','font-size':12},n));
+ const col={ldg:'var(--accent)',wait:'var(--amber-soft)',sts:'var(--accent-soft)',calc:'var(--good-soft)'};
+ p.ev.forEach(e=>{if(e.s>=tnow)return;const w=Math.min(e.d,tnow-e.s);el('rect',{x:X0+e.s*U,y:24+ROW[e.r]*36,width:Math.max(w*U-1,0),height:22,rx:3,fill:e.hid?'transparent':col[e.r],stroke:e.hid?'var(--amber)':'var(--line)','stroke-dasharray':e.hid?'3 3':'','stroke-width':e.hid?1:0.5});
+  if(w===e.d&&e.d*U>30)el('text',{x:X0+(e.s+e.d/2)*U,y:39+ROW[e.r]*36,'text-anchor':'middle','font-size':10,fill:'var(--ink)'},e.t)});
+ if(tnow>=p.end)el('text',{x:Math.min(X0+p.end*U+6,600),y:195,'font-size':12,fill:'var(--muted)'},'用时 '+p.end+' 格');
+ $('res').innerHTML=db?'<strong>⑦</strong>：第 t 轮先发下一块的 LDG（结果先放寄存器 ra、rb），紧接着算这一块；算完再把 ra、rb 写进另一份 shared。读的等待被 512 条 FFMA 盖住（虚线框），每轮只同步 1 次。ncu：long_scoreboard 1.81 → 0.02。':
+  '<strong>⑥</strong>：每一轮都是"读 → 等 → 写 shared → 同步 → 算 → 同步"，读的时候 block 里所有 warp 都在搬，没有计算可以填进来，只能干等（ncu 里的 long_scoreboard）。';
+ $('m0').style.borderColor=db?'':'var(--accent)';$('m1').style.borderColor=db?'var(--accent)':''}
+function stop(){clearInterval(tm);tm=null}
+$('m0').onclick=()=>{stop();db=false;tnow=999;draw()};$('m1').onclick=()=>{stop();db=true;tnow=999;draw()};
+$('play').onclick=()=>{stop();tnow=0;draw();tm=setInterval(()=>{tnow++;draw();if(tnow>=plan().end)stop()},90)};
+draw();
+})();
+</script>
+        <div class="tablewrap"><table>
+          <thead><tr><th></th><th>在哪</th><th>存什么</th></tr></thead>
+          <tbody>
+            <tr><td><code>ra[4]</code>、<code>rb[4]</code></td><td>寄存器（每线程私有）</td><td>下一块里自己负责搬的 4 + 4 个数（1024 个 ÷ 256 线程）</td></tr>
+            <tr><td><code>As[2]</code>、<code>Bs[2]</code></td><td>shared memory</td><td>两份轮流：一份在算，一份接收下一块</td></tr>
+            <tr><td><code>a[8]</code>、<code>b[8]</code></td><td>寄存器</td><td>这一块某个 kk 的数据；和 ra、rb 生命周期重叠，不能共用</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li><strong>③ 必须在计算之后</strong>：放在计算前，STS 要等 LDG 的数据，又退回干等。</li>
+          <li><strong>每轮只要同步一次</strong>：被写的那份 buffer 上一轮算完后已经同步过，不会有人还在读。</li>
+          <li><strong>藏的是"全局 → shared"这一段</strong>，搬运量一点没少。普通指令不能全局直接拷进 shared，必须经过寄存器；Ampere 起的 <code>cp.async</code> 可以直拷（没做）。</li>
+        </ul>
+        <div class="note"><strong>易错</strong>：ra / rb 的循环上限和下标要是编译期常量（<code>constexpr int LA = BM*BK / NT</code>，<code>#pragma unroll</code>）。用运行时的 <code>num_threads</code> 当步长时下标不固定，数组掉进 local memory（物理上在 DRAM），读写它也算 long_scoreboard，和目的正好相反。</div>
+        <div class="tablewrap"><table>
+          <thead><tr><th>尺寸</th><th class="num">⑥</th><th class="num">⑦</th><th class="num">占 cuBLAS</th></tr></thead>
+          <tbody>
+            <tr><td>1024³</td><td class="num">2241</td><td class="num win">2756</td><td class="num">70% → 87%</td></tr>
+            <tr><td>2048³</td><td class="num">2136</td><td class="num win">2840</td><td class="num">63% → 83%</td></tr>
+            <tr><td>4096³</td><td class="num">2382</td><td class="num win">2895</td><td class="num">70% → 85%</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li><code>-Xptxas=-v</code>：149 个寄存器、0 stack frame、0 spill；shared 16.6 KB（翻倍）。</li>
+          <li>寄存器超过 128，每 SM 只放得下 1 个 block，占用率 33% → 16.67%，<strong>却快了 22%</strong>：延迟在一个线程内部被计算盖住，不再靠多放 warp 轮换。</li>
+        </ul>
+        <div class="tablewrap"><table>
+          <thead><tr><th>ncu 停顿（每条指令平均周期）</th><th class="num">⑤</th><th class="num">⑦</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td><strong>long_scoreboard</strong>（等全局内存）</td><td class="num">1.81</td><td class="num win">0.02</td><td>这次针对的就是它</td></tr>
+            <tr><td>short_scoreboard（等 shared）</td><td class="num">1.50</td><td class="num">0.39</td><td>展开 kk 和少同步都有贡献</td></tr>
+            <tr><td>not_selected</td><td class="num">1.49</td><td class="num">0.65</td><td>准备好了只是没轮到，不是问题</td></tr>
+            <tr><td>barrier</td><td class="num">0.54</td><td class="num">0.12</td><td>每轮同步 2 次 → 1 次</td></tr>
+            <tr><td>Warp Cycles Per Issued Instruction</td><td class="num">7.75</td><td class="num">2.93</td><td>warp 数不同，总数只作参考</td></tr>
+          </tbody>
+        </table></div>
+        <div class="note good"><strong>验证时看你针对的那一项</strong>：改的是全局读取的等待，就看 long_scoreboard 有没有降。</div>
+      </div>
+
+      <div class="blk" id="m11-s20"><h3>怎么读 ncu：时间账单、占用率、stack frame 和 spill</h3>
+        <p><strong>核心只有一个概念</strong>：一个 SM 里有 4 个调度器，每个调度器管几个 warp，每个周期从"准备好了"的 warp 里挑一个发一条指令。于是任何一个周期，每个 warp 都正好处在一种状态：<strong>selected</strong>（正在发指令，唯一在干活的状态）、<strong>not_selected</strong>（准备好了，但这拍选了别人）、或某种 <strong>stalled</strong>（在等某样东西，等什么就记成什么）。Warp State Statistics 统计的就是 warp 的时间花在了哪种状态上。</p>
+        <p><strong>单位</strong>：<code>…_per_issue_active.ratio</code> = 平均每发射一条指令，warp 在这个状态上花了几个周期。各项加起来就是 Warp Cycles Per Issued Instruction，可以当成一张<strong>时间账单</strong>：</p>
+<pre><code>selected 1.00 + not_selected 0.65 + wait 0.40 + short 0.39 + barrier 0.12
++ math 0.04 + long 0.02 + mio 0.01 + 没抓的小项约 0.3 ≈ 2.93</code></pre>
+        <p>哪一项最大，就先解决哪一项。</p>
+        <p><strong>调度器有多闲</strong>：每个调度器管 W 个 warp，当每个 warp 平均每 W 个周期发一条指令时，调度器刚好每个周期都有活干。所以 <strong>调度器忙碌程度 ≈ W ÷ cycles/指令</strong>。换算链：block 数/SM × 每 block 的 warp 数 = warp 数/SM，再 ÷ 4 = W。注意 W 数的是 warp 不是 block：1 个 block = 256 线程 = 8 个 warp，按编号轮流分给 4 个调度器，每个 2 个。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>版本</th><th class="num">每 SM warp 数</th><th class="num">每调度器 W</th><th class="num">cycles/指令</th><th class="num">调度器忙碌</th></tr></thead>
+          <tbody>
+            <tr><td>④ 交错版 f0b5cd5</td><td class="num">16</td><td class="num">4</td><td class="num">6.21</td><td class="num">64%</td></tr>
+            <tr><td>⑤ float4 版</td><td class="num">16</td><td class="num">4</td><td class="num">7.75</td><td class="num">52%</td></tr>
+            <tr><td>⑦ 双缓冲版</td><td class="num">8</td><td class="num">2</td><td class="num">2.93</td><td class="num">68%</td></tr>
+          </tbody>
+        </table></div>
+        <p>这个顺序和实测速度的顺序一致。它是粗略估计（一条 <code>LDS.128</code> 和一条 <code>LDS</code> 干的活不一样），用来判断方向够了。也说明<strong>占用率和停顿要一起看</strong>：warp 多可以藏延迟，单个 warp 等得少也可以。</p>
+        <p><strong>常见停顿原因对照</strong>：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>停顿</th><th>在等什么</th><th>我们代码里对应</th><th>常见解决办法</th></tr></thead>
+          <tbody>
+            <tr><td>not_selected</td><td>不等，只是没轮到</td><td>⑦ 里 0.65</td><td>不是问题，说明 warp 够用</td></tr>
+            <tr><td>long_scoreboard</td><td>全局内存（也包括 local memory）</td><td>搬 A、B：LDG → STS</td><td>合并访存、预取（double buffering）、多放 warp；也要查有没有数组掉进 local memory</td></tr>
+            <tr><td>short_scoreboard</td><td>shared memory，以及 sin / exp 这类特殊运算</td><td>读 As、Bs：LDS → FFMA</td><td>消除 bank conflict、寄存器级预取</td></tr>
+            <tr><td>wait</td><td>固定延迟的依赖</td><td>FFMA 接 FFMA</td><td>让相邻指令互不依赖、多放 warp</td></tr>
+            <tr><td>barrier</td><td><code>__syncthreads()</code>，等最慢的线程</td><td>每轮的同步</td><td>减少同步次数、让工作量均匀</td></tr>
+            <tr><td>math_pipe_throttle</td><td>计算单元满了</td><td>一直很低</td><td>高了说明接近算力上限，是"好的瓶颈"</td></tr>
+            <tr><td>mio_throttle</td><td>shared memory 指令太多，队列排满</td><td>0.01</td><td>向量化（<code>LDS.128</code>）减少指令数</td></tr>
+            <tr><td>lg_throttle</td><td>全局内存指令太多，队列排满</td><td>没测</td><td>全局读写用 float4</td></tr>
+            <tr><td>no_instruction</td><td>指令缓存没命中</td><td>—</td><td>代码展开得太大时会出现</td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>拿到 ncu 输出后的顺序</strong>：</p>
+        <ol class="plain">
+          <li><strong>SpeedOfLight</strong>：计算、内存各用了百分之多少。计算高 → 算力瓶颈；内存高 → 带宽瓶颈；<strong>两个都不高 → 延迟瓶颈</strong>（我们的 GEMM 一直是这种），才往下看。</li>
+          <li><strong>Occupancy</strong>：每个 SM 有几个 warp，被什么限制住。</li>
+          <li><strong>Warp State Statistics</strong>：时间账单里哪一项最大。</li>
+          <li><strong>定位到代码</strong>：最大那项对应哪段代码，需要时用 SASS 或 bank conflict 指标确认。</li>
+          <li><strong>改一处，重测，只看针对的那一项有没有降。</strong></li>
+        </ol>
+        <p>RMSNorm 当时为什么没走到第 2、3 步：它在第 1 步就有答案（带宽瓶颈，看有效带宽和每次请求的扇区数）。带宽到顶之后 long_scoreboard 占大头是正常的，这时只能少搬数据（比如融合），调 warp 没用。不过 RMSNorm 也用过一次停顿分析：查"n 除不尽为什么变慢"时，是靠 barrier 停顿涨了 7 倍和每 warp 活跃线程数 31.6 → 27.7 找到原因的。</p>
+        <p><strong>占用率：四个限制取最小</strong>。一个 SM 同时有几种资源，哪种先用完就卡在哪。ncu 的 Occupancy 段把四项都列出来（Orin 每 SM 的数字；A100 是每 SM 64 个 warp，算占用率前先查清是哪种卡）：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>限制</th><th>硬件上限（Orin 每 SM）</th><th>能放几个 block</th><th class="num">⑦ 的值</th></tr></thead>
+          <tbody>
+            <tr><td>Block Limit Warps（warp 槽位：硬件要为每个 warp 记住 PC 和状态）</td><td>48 个 warp = 1536 线程，每调度器最多 12 个</td><td>48 ÷ 每 block 的 warp 数</td><td class="num">48 ÷ 8 = 6</td></tr>
+            <tr><td>Block Limit Registers</td><td>65536 个</td><td>65536 ÷（每线程寄存器 × 每 block 线程数）</td><td class="num">1</td></tr>
+            <tr><td>Block Limit Shared Mem</td><td>驱动分配的配额</td><td>配额 ÷ 每 block 用量</td><td class="num">1</td></tr>
+            <tr><td>Block Limit SM（block 槽位）</td><td>16 个 block</td><td>固定</td><td class="num">16</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li>实际能放的 block 数 = 四个里最小的 = 1 → 8 个 warp → 8 ÷ 48 = 16.67%（实测 16.66%）。</li>
+          <li><strong>"128 这条线"</strong>：要放 2 个 block，每个 block 最多 32768 个寄存器，每线程不超过 128 个。149 × 256 = 38144 &gt; 32768，所以只能放 1 个。（另一种说法：寄存器按 warp 分配、每线程用量向上取整到 8 的倍数，149 算成 152；这一点没查文档。）</li>
+          <li>反例：每线程只用 32 个寄存器、几乎不用 shared 时，寄存器够放 8 个 block，但 warp 槽位只够 6 个，占用率 100%，卡在 warp 槽位上。</li>
+          <li><strong>Shared Mem 这一行也是 1，和预期不一样</strong>：每 block 只用 16.6 KB。推测：L1 和 shared memory 共用一块存储，驱动自动选了较小的 shared 配额，可以用 <code>cudaFuncSetAttribute(…, cudaFuncAttributePreferredSharedMemoryCarveout, …)</code> 调大。<strong>待验证</strong>。所以想回到每 SM 2 个 block，寄存器和 shared memory 两个限制要同时解决。</li>
+        </ul>
+        <p><strong>local memory、stack frame、spill</strong>。线程的私有变量（<code>c[8][8]</code>、<code>a[8]</code>、<code>ra[4]</code>）最好都在寄存器里。寄存器有两个限制：数量有限（Ampere 每线程最多 255 个，用得越多能同时放的 warp 越少）；不能按运行时下标取（指令里必须直接写"用 R5"）。放不进寄存器的私有变量只能放 <strong>local memory</strong>：名字叫 local 是因为每个线程私有，但它物理上在 DRAM 里（经过 L1 / L2），用 <code>STL</code> / <code>LDL</code> 读写，延迟和全局内存差不多，等待也记在 long_scoreboard 上。</p>
+        <ul class="plain">
+          <li><strong>stack frame</strong>：编译器给每个线程在 local memory 里划出的空间大小。<code>48 bytes stack frame</code> = 每线程 48 字节 = 12 个 float。最常见的原因是下标不固定的数组。</li>
+          <li><strong>spill</strong>：寄存器不够用，编译器把一部分变量临时存到 local memory（spill store，STL），要用时再读回来（spill load，LDL）。常见原因：变量真的太多（<code>c[16][16]</code> 就要 256 个）；或者用 <code>__launch_bounds__(256, 2)</code> 强制压寄存器。</li>
+        </ul>
+        <div class="tablewrap"><table>
+          <thead><tr><th><code>-Xptxas=-v</code> 看到的</th><th>意思</th><th>典型原因</th></tr></thead>
+          <tbody>
+            <tr><td>stack frame、spill stores、spill loads 都是 0</td><td>全部在寄存器里</td><td>⑦ 双缓冲版</td></tr>
+            <tr><td>stack frame &gt; 0，spill = 0</td><td>有数组在 local memory，但不是因为寄存器不够</td><td>数组下标不是常量（如 ra、rb 用运行时下标）</td></tr>
+            <tr><td>spill &gt; 0</td><td>寄存器不够，被挤出去（stack frame 也跟着 &gt; 0）</td><td>变量太多，或用 <code>__launch_bounds__</code> 压了寄存器</td></tr>
+          </tbody>
+        </table></div>
+<pre><code>nvcc -O3 -arch=sm_87 -Xptxas=-v ...                          # 编译时看那一行
+cuobjdump -sass build-orin/gemm_bench | grep -cE "LDL|STL"   # 0 就说明完全没碰 local memory</code></pre>
+        <p>少量 spill 有时可以接受（只发生在循环外，或者 L1 能命中），出现时要实测，不能光看数字下结论。所以 long_scoreboard 高时，除了全局读取，还要查是不是有数组掉进了 local memory。</p>
+      </div>
+
+      <div class="blk" id="m11-s21"><h3>RMSNorm 和 GEMM 对照</h3>
+        <div class="tablewrap"><table>
+          <thead><tr><th></th><th>RMSNorm</th><th>GEMM</th></tr></thead>
+          <tbody>
+            <tr><td>做什么</td><td>每行求平方和 → 开方 → 每个数乘系数</td><td>C = A × B</td></tr>
+            <tr><td>每个数被用几次</td><td>1 次</td><td>很多次（一个 A 元素参与一整行 C）</td></tr>
+            <tr><td>计算强度</td><td>约 0.5 FLOP/字节</td><td>几百 FLOP/字节</td></tr>
+            <tr><td>和 Orin 拐点（约 26）比</td><td>远低于 → 带宽瓶颈</td><td>远高于 → 理论上是算力瓶颈</td></tr>
+            <tr><td>实际卡在哪</td><td>带宽</td><td><strong>延迟</strong>：计算和带宽都没用满，warp 在干等</td></tr>
+            <tr><td>主要看的指标</td><td>有效带宽（GB/s）、每次请求的扇区数</td><td>停顿原因、占用率、bank conflict、SASS 指令</td></tr>
+            <tr><td>优化的本质</td><td>少搬、搬得整齐、同时多发几个请求</td><td>多复用、别排队、边算边搬</td></tr>
+            <tr><td>结果</td><td>own_reg：147.7 → 109.5 μs（n=4096，rows=512）</td><td>408 → 2895 GFLOPS，cuBLAS 的 85%</td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>同一套分析流程，两个算子都走过</strong>：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>步骤</th><th>RMSNorm</th><th>GEMM</th></tr></thead>
+          <tbody>
+            <tr><td>① 先保证测得对</td><td>CPU 参考、NaN 预填、逐元素校验、锁频、3 个独立进程确认</td><td>double 参考、NaN 预填、不整齐形状、锁频、同一次运行内对比</td></tr>
+            <tr><td>② 算理论上限</td><td>有效带宽 vs 204.8 GB/s</td><td>GFLOPS vs cuBLAS 和峰值 5325</td></tr>
+            <tr><td>③ 判断瓶颈类型</td><td>SpeedOfLight：内存</td><td>SpeedOfLight：两边都不高 → 延迟</td></tr>
+            <tr><td>④ 找具体原因</td><td>扇区数 4 → 4.44（不对齐）；barrier ×7（零头分叉）</td><td>bank conflict 839 万；long_scoreboard 1.81；kk 没展开</td></tr>
+            <tr><td>⑤ 看机器码</td><td>CUB 39 条 LDG，我们只有 3 条 → 没展开</td><td>自动 <code>LDS.128</code>；只有 64 条 FFMA → kk 没展开</td></tr>
+            <tr><td>⑥ 只改一处验证</td><td>补齐行宽后恢复；own_t 和 CUB 一样快</td><td>改交错后冲突 → 1218；双缓冲后 long_scoreboard → 0.02</td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>很多手段是同一个思想</strong>：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>思想</th><th>RMSNorm</th><th>GEMM</th></tr></thead>
+          <tbody>
+            <tr><td>编译期常量 → 循环能展开</td><td>own_t：blockDim → 模板参数 BLOCK，展开 16 份，追平 CUB</td><td>BM / BN / BK / TM / TN 全是模板参数；kk 加 <code>#pragma unroll</code>；双缓冲里 NT、LA 用 constexpr</td></tr>
+            <tr><td>数据放寄存器</td><td>own_reg：x 读一次存进寄存器，不再读第二遍</td><td><code>c[8][8]</code>、a、b、ra、rb 全在寄存器</td></tr>
+            <tr><td>下标必须固定</td><td>固定每线程元素数，<code>cuobjdump</code> 确认 LOCAL:0</td><td>ra 用运行时下标会掉进 local memory，改成固定次数的 r 循环</td></tr>
+            <tr><td>让很多请求同时在路上</td><td>展开后一次发 32 个读请求</td><td>双缓冲：下一块的 LDG 和这一块的 FFMA 同时进行</td></tr>
+            <tr><td>竖着看一个 warp</td><td>32 个线程的地址是否连续 → 合并访存、扇区数</td><td>32 个线程落在哪个 bank → bank conflict</td></tr>
+            <tr><td>对齐</td><td>行宽不是 32 的倍数 → 每次请求 4.4 个扇区；补齐解决</td><td>padding 用 +4 不用 +1，保证 float4 的 16 字节对齐</td></tr>
+            <tr><td>向量化</td><td>接 PyTorch 时加了 float4 版（rmsNormVec4）</td><td>float4 读 shared → <code>LDS.128</code></td></tr>
+            <tr><td>同步和分叉</td><td>零头让最后一个 warp 分叉，其他 warp 在 barrier 等</td><td>双缓冲把每轮 2 次同步减到 1 次，barrier 0.54 → 0.12</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li><strong>最大的共同点</strong>：最后都落到"不让硬件干等"。RMSNorm 是让更多读请求同时在路上，GEMM 是让计算盖住读取。</li>
+          <li><strong>最大的不同点</strong>：GEMM 有复用，所以要用 shared memory 和寄存器分层存数据，才有 bank conflict、分块、双缓冲这些问题；RMSNorm 每个数只用一次，shared memory 只用来做规约。</li>
+          <li>先判断是哪类瓶颈，再选看哪些指标；编译期常量是性能的前提；两次都是 SASS 揭示了真相；"理论上更好"不等于更快（RMSNorm 有被推翻的猜测，GEMM 有变慢的 float4）。</li>
+        </ul>
+      </div>
+
+      <div class="blk" id="m11-conv"><h3>卷积 bench：v1 直接卷积</h3>
+        <p><strong>先把卷积本身讲清</strong>。卷积核是一个小窗口，在图上滑动，每停一个位置就把窗口里对应位置的数相乘再求和，得到一个输出数。一层一层加上去：</p>
+        <ol class="plain">
+          <li><strong>一个通道、一个卷积核</strong>：4×4 的输入、3×3 的卷积核、不补边，横竖各能放 2 个位置，输出 2×2。左列 +1、右列 −1 的卷积核在找竖直边缘；权重是训练学出来的。</li>
+          <li><strong>多个输入通道</strong>：输入有 C 张图（RGB 时 C = 3），卷积核也有 C 层，每层盖在对应的图上各自乘加，C 个结果再相加，得到 <strong>1 个</strong>数。所以不管输入几层，一个卷积核只输出一张图。</li>
+          <li><strong>多个卷积核</strong>：准备 K 个卷积核，每个都在同一份输入上完整滑一遍，得到 K 张输出图。K = 输出通道数 = 这一层要找几种图案；这一层的 K 就是下一层的 C（只有第一层的输入是真实图片）。</li>
+          <li><strong>权重共享</strong>：层与层之间卷积核不共享；同一层里一个卷积核滑遍全图，每个位置用同一组权重，所以卷积参数比全连接少得多。</li>
+        </ol>
+<pre><code>输入 in[N, C, H, W]   卷积核 w[K, C, R, S]   输出 out[N, K, P, Q]
+P = (H + 2·pad − R) / stride + 1          例：SigLIP 512×512、16×16、stride 16 → 32，共 1024 个 patch
+
+out[n,k,p,q] = Σ_c Σ_r Σ_s  in[n, c, p·stride − pad + r, q·stride − pad + s] · w[k,c,r,s]
+                              └ 窗口左上角 ┘ └ 窗口里第 r 行</code></pre>
+        <p>下标分两类：n、k、p、q 决定"算哪一个输出格子"，c、r、s 是这个格子要加起来的项。所以 n 不需要循环——不同照片从不相加，n 只出现在读 X 的下标里，作用是选哪张照片；k 同理，只出现在 Wt 的下标里。pad 区域的 0 并不存在显存里，算出的 h 或 w 越界时直接跳过（等价于乘 0），否则会读到上一层的数据或非法地址。</p>
+        <p><strong>v1：一个线程一个输出</strong>。外面三层 k、p、q 交给线程，里面三层 c、r、s 留在线程里循环：</p>
+<pre><code>size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+if (idx &gt;= N·K·P·Q) return;                  // 最后一个 block 多出来的线程
+q = idx % Q;  p = (idx / Q) % P;  k = (idx / (P·Q)) % K;  n = idx / (K·P·Q);   // 像时钟进位
+for c, r, s:
+    h = p·stride − pad + r;  w = q·stride − pad + s;
+    if (h &lt; 0 || h &gt;= H || w &lt; 0 || w &gt;= W) continue;
+    sum += X[((n·C + c)·H + h)·W + w] * Wt[((k·C + c)·R + r)·S + s];
+Y[idx] = sum;                                // Y 的摊平顺序就是 n、k、p、q</code></pre>
+        <p>一维下标要一层套一层：把 Wt 想成一本书，k 是章、c 是节、r 是行、s 是字，第 k 章从 <code>k·C·R·S</code> 开始，提公因式就是 <code>((k·C + c)·R + r)·S + s</code>。<strong>易错</strong>：写成 <code>k*C + c*R + r*S + s</code>，代入 C = 2、R = S = 3、读第 1 层第一个数：正确位置是 9，这个写法得到 3（读成了第 0 层第 1 行）。<code>h = r + p</code> 只在 stride 1、pad 0 时对；idx 和 h / w 两个越界检查都不能少。kernel 里要调用的辅助函数（如 <code>P()</code> / <code>Q()</code>）要标 <code>__host__ __device__</code>。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>形状（N, C, H×W, K, R×S, stride, pad）</th><th class="num">v1 direct</th><th class="num">cuDNN</th><th class="num">差距</th></tr></thead>
+          <tbody>
+            <tr><td>resnet3x3（1, 64, 56×56, 64, 3×3, 1, 1）</td><td class="num">0.199</td><td class="num">1.875</td><td class="num">9.4×</td></tr>
+            <tr><td>resnet3x3_s2（1, 128, 28×28, 256, 3×3, 2, 1）</td><td class="num">0.178</td><td class="num">0.426</td><td class="num">2.4×</td></tr>
+            <tr><td>resnet1x1（1, 256, 56×56, 64, 1×1, 1, 0）</td><td class="num">0.069</td><td class="num">0.614</td><td class="num">8.9×</td></tr>
+            <tr><td>siglip_patch（3, 3, 512×512, 768, 16×16, 16, 0）</td><td class="num">0.077</td><td class="num">2.857</td><td class="num"><strong>37×</strong></td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">Orin，锁频 1300 MHz，TFLOPS，NCHW，FP32。cuDNN 8.6 只用 FP32 乘加、不用 Tensor Core。另有 4 组不整齐的小形状（含奇数尺寸、pad、stride 2、1×1）只查正确性，8 组全部 PASS。Orin FP32 峰值约 5.3 TFLOPS，v1 只用到 1～4%。</p>
+        <ol class="plain">
+          <li><strong>读 Wt 没问题</strong>：一个 warp 的 32 个线程 k 相同、只有 q 不同，读的是同一个地址，硬件读一次再广播。</li>
+          <li><strong>读 X 看 stride</strong>：stride 1 时相邻线程的 w 相邻，地址连续能合并；siglip 的 stride 16 让相邻线程相隔 64 字节，32 个线程碰 32 段内存，所以最慢。</li>
+          <li><strong>根本问题是没有复用</strong>：每次乘加都从显存读 2 个数。resnet3x3 里一个 X 元素被 9 个窗口位置 × 64 个卷积核用 576 次，每个权重被 3136 个输出位置用到，每次都重新读。以上是按代码推的，<strong>没有用 ncu 验证</strong>。</li>
+        </ol>
+        <p><strong>下一步 v2 implicit GEMM</strong>：把 (c, r, s) 压成一个下标，长度 CRS，每个输出就是两个长度 CRS 的向量点积，所有输出合起来是一次 GEMM：A = 权重 reshape 成 K × CRS，B = "补丁矩阵" CRS × NPQ（每列是一个输出位置要用的那块输入，越界处为 0），C = K × NPQ。显式 im2col 要把 B 真写进显存，3×3 stride 1 时 B 约是输入的 9 倍；implicit 只改 GEMM 里"搬 B 的 tile"那一行，加载时按卷积规则现算地址，其余（shared 分块、寄存器分块、双缓冲）照搬模块里的 GEMM。之后的难点：每个元素都要做几次 <code>/</code> 和 <code>%</code>（预先算好或沿 k 增量更新）；NHWC 布局让 c 连续、可以 float4；padding 分支。形状差别：1×1 卷积本身就是 GEMM；siglip 的 patch embed 窗口互不重叠，im2col 只是 reshape；resnet3x3 对应 M = 64、N = 3136、K = 576。</p>
+      </div>
+
+      <div class="blk" id="m11-im2col"><h3>卷积 v2：显式 im2col + 自己的 GEMM</h3>
+        <p><strong>要解决什么</strong>：v1 每做一次乘加都从显存读 2 个数、读进来的不复用，resnet3x3 只有 0.199 TFLOPS。GEMM 里同样的问题已经用分块解决过，所以思路是<strong>把卷积改写成矩阵乘，再直接调用自己写好的 GEMM</strong>。</p>
+        <p><strong>最小例子</strong>：X 是 3×3，一个 2×2 卷积核，输出 2×2。v1 算 Y[0,0] 是窗口 <code>1 2 / 4 5</code> 和 Wt <code>1 0 / 0 1</code> 对应相乘再加：1 + 5 = 6。这其实是两个长度 4 的向量点积：窗口摊平成 [1,2,4,5]，Wt 摊平成 [1,0,0,1]。把 4 个窗口都摊平、竖着排成 4 列，就是矩阵 B：</p>
+<pre><code>            窗口(0,0) (0,1) (1,0) (1,1)
+B =            1      2      4      5
+               2      3      5      6
+               4      5      7      8
+               5      6      8      9
+
+Wt (2×4)           · B (4×4)  =  Y (2×4)
+[1 0 0 1]                         [ 6   8  12  14]   ← 输出第 0 层
+[1 1 1 1]                         [12  16  24  28]   ← 输出第 1 层（再加一个卷积核就是 Wt 多一行）</code></pre>
+        <p>这就是 im2col（image to column）。乘出来的结果直接就是 Y：B 的列号 = p·Q + q，正好是 <code>Y[k][p][q]</code> 在一行里的位置；Y 的第 k 行就是第 k 个输出层。对应 GEMM 的三个维度：M = K（卷积核个数），N = P·Q（输出位置数），GEMM 的"K 维" = C·R·S（每个窗口有几个数）。resnet3x3 就是 M = 64、N = 3136、K = 576。</p>
+        <p><strong>为什么不用转置</strong>：GEMM 要求 <code>C[M×N] = A[M×K] · B[K×N]</code>，都是行主序。A = Wt，<code>Wt[k][c][r][s]</code> 本来就是一行一个卷积核；B 由我们自己按 [CRS × PQ] 行主序写，<code>B[row][col]</code> 在 <code>row·PQ + col</code>，一个窗口的数在内存里相隔 PQ，写出来就是列；C = 第 n 张图的 Y，<code>Y[k][p][q]</code> 本来就是 [K × PQ]。（上面 4×4 的 B 恰好对称，转不转看起来一样，只是巧合。）另一种摆法是每个窗口存成一行得到 Bᵀ [PQ × CRS]，算 <code>Yᵀ = Bᵀ · Wtᵀ</code>，Y 是 [PQ × K]，也就是 NHWC（channels-last）——要 NCHW 的话最后反而要再转置一次。</p>
+        <p><strong>拆下标：像"秒换算成时分秒"</strong>。B 的行号 <code>row = (c·R + r)·S + s</code>，列号 <code>col = p·Q + q</code>（N = 1 时）：</p>
+<pre><code>int s = row % S;          // 最低位：对自己的进制取余
+int r = (row / S) % R;    // 中间位：先除掉下面的位，再对自己的进制取余
+int c = row / (R * S);    // 最高位
+int q = col % Q;  int p = col / Q;
+int h = p*stride - pad + r;  int w = q*stride - pad + s;      // 和 v1 完全相同
+B[row*PQ + col] = (h &lt; 0 || h &gt;= H || w &lt; 0 || w &gt;= W) ? 0.0f : Xn[(c*H + h)*W + w];</code></pre>
+        <p>h、w 的公式和 v1 一样，因为 im2col 只改变"按什么顺序数要哪些数"，没改变"每个数在输入图的哪里"：v1 的 (n,p,q) 来自线程号、(c,r,s) 来自循环变量；这里 (c,r,s) 来自行号、(n,p,q) 来自列号。和 v1 不同的是越界的 0 <strong>必须真的写进 B</strong>，因为 GEMM 会把整列都乘一遍。<strong>易错</strong>：<code>r = (row % C) / R</code>、<code>s = row % C % R / S</code>（r、s 和 C 无关，用 tiny 形状 row = 13 代入，应为 c = r = s = 1，得到 r = s = 0）；<code>p = col / P</code>（应为 / Q；方形输出测不出来，<code>odd_pad</code> 的 P = 7、Q = 9 能查出来）；<code>r = (row / S) % S</code>（R = S 时测不出，3×5 卷积核会错）、读 X 写成 <code>(c*C + h)*H + w</code>、漏越界补 0、第 n 张图起点写成 <code>X + n*CRS</code>（一张图是 C·H·W 个数）、<code>launch_tiled</code> 的 A 填成 X、C 少乘 PQ、N 和 K 对调、漏 stream。正确的调用：</p>
+<pre><code>for n in 0..N-1:
+    im2col_kernel(X + n·C·H·W → B)                         // B 只开一块，每张图复用
+    launch_reg(Wt, B, Y + size_t(n)·K·PQ, /*M*/K, /*N*/PQ, /*K*/CRS, stream);</code></pre>
+        <p class="small muted">B 的显存在第一次（不计时的那轮）<code>cudaMalloc</code>，不算进 TFLOPS。<code>size_t(C*R*S*P*Q)</code> 是先用 int 乘完再转，大形状会溢出，要写成 <code>size_t(C)*R*S*P*Q</code>。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>形状</th><th class="num">v1 direct</th><th class="num">im2col + tiled</th><th class="num">im2col + reg</th><th class="num">cuDNN</th></tr></thead>
+          <tbody>
+            <tr><td>resnet3x3</td><td class="num">1.157 (0.200)</td><td class="num">0.595 (0.388)</td><td class="num win">0.420 (0.551)</td><td class="num">0.127 (1.823)</td></tr>
+            <tr><td>resnet3x3_s2</td><td class="num">0.649 (0.178)</td><td class="num win">0.236 (0.491)</td><td class="num">0.245 (0.471)</td><td class="num">0.271 (0.427)</td></tr>
+            <tr><td>resnet1x1</td><td class="num">1.478 (0.070)</td><td class="num">0.263 (0.391)</td><td class="num win">0.201 (0.512)</td><td class="num">0.172 (0.597)</td></tr>
+            <tr><td>siglip_patch</td><td class="num">46.96 (0.077)</td><td class="num">5.932 (0.611)</td><td class="num win">1.630 (2.224)</td><td class="num">1.275 (2.841)</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">Orin，锁频 1300 MHz（不锁频时 GPU 可能只跑 306 MHz，数字不可用），单位 ms，括号是 TFLOPS；cuDNN 8.6 只用 FP32 FMA。8 组形状（含 <code>odd_pad</code>、<code>odd_stride2</code>）全部 PASS。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>形状</th><th class="num">X 大小</th><th class="num">B = CRS × NPQ</th><th class="num">膨胀</th><th class="num">reg 版 block 数（128×128）</th></tr></thead>
+          <tbody>
+            <tr><td>resnet3x3（3×3，s1，pad 1）</td><td class="num">0.8 MB</td><td class="num">576 × 3136（7.2 MB）</td><td class="num">9×</td><td class="num">1 × 25 = 25</td></tr>
+            <tr><td>resnet3x3_s2（3×3，s2）</td><td class="num">100,352 个</td><td class="num">1152 × 196</td><td class="num">2.25×</td><td class="num">2 × 2 = 4</td></tr>
+            <tr><td>resnet1x1</td><td class="num">—</td><td class="num">B 就是 X</td><td class="num">1×</td><td class="num">25</td></tr>
+            <tr><td>siglip_patch（16×16，s16）</td><td class="num">2,359,296 个</td><td class="num">768 × 3072</td><td class="num">1×（只是重排）</td><td class="num">每张图 6 × 8 = 48</td></tr>
+          </tbody>
+        </table></div>
+        <ol class="plain">
+          <li><strong>"大 tile 更快"有前提：block 要够把 SM 填满</strong>。s2 上 reg 版只有 4 个 block，Orin 16 个 SM 有 12 个闲着，tiled 版（16×16 小块）有 208 个 block，所以 tiled 更快——这是跑之前就按 block 数预测出来的。这一组两版都比 cuDNN 快（cuDNN 在纯 FP32 FMA 模式下对这个形状选的算法不好）。</li>
+          <li><strong>siglip 提升最大</strong>：46.96 → 1.63 ms，约 29 倍，到 cuDNN 的 78%。GEMM 大（M = 768），窗口不重叠所以 im2col 几乎没有额外开销；v1 的 X 读取不合并问题在 GEMM 里也没有了。</li>
+          <li><strong>resnet3x3 还差 cuDNN 3.3 倍</strong>（分析，<strong>没有用 ncu 验证</strong>）：M = 64，reg 版每个 128 行的块一半在算补的 0；B 是 X 的 9 倍，要先写出 7.2 MB 再读回。没有单独计时 im2col 这一步占多少。</li>
+        </ol>
+        <p><strong>下一步 implicit GEMM</strong>：不再把 B 写进显存，GEMM 搬 B 的 tile 进 shared memory 时按上面同一套拆下标 + h、w 公式直接去 X 里读，越界补 0。之后再考虑增量算下标、NHWC + float4。</p>
+        <div class="selftest"><h3>自测（im2col）</h3><ul class="plain">
+          <li>用 3×3 输入、2×2 卷积核手写出 B，数字 5 出现几次？为什么？</li>
+          <li>卷积写成 GEMM 时 M、N、K 分别是什么？resnet3x3 的三个数是多少？</li>
+          <li>为什么按 [CRS × PQ] 写 B 就不用转置？如果每个窗口存成一行，Y 会变成什么布局？</li>
+          <li>row = 13、C = 2、R = S = 3 时 c、r、s 是多少？为什么 r、s 的式子里不出现 C？</li>
+          <li>为什么 implicit / im2col 里 h、w 的公式和 v1 一样？为什么越界的 0 这次必须写进 B？</li>
+          <li>resnet3x3_s2 上为什么 128×128 的 reg 版反而比 16×16 的 tiled 版慢？</li>
+          <li>显式 im2col 的数据膨胀约等于多少？哪两组形状没有膨胀？</li>
+        </ul></div>
+      </div>
+
+      <div class="blk" id="m11-igemm"><h3>卷积 v3：implicit GEMM</h3>
+        <p><strong>要解决什么</strong>：v2 分两个 kernel。第 1 个 <code>im2col_kernel</code> 读 X、抄成 B、把 B 写进显存；第 2 个 GEMM 从显存把 B 读回来、搬进 shared memory 再乘加。B 是用完就扔的中间产物，而且是 X 的 9 倍（resnet3x3：X 0.8 MB，B 7.2 MB），这一写一读全是额外的显存流量。问题是：能不能不要 B？</p>
+        <p><strong>只改一行</strong>：<code>B[row][col]</code> 的值本来就是从 X 的某一格抄过去的，那 GEMM 需要它时自己算出该读 X 的哪一格就行了。拿 <code>gemm_tiled</code> 当骨架，只改搬 B 的那一行：</p>
+<pre><code>改之前：Bs[i][j] = B[brow][col];                 // 读 im2col 写好的 B
+改之后：int c = brow / (R*S), r = (brow / S) % R, s = brow % S;   // 行号 → (c, r, s)
+        int p = col / Q,  q = col % Q;                              // 列号 → (p, q)
+        int h = p*stride - pad + r,  w = q*stride - pad + s;        // 和 v1、v2 完全相同
+        Bs[i][j] = (brow &lt; GK &amp;&amp; col &lt; GN &amp;&amp; h,w 不越界) ? Xn[(c*H + h)*W + w] : 0.0f;</code></pre>
+        <p>搬 A（Wt 本来就是 [K × CRS]）、乘加循环、写回 Y 一个字都不改：GEMM 不关心 Bs 里的数从哪来。im2col_kernel 整个删掉，B 只存在于公式里，"implicit"（隐式）就是这个意思。越界有两种都要补 0：矩阵本身越界（<code>brow ≥ GK</code> 或 <code>col ≥ GN</code>）和卷积补的 pad（h、w 越界）。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>resnet3x3</th><th>显式 im2col（v2）</th><th>implicit（v3）</th></tr></thead>
+          <tbody>
+            <tr><td>写 B</td><td>7.2 MB 写进显存</td><td>没有</td></tr>
+            <tr><td>GEMM 读 B</td><td>从显存读 7.2 MB</td><td>直接读 X（0.8 MB），重复读的部分大多命中 L1 / L2（Orin L2 4 MB）</td></tr>
+            <tr><td>kernel 数</td><td>2</td><td>1</td></tr>
+            <tr><td>代价</td><td>—</td><td>每次搬 B 都要做整数除法和取余，GPU 上较慢（之后用"增量算下标"优化）</td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>一个线程、一个 block、一轮各管什么</strong>。还是一个线程算一个输出 <code>Y[n][k][p][q]</code>（row = k，col = p·Q + q），但一个 block 不是一张图：把 Yn 看成 [K × PQ] 矩阵，一个 block 负责其中 TILE × TILE 的方块（TILE = 16 时是 16 个卷积核 × 16 个输出位置）。resnet3x3 一张图需要 64/16 × 3136/16 = 4 × 196 = 784 个 block，它们同时交给 16 个 SM 去领，没有先后顺序；N 张图由 <code>launch_igemm</code> 里的循环每张图启动一次（以后可以放进 <code>blockIdx.z</code>）。这个方块放回 56×56 的输出图上，是按行展开后连续的 16 个像素，可能折到下一行（如 col 48～63 = 第 0 行最后 8 个 + 第 1 行前 8 个），拆 (p, q) 的公式会自动处理，所以 <code>odd_pad</code>（Q = 9）也能对。</p>
+        <p>block 内部的 <code>for (t = 0; t &lt; (GK + TILE − 1) / TILE; ++t)</code> 沿 CRS 方向走：第 t 轮搬 Wt 的第 16t～16t+15 列和 B 的第 16t～16t+15 行，每个线程把这 16 个乘积加进 sum；输出方块的位置在整个循环里不变，走完后每个线程只写一次 Y。轮数是 ⌈GK / TILE⌉：resnet3x3 GK = 576，36 轮；tiny GK = 2·3·3 = 18 要 2 轮，第 2 轮只有第 16、17 行是真数据，其余 14 行必须补 0（写成 <code>GK / TILE</code> 就只剩 1 轮、漏算最后 2 行）。一个 tile 的 16 行可以跨两层：resnet3x3 每层 9 行，第 0 轮是 c = 0 的全部 9 行加 c = 1 的前 7 行，因为每个线程只用自己的 brow 拆 (c, r, s)，这没有影响。</p>
+        <p><strong>为什么比 v1 快</strong>：v1 每个线程自己从显存读窗口和 Wt，每次乘加读 2 个数，读进来只给自己用；v3 每一轮 256 个线程合作搬 256（As）+ 256（Bs）= 512 个数，做 256 × 16 = 4096 次乘加，每读 1 个数做 8 次乘加，v1 是 0.5 次。Bs 里每个数被 16 行线程（16 个卷积核）各用一次，As 里每个数被 16 列线程（16 个输出位置）各用一次——和 GEMM 从 naive 到 tiled 是同一个道理。</p>
+        <p><strong>TILE 同时管三件事</strong>：① 一个 block 负责的输出大小（16 × 16）；② 线程数（一个线程一个输出，所以也是 256）；③ 每轮沿 GK 走多长。它是按硬件挑的（TILE² ≤ 1024、2·TILE² 个 float 放得进 shared memory，一般试 16 和 32），和卷积的 K 无关，K 不是 TILE 的倍数时多出来的线程不写 Y（<code>odd_pad</code> K = 5，一个 block 16 行线程只有 5 行有活）。三件事绑在一起就不灵活：想让 block 负责更大的输出，线程数也得跟着变。<code>gemm_reg</code> 把它们拆开了（输出 128 × 128、线程 16 × 16、每线程 8 × 8、每轮 BK = 8），所以 tiled 版跑通后，下一步是把同一套改法套到 reg 版上。</p>
+        <p><strong>实测：从 tiled 到增量下标</strong>。implicit 先套在 tiled 版上（v3a），再套到 reg 版上（v3b，128 × 128 tile、double buffering），最后把下标计算挪出循环（v3c）：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>版本（ms）</th><th class="num">resnet3x3</th><th class="num">resnet3x3_s2</th><th class="num">resnet1x1</th><th class="num">siglip_patch</th></tr></thead>
+          <tbody>
+            <tr><td>v1 直接卷积</td><td class="num">1.159</td><td class="num">0.650</td><td class="num">1.527</td><td class="num">46.96</td></tr>
+            <tr><td>v2a 显式 im2col + tiled</td><td class="num">0.598</td><td class="num win">0.236</td><td class="num">0.264</td><td class="num">5.909</td></tr>
+            <tr><td>v2b 显式 im2col + reg</td><td class="num">0.422</td><td class="num">0.246</td><td class="num">0.201</td><td class="num win">1.630</td></tr>
+            <tr><td>v3a implicit + tiled</td><td class="num">0.508</td><td class="num">0.286</td><td class="num">0.253</td><td class="num">7.973</td></tr>
+            <tr><td>v3b implicit + reg</td><td class="num">0.530</td><td class="num">0.531</td><td class="num">0.245</td><td class="num">3.235</td></tr>
+            <tr><td>v3c implicit + reg + 增量下标（查表）</td><td class="num win">0.289</td><td class="num">0.292</td><td class="num win">0.139</td><td class="num">1.881</td></tr>
+            <tr><td class="sub">cuDNN</td><td class="num sub">0.126</td><td class="num sub">0.270</td><td class="num sub">0.180</td><td class="num sub">1.277</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">Orin，锁频 1300 MHz，FP32 NCHW，cuDNN 8.6 只用 FP32 FMA。8 组形状全部 PASS。绿色是自己写的版本里最快的。</p>
+        <ol class="plain">
+          <li><strong>v3b 反而比显式慢（resnet3x3 0.422 → 0.530）</strong>：搬 B 的每个元素都要做几次整数除法和取余。ncu（resnet3x3）里整数指令从 0.26 亿条涨到 1.61 亿条（6.1 倍，占全部指令 32%），FFMA 条数不变，寄存器 149 → 153，占用率仍是 16.7%。省下的显存流量被算地址的开销吃掉了。</li>
+          <li><strong>v3c 增量下标</strong>：X 里的地址可以拆成两半，<code>地址 = base(列) + delta(行)</code>。列那一半（p、q 决定的窗口左上角）对一个线程在整个 t 循环里不变，提到循环外算一次；行那一半（c、r、s 决定的窗口内偏移）只和 brow 有关，所有 block 都一样，预先算成一张表放进 <code>__constant__</code>，循环里查表。这和 cuDNN 的 <code>IMPLICIT_PRECOMP_GEMM</code> 是同一个思路。resnet3x3 0.530 → 0.289 ms，第一次比显式 im2col 快；1×1 卷积 0.139 ms，比 cuDNN 的 0.180 还快。</li>
+          <li><strong>implicit 不一定赢</strong>：siglip_patch 的窗口互不重叠，显式 im2col 没有膨胀（只是重排），而 stride 16 让 implicit 读 X 时相邻线程相隔 64 字节、读不合并，所以显式 reg 版（1.630）比 v3c（1.881）快。implicit 省的是"膨胀出来的那部分显存写和读"，读请求的次数并没有减少（多出来的读打在 L1 / L2 上）。</li>
+          <li><strong>tile 大小要看形状</strong>：s2 用 128 × 128 只有 4 个 block，16 个 SM 大部分闲着，所以小 tile 的 v2a 最快；resnet 的 K = 64 小于 BM = 128，一半的 FFMA 在乘补的 0（ncu 里 FFMA 条数正好是有用量的 2 倍）。</li>
+        </ol>
+        <p class="small muted">还没做（只讲过）：按形状选 tile（如 64 × 64）；改成 NHWC，让 c 连续、沿 s 读能合并；把 X 的原始 tile 先搬进 shared memory 再展开。</p>
+        <div class="selftest"><h3>自测（implicit GEMM）</h3><ul class="plain">
+          <li>显式 im2col 的 B 为什么是"多余"的？implicit GEMM 改了 GEMM 的哪一行，哪些部分一个字不改？</li>
+          <li>搬 B 时有哪两种越界？各自为什么必须补 0？</li>
+          <li>resnet3x3 一张图要多少个 16 × 16 的 block？一个 block 负责的 16 个输出位置在输出图上是什么形状？</li>
+          <li>t 循环的轮数为什么是 (GK + TILE − 1) / TILE？tiny（GK = 18）第 2 轮哪些行是真数据？</li>
+          <li>tiled 版每读 1 个数做几次乘加？v1 呢？差多少倍？</li>
+          <li>TILE 同时决定哪三件事？为什么说它和卷积的 K 无关？gemm_reg 是怎么把它们拆开的？</li>
+          <li>implicit GEMM 也会重复读 X 的同一格，为什么比显式 im2col 省？代价是什么？</li>
+        </ul></div>
+      </div>
+
+      <div class="blk" id="m11-s18"><h3>下一步</h3>
+        <p>⑦ 之后剩下的停顿主要是 not_selected 0.65、wait 0.40、short_scoreboard 0.39，后两个都属于"每个调度器只有 2 个 warp，可轮换的对象太少"。下面这些都没做，GEMM 先收尾（剩下的主要是调参）：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>优化</th><th>做法</th></tr></thead>
+          <tbody>
+            <tr><td>提高占用率</td><td><code>__launch_bounds__(256, 2)</code> 把寄存器压到 128 以内，同时调大 shared memory 配额（两个限制要一起解决）；风险是寄存器压太狠会 spill</td></tr>
+            <tr><td>寄存器级预取</td><td>a、b 也开两份，算第 kk 轮时预取第 kk+1 轮，针对 short_scoreboard；寄存器会更紧</td></tr>
+            <tr><td><code>cp.async</code></td><td>全局直接拷到 shared，省掉 ra、rb 这 8 个寄存器（CUTLASS 在 Ampere 上的做法，未核实）</td></tr>
+            <tr><td>warp 分块</td><td>在 block 和线程之间再加一层，改善复用</td></tr>
+            <tr><td>Tensor Core</td><td>WMMA / MMA，FP16</td></tr>
+          </tbody>
+        </table></div>
+<pre><code>nvcc -O3 -arch=sm_87 -Xptxas=-v src/gemm/gemm_bench.cu -lcublas -o build-orin/gemm_bench
+sudo jetson_clocks                                   # 锁频，cur_freq 应为 1300500000
+./build-orin/gemm_bench                              # 正确性 + 三组方阵
+cuobjdump -sass build-orin/gemm_bench | ...          # 数 LDS / LDS.128 / FFMA
+sudo .../ncu -k regex:gemm_reg -c 1 --section Occupancy --section WarpStateStats ./build-orin/gemm_bench 2048 2048 2048
+# 只抓一次，并列出停顿细分
+sudo .../ncu --kernel-name regex:gemm_reg --launch-skip 3 --launch-count 1 --metrics \
+  smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio,\
+  smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio,\
+  smsp__average_warps_issue_stalled_not_selected_per_issue_active.ratio,\
+  smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio,\
+  smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio,\
+  smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio,\
+  smsp__average_warps_issue_stalled_wait_per_issue_active.ratio \
+  ./build-orin/gemm_bench 4096 4096 4096</code></pre>
+        <p class="small muted">gemm_bench 会先预热再循环计时，不加 <code>--launch-skip</code> / <code>--launch-count</code> 时 ncu 会把同一个 kernel 抓很多遍，数字都一样，看一块就够。</p>
+      </div>
+
+      <div class="blk iv" id="m11-iv"><h3>面试要求</h3>
+        <p>推理优化、CUDA 算子岗位里 GEMM 几乎必问。下面合并了卷积部分和 GEMM 的要求；完整优化过程见本模块上面的 ①～⑥。</p>
+        <h4>必须会</h4>
+        <ul class="plain">
+          <li>卷积输出尺寸公式 <code>(H + 2P − K) / S + 1</code>；多通道怎么算；乘加次数怎么算。</li>
+          <li>朴素卷积 kernel：按输出分配线程，列放在 x 方向（合并访存）；padding 的实现。</li>
+          <li>shared memory 分块卷积：输入块要比输出块大一圈 halo（核大小 / 2）。</li>
+          <li>naive GEMM（当场手写，15～20 分钟内写对）：下标、<code>dim3</code> 的 x / y 对应列 / 行、grid 向上取整、越界判断、<code>&lt;&lt;&lt;grid, block&gt;&gt;&gt;</code> 启动；能说出为什么 j 要跟 threadIdx.x（合并访存）。</li>
+          <li>shared memory 分块 GEMM（当场手写）：row / col 的算法、段数 <code>(K+TILE-1)/TILE</code>、越界补 0、两个 <code>__syncthreads()</code> 各自防什么、为什么不能提前 return、sum 放在循环外最后写一次。常见追问："第二个 <code>__syncthreads()</code> 去掉会怎样？""K 不是 TILE 的倍数怎么办？"</li>
+          <li>算清三个数：计算量 2MNK、给出用时能算 GFLOPS；峰值 = 核心数 × 2 × 频率（Orin ≈ 5.3 TFLOPS，A100 FP32 ≈ 19.5 TFLOPS）；计算强度和 roofline，拐点 = 峰值算力 / 带宽，为什么大矩阵 GEMM 是计算密集、RMSNorm 是访存密集。</li>
+        </ul>
+        <h4>应该会</h4>
+        <ul class="plain">
+          <li>卷积的几种实现：直接卷积、im2col + GEMM、implicit GEMM、Winograd、FFT，各自省了什么、代价是什么；TensorRT 为什么要实测挑实现。</li>
+          <li>寄存器分块：外积的视角、BM / BN / BK / TM / TN 各是什么、线程数 = (BM/TM)×(BN/TN)、为什么必须是编译期常量、读和算的比例从 1:1 变成 1:4；能写出 kk 循环里读 a、b 和外积那几行。</li>
+          <li>bank conflict：32 个 bank、<code>bank = 地址 % 32</code>、同 bank 不同地址才冲突（同地址是广播）、"竖着看一个 warp"；能当场分析一个下标有几路冲突（例如"每隔 2 个读"是 2 路），给出至少两种修法：改线程分工（交错）、padding（并解释为什么是 +4 不是 +1）、swizzle（知道名字和思路）。</li>
+          <li>合并访存 vs bank conflict：一个是显存 → L1（32 字节 sector），一个是 shared → 寄存器（32 个 bank）。</li>
+          <li>float4：只要求 4 个连续 + 16 字节对齐；省的是指令数，不会让 shared memory 读得更宽；为什么读 a 需要把 As 转置；全局读用 float4 时 K、N 不是 4 的倍数怎么办。</li>
+          <li>占用率：寄存器、shared memory、线程数怎么限制每个 SM 的 block 数；为什么占用率低时延迟藏不住；"占用率不是越高越好"（寄存器分块就是用占用率换复用）。</li>
+          <li>用数据讲完整的优化故事：交错分工把 bank conflict 从 839 万降到 1218 次，快了 20%；接着做 float4 反而慢了 15%，ncu 显示 warp 主要在等全局内存和 shared memory、计算单元基本没满，SASS 显示 kk 循环没被展开、转置后写 As 有 8 路冲突；加 padding 和 <code>#pragma unroll</code> 后到 2366 GFLOPS，cuBLAS 的 70%；这时最大的停顿是 long_scoreboard 1.81，做 double buffering 后降到 0.02，2895 GFLOPS，cuBLAS 的 85%，而占用率反而从 33% 掉到 16.7%。</li>
+          <li>读 ncu 的顺序：SpeedOfLight 判断瓶颈类型 → Occupancy（四个限制取最小，能当场算"每线程 149 个寄存器、每 block 256 线程，每 SM 放几个 block"）→ Warp State 的时间账单 → 定位代码 → 只改一处重测。long / short scoreboard、barrier、not_selected、math_pipe_throttle 各表示什么。</li>
+          <li>stack frame 和 spill 的区别；为什么数组下标必须是编译期常量才能进寄存器；怎么查（<code>-Xptxas=-v</code>、数 SASS 里的 LDL / STL）。</li>
+          <li>算子和模型的关系：ACT 里哪些层是卷积、哪些是 GEMM；batch = 1 时为什么 GEMM 会变成访存密集。</li>
+        </ul>
+        <h4>加分</h4>
+        <ul class="plain">
+          <li>double buffering / 预取（自己做过，见 ⑦）：能写出一轮循环的四步顺序，说清为什么要两份 shared、为什么写 shared 必须放在计算之后、为什么每轮只同步一次；<code>cp.async</code>、TMA 知道是什么；寄存器级预取（a、b 也开两份）。</li>
+          <li>warp 分块、split-K（K 很大而 M、N 很小时，把 K 切开给多个 block 再归约）。</li>
+          <li>Tensor Core：WMMA / MMA 指令、FP16 / BF16 / TF32 / INT8 输入、为什么快一个数量级；TF32 会悄悄降低 FP32 精度（所以 FP32 engine 加了 <code>--noTF32</code>）。</li>
+          <li>cuBLAS / CUTLASS / cuDNN 的关系；cuBLAS 是列优先，行优先 C = AB 要把 A、B 对调传进去。</li>
+          <li>小矩阵、batch = 1 的 GEMM（ACT、LLM decode）：为什么占不满 GPU、为什么这时是访存密集、GEMV。</li>
+          <li>depthwise 卷积为什么难优化（计算强度低）。</li>
+        </ul>
+        <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+      </div>
+
+      <div class="selftest"><h3>自测</h3><ul class="plain">
+        <li>4×4 输入、3×3 核、padding 1、步长 2，输出多大？ResNet-18 从 480×640 怎么一步步变成 15×20？</li>
+        <li>输入通道和输出通道在公式里分别怎么处理？layer1 一个卷积的乘加次数怎么算？为什么卷积是计算受限、RMSNorm 是访存受限？</li>
+        <li>朴素卷积里 threadIdx.x / y 是两个线程吗？block 和 grid 是按输入还是按输出分配的？padding 在代码里是怎么实现的？</li>
+        <li>一个 16×16 的 block 里，warp 0 包含哪些线程？为什么图像的列要放在 x 方向？</li>
+        <li>分块卷积为什么二维 block 比一维复用率高？5×5 卷积核的输入块多大？第二个 <code>__syncthreads()</code> 能删吗？</li>
+        <li>im2col 和 implicit GEMM 有什么区别？Winograd 省了什么、代价是什么？TensorRT 为什么要实测挑卷积实现？</li>
+        <li>卷积核 [K, C, R, S] 四个字母各是什么？这一层的 K 和下一层的 C 是什么关系？为什么 v1 里不需要循环 n？</li>
+        <li>把 Wt[k][c][r][s] 摊平成一维的下标是什么？为什么 <code>k*C + c*R + r*S + s</code> 是错的？pad 区域为什么可以直接 continue？</li>
+        <li>v1 在 siglip_patch 上比 cuDNN 慢 37 倍、在 resnet3x3_s2 上只慢 2.4 倍，各自可能是什么原因？v1 读 Wt 和读 X 是否合并？</li>
+        <li>把卷积写成 GEMM 时 A、B、C 各是什么形状？3×3 stride 1 时显式 im2col 的 B 为什么约是输入的 9 倍？1×1 卷积和 patch embed 各有什么特殊？</li>
+        <li>M × K 的矩阵里，A[i][s] 在一维数组的哪？为什么乘的是 K 不是 M？算 c12 时依次读 A、B 的哪些地址？</li>
+        <li><code>dim3 grid(N/16, M/16)</code> 有哪两个错？<code>(16,16)</code> 为什么不是二维？</li>
+        <li>GEMV、扁矩阵 GEMM、batched、grouped 各对应什么场景？<code>h16816gemm_128x64</code> 里的数字是什么意思？decode b8 为什么难选 kernel？</li>
+        <li>Orin 锁 1.3 GHz 的 FP32 峰值怎么算？朴素 GEMM 的计算强度是多少，为什么远远不够？</li>
+        <li>shared memory 分块 GEMM 的四步是什么？为什么不能像朴素版那样开头 return？TILE 从 16 加到 32，显存读取变成几分之一？为什么 TILE 不能一直加大？</li>
+        <li>内积和外积有什么区别？8×8 寄存器分块每个 k 读几次、做几次乘加？什么情况下会寄存器溢出，怎么查？</li>
+        <li>shared 版里 row 为什么是 <code>bi*TILE + i</code> 而不是 <code>bi*TILE*k</code>？k 只出现在哪些下标里？搬 A、搬 B 各要检查哪两个方向的越界，为什么？</li>
+        <li>BM、BN、BK、TM、TN 各管哪一层？一个 block 为什么是 256 个线程？为什么这些数必须是模板参数？</li>
+        <li>寄存器版里 tid = 17 的线程负责哪 64 个 C？搬 As 时它搬哪 4 个数（ar、ac 怎么算）？"搬哪个"和"算哪个"为什么是两件事？</li>
+        <li>一个线程算同一行相邻 2 个元素时，为什么读 4 次变 3 次？这和 8×8 外积是什么关系？</li>
+        <li>用一维 <code>block(256)</code> 拆 <code>tid / 16</code>、<code>tid % 16</code>，和二维 <code>block(16,16)</code> 直接用 <code>threadIdx.y</code> 有区别吗？</li>
+        <li>寄存器版里 <code>a</code>、<code>b</code> 两个数组各多大，为什么？搬 As 时下标写成 <code>tid / BK</code> 而不是 <code>idx / BK</code> 会怎样，编译器会报错吗？</li>
+        <li>为什么要有 <code>kk</code> 这一层循环？写回 C 时全局行、列怎么算？二维线程时 block 和 grid 怎么设？</li>
+        <li>TM 和 TN 写反了，为什么 TM = TN = 8 时看不出来？怎么设计测试才能发现？</li>
+        <li>为什么不把手写 GEMM 换进 ACT？算子线和 ACT 在哪一步接上？每个算子的"三步"是什么？</li>
+        <li>卷积和 GEMM 是什么关系？im2col 和 implicit GEMM 的区别是什么？</li>
+        <li>gemm_bench 为什么先把 C 填成 NaN？为什么要用不整齐的形状、为什么小形状的计时没有意义？4096³ 用时 58 ms，GFLOPS 怎么算？</li>
+        <li>shared 版全局读取降到 1/16，为什么只快了 1.5 倍？寄存器版快 2.8 倍的来源是什么？</li>
+        <li>shared memory 有几个 bank、地址怎么映射？什么情况冲突、什么情况是广播？bank conflict 和合并访存分别发生在哪一段路上？</li>
+        <li>第 3 版读 <code>Bs[kk][tj + tx*8]</code> 为什么是 4 路冲突？"竖着看"是什么意思？读 As 为什么是 2 路？</li>
+        <li>交错分工要改哪三处公式？步长为什么必须是 BM/TM、BN/TN？为什么搬运部分不用改？</li>
+        <li>交错版指令数多了 60% 为什么还快 20%？wavefront 是什么？SASS 里的 <code>LDS.128</code> 是谁生成的？</li>
+        <li>float4 对地址有什么要求？硬件处理 float4 指令时几个线程一组、为什么？</li>
+        <li>为什么读 a 要把 As 转置成 <code>As[BK][BM]</code>，而 Bs 不用？转置时全局 A 的下标要不要改？</li>
+        <li>float4 版为什么反而慢了 15%？占用率 33% 是怎么算出来的？long_scoreboard、short_scoreboard、math_pipe_throttle 分别表示什么？</li>
+        <li>padding 为什么是 +4 而不是 +1？代价多大？为什么 Bs 不需要 padding？</li>
+        <li><code>#pragma unroll</code> 为什么要放在 kk 循环上而不是 t 循环上？展开后为什么更快？会不会读到还没准备好的寄存器？</li>
+        <li>GEMM 和 RMSNorm 的优化思路为什么不同？两边相通的地方是什么？下一步 double buffering 针对 ncu 里的哪一项？</li>
+        <li>long_scoreboard 和 short_scoreboard 分别在等什么？数据在 L1 命中算不算 long_scoreboard？scoreboard 是什么？</li>
+        <li>As 行宽 128 时，一个 warp 写 As 落在几个 bank、每个几路冲突？行宽 132 时 bank 的公式是什么，为什么正好铺满 32 个？</li>
+        <li>GPU 读全局内存会阻塞吗？warp 到底在哪一条指令上停下来？double buffering 改的是什么？</li>
+        <li>为什么需要两份 As / Bs？ra、rb 是什么、每线程几个、为什么不能和 a[TM]、b[TN] 共用？</li>
+        <li>一轮循环的四步是什么顺序？写 shared 为什么必须在计算之后？为什么每轮只要一次 <code>__syncthreads()</code>？K = 32、BK = 8 时每轮算哪一块、写哪份 buffer？</li>
+        <li><code>ra[idx / num_threads]</code> 为什么会让 ra 掉进 local memory？怎么改？改完怎么确认？</li>
+        <li>double buffering 少搬数据了吗？它藏的是哪一段延迟？shared → 寄存器那一段怎么藏，这次为什么没做？</li>
+        <li>双缓冲后占用率从 33% 掉到 16.7%，为什么反而快了 22%？cycles/指令 从 7.75 到 2.93 为什么不能直接比？应该看哪个数？</li>
+        <li>时间账单怎么读？每调度器 4 个 warp、cycles/指令 是 4.1，还值得继续优化停顿吗？math_pipe_throttle 最大说明什么？</li>
+        <li>每个 SM 能放几个 block 由哪四项决定？Orin 每 SM 最多几个 warp、每个调度器几个？149 个寄存器 × 256 线程为什么只能放 1 个 block？"128 这条线"怎么来的？</li>
+        <li>每 SM 1 个 block 时，每个调度器管几个 warp？为什么不是 1？</li>
+        <li><code>48 bytes stack frame</code> 是什么意思？stack frame &gt; 0 而 spill = 0 说明什么？某个 kernel long_scoreboard 很高且有 stack frame，最可能的原因是什么？</li>
+        <li>RMSNorm 为什么主要看带宽而不看占用率和停顿？RMSNorm "带宽 94%"是在什么形状下测的？</li>
+      </ul>
+      <h3>面试高频问题</h3><ul class="plain">
+        <li>手写 shared memory 分块 GEMM / 卷积，并说明每个 <code>__syncthreads()</code> 的作用。</li>
+        <li>卷积怎么转成矩阵乘？im2col 和 implicit GEMM 的区别？</li>
+        <li>你的 GEMM 达到了 cuBLAS 的多少？差距在哪里？下一步怎么优化？（85%；剩下的是 wait 和 short_scoreboard，每调度器只有 2 个 warp）</li>
+        <li>ncu 的 Warp State Statistics 怎么读？占用率低一定慢吗？</li>
+        <li>什么是 bank conflict？举一个会冲突的例子和修法。</li>
+        <li>为什么寄存器分块比 shared 分块快？读和算的比例是多少？</li>
+        <li>float4 一定更快吗？（不一定：讲 ⑤ 变慢的原因）</li>
+        <li>怎么判断一个 kernel 是计算瓶颈还是访存瓶颈？用什么工具、看什么指标？</li>
+        <li>循环展开为什么能提速？会不会读到还没准备好的寄存器？（scoreboard、编译器换寄存器）</li>
+      </ul></div>
+    </article>

@@ -1,0 +1,351 @@
+<article class="mod" id="m15" hidden>
+      <div class="eyebrow">模块 15</div>
+      <h2>核心算子：Scan（前缀和）</h2>
+      <p class="why"><strong>主线</strong>：scan 求每个位置的前缀和。reduction 只要最后一个总和，scan 要保留每一个中间结果。串行写法是一条长度 n 的依赖链，能并行是因为加法满足结合律、顺序可以重排：先在小范围里算局部前缀和，再把各段拼起来。和 softmax 一样是带宽问题，优化同样沿"分工"（一个 block / 一个 warp / 多个 block）和"算法"（读几遍、几个 kernel）两个方向走。</p>
+
+      <div class="blk" id="m15-s0"><h3>结果总览</h3>
+        <p>计时长度 1M、16M、64M 个 int，参考是 CUB 的 <code>cub::DeviceScan::InclusiveSum</code> 和同样数据量的 copy（Orin，锁频 1300 MHz，GB/s，括号是占 copy 的比例）。① ② ③ 已完成；④ 只讲了思路，暂不写。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>版本</th><th>分工</th><th>做法</th><th>能处理的 n</th><th>结果</th></tr></thead>
+          <tbody>
+            <tr><td>① block</td><td>1 个 block</td><td>shared memory 里做 Hillis-Steele</td><td>n ≤ 1024</td><td>所有 n ≤ 1024 的长度 PASS（太短，没有计时）</td></tr>
+            <tr><td>② multi</td><td>多个 block</td><td>三级：局部 scan → block 和 scan → 加偏移</td><td>任意</td><td>全部 PASS；1M 30.0（18%）、16M 31.7（16%）、64M 22.0（12%）</td></tr>
+            <tr><td>③ warp</td><td>多个 block</td><td>每线程 4 个数（int4）+ <code>__shfl_up_sync</code> + warp 之间经 shared</td><td>任意</td><td>全部 PASS；1M 63.0（37%）、16M 68.6（36%）、64M 51.1（27%），比 ② 快 2 倍多</td></tr>
+            <tr><td>④ lookback（可选）</td><td>多个 block</td><td>decoupled look-back，单个 kernel</td><td>任意</td><td class="muted">只讲了思路（见下面 ④），暂不写</td></tr>
+            <tr><td>CUB（参考）</td><td>—</td><td>look-back + 每线程多个数</td><td>任意</td><td>1M 138（84%）、16M 159（82%）、64M 159（84%）</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+
+      <div class="blk"><h3>定义：inclusive 和 exclusive</h3>
+<pre><code>输入：      [3, 1, 7,  0,  4,  1,  6,  3]
+inclusive： [3, 4, 11, 11, 15, 16, 22, 25]   第 i 个 = in[0] + … + in[i]，包含自己
+exclusive： [0, 3, 4,  11, 11, 15, 16, 22]   第 i 个 = in[0] + … + in[i-1]，不含自己，前面补 0</code></pre>
+        <p>两者只差一位：exclusive 就是 inclusive 整体右移一格、前面补 0。reduction 的结果 25 就是 inclusive 的最后一个数。</p>
+      </div>
+
+      <div class="blk"><h3>为什么难并行，又为什么能并行</h3>
+        <p>CPU 上只有一行：<code>out[i] = out[i-1] + in[i]</code>。每一步都要等上一步的结果，形成一条长度 n 的依赖链，看起来没法并行。</p>
+        <p>但加法满足结合律：<code>(3 + 1) + (7 + 0)</code> 和 <code>((3 + 1) + 7) + 0</code> 一样。所以可以先让不同线程各算一小段的部分和，再把这些部分和拼起来——这和 reduction 用树形规约是同一个道理，区别只是 scan 要让<strong>每个位置</strong>都拿到"从头到自己"的和。</p>
+        <p class="small muted">测试用 int 而不用 float：浮点加法换顺序结果会差一点，int 可以和 CPU 串行结果逐个精确比较。</p>
+      </div>
+
+      <div class="blk" id="m15-s1"><h3>算法 1：Hillis-Steele（步数少，加法多一些）</h3>
+        <p>每一步，每个位置加上它左边距离为 offset 的那个数，offset 依次是 1、2、4…：</p>
+<pre><code>初始：       3   1   7   0   4   1   6   3
+offset=1：   3   4   8   7   4   5   7   9    每个数加上左边第 1 个
+offset=2：   3   4  11  11  12  12  11  14    加上左边第 2 个
+offset=4：   3   4  11  11  15  16  22  25    加上左边第 4 个 ✓</code></pre>
+        <ul class="plain">
+          <li><strong>为什么对</strong>：第 s 步结束后，位置 i 存的是"它自己和左边共 2^s 个数之和"（不够的就到开头为止）。每一步把覆盖范围翻倍，log₂n 步后覆盖了全部。</li>
+          <li><strong>代价</strong>：步数 log₂n（8 个数 3 步），但每步差不多 n 个线程都在做加法，总加法约 n·log n，比串行的 n 次多。</li>
+          <li><strong>和 reduction 的关系</strong>：warp reduction 每步也是"拿距离 offset 的数加过来"，但只关心一个位置的结果；scan 让每个位置都保留结果。</li>
+        </ul>
+        <p><strong>动画 · Hillis-Steele 逐步演示</strong>：看每一步每个位置从哪里拿数；切到"原地写"看为什么必须先读、同步、再写。</p>
+<p class="sr-only">动画：8 个数做 Hillis-Steele scan。每一步 offset 翻倍，每个位置加上左边距离 offset 的数，3 步后得到前缀和。另一种模式演示原地写的数据竞争：如果线程按编号从小到大依次原地累加，会读到这一步已经被改过的值，结果出错。</p>
+<div class="anim" id="anim-hs-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+<button id="anim-hs-ok">先读、同步、再写</button><button id="anim-hs-bad">原地 buf[t] += buf[t − off]</button>
+<span style="flex:1"></span><button id="anim-hs-play">播放</button><button id="anim-hs-next">下一步</button><button id="anim-hs-reset">重来</button>
+</div>
+<svg id="anim-hs-sv" viewBox="0 0 680 260" width="100%" role="img" aria-label="Hillis-Steele scan 逐步演示"></svg>
+<div id="anim-hs-res" style="font-size:14px;margin-top:4px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-hs-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');const V0=[3,1,7,0,4,1,6,3],OFF=[1,2,4];let good=true,st=0,tm=null;
+const REF=V0.reduce((a,v)=>{a.push((a.length?a[a.length-1]:0)+v);return a},[]);
+function el(t,a,v){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(v!==undefined)e.textContent=v;sv.appendChild(e);return e}
+function states(){const S=[V0.slice()];let v=V0.slice();for(const o of OFF){let nv;
+ if(good){nv=v.map((x,i)=>i>=o?x+v[i-o]:x)}else{nv=v.slice();for(let i=0;i<8;i++)if(i>=o)nv[i]=nv[i]+nv[i-o]}
+ S.push(nv);v=nv}return S}
+function draw(){sv.innerHTML='';const S=states(),X0=70,CW=70,RY=[40,100,160,220];
+ for(let i=0;i<8;i++)el('text',{x:X0+i*CW+(CW-14)/2,y:18,'text-anchor':'middle','font-size':11,fill:'var(--muted)'},'t = '+i);
+ for(let s=0;s<=Math.min(st,3);s++){el('text',{x:4,y:RY[s]+5,fill:'var(--muted)','font-size':11},s===0?'初始':'off='+OFF[s-1]);
+  S[s].forEach((v,i)=>{const fin=s===3,ok=v===REF[i];
+   el('rect',{x:X0+i*CW,y:RY[s]-14,width:CW-14,height:26,rx:6,fill:fin?(ok?'var(--good-soft)':'var(--amber-soft)'):'var(--panel)',stroke:fin?(ok?'var(--good)':'var(--amber)'):'var(--line)'});
+   el('text',{x:X0+i*CW+(CW-14)/2,y:RY[s]+4,'text-anchor':'middle','font-size':14,'font-weight':600,fill:'var(--ink)'},v)});
+  if(s>0){const o=OFF[s-1];for(let i=o;i<8;i++){
+   el('line',{x1:X0+(i-o)*CW+(CW-14)/2,y1:RY[s-1]+12,x2:X0+i*CW+(CW-14)/2,y2:RY[s]-14,stroke:s===st?'var(--accent)':'var(--line)','stroke-width':s===st?1.6:1})}}}
+ const o=st>0?OFF[st-1]:null;let msg;
+ if(st===0)msg='每个线程 t 负责一个位置。正确答案（串行前缀和）：['+REF.join(', ')+']。';
+ else if(good)msg='off = '+o+'：t ≥ '+o+' 的线程先读 buf[t − '+o+']（读的都是上一行的旧值），全部读完同步，再一起加到自己身上；t &lt; '+o+' 不变。'+(st===3?'<br><span style="color:var(--good)">3 步得到 ['+S[3].join(', ')+']，和串行结果一致。</span>':'');
+ else msg='off = '+o+'：假设线程按 t 从小到大依次原地执行 buf[t] += buf[t − '+o+']，后面的线程会读到前面线程<strong>这一步刚改过</strong>的值，多加一次（这只是一种可能的执行顺序，真实 GPU 上结果不确定）。'+(st===3?'<br><span style="color:var(--amber)">得到 ['+S[3].join(', ')+']，和正确答案 ['+REF.join(', ')+'] 不同。</span>':'');
+ $('res').innerHTML=msg;$('ok').style.borderColor=good?'var(--accent)':'';$('bad').style.borderColor=good?'':'var(--accent)'}
+function stop(){clearInterval(tm);tm=null}
+$('ok').onclick=()=>{stop();good=true;st=0;draw()};$('bad').onclick=()=>{stop();good=false;st=0;draw()};
+$('next').onclick=()=>{stop();st=st>=3?0:st+1;draw()};$('reset').onclick=()=>{stop();st=0;draw()};
+$('play').onclick=()=>{stop();st=0;draw();tm=setInterval(()=>{st++;draw();if(st>=3)stop()},1200)};
+draw();
+})();
+</script>
+        <p>block 版的标准写法（思路示意，不是仓库里的实现）：</p>
+<pre><code>__shared__ int buf[BLOCK];
+int t = threadIdx.x;
+buf[t] = (t &lt; n) ? in[t] : 0;                 // 越界填 0（加法的单位元）
+__syncthreads();
+for (int off = 1; off &lt; BLOCK; off *= 2) {
+    int v = (t &gt;= off) ? buf[t - off] : 0;   // ① 先读：读的是上一步的结果
+    __syncthreads();                          // ② 所有线程都读完
+    buf[t] += v;                              // ③ 再写
+    __syncthreads();                          // ④ 所有线程都写完，下一步才能读
+}
+if (t &lt; n) out[t] = buf[t];</code></pre>
+        <div class="note"><strong>易错</strong>：写成 <code>buf[t] += buf[t - off]</code> 一行，读和写之间没有同步，线程 t 可能读到线程 t − off 这一步刚加过的值（上面动画的"原地写"）。两种改法：拆成"读 → 同步 → 写 → 同步"，或者开两块 buffer 轮流读写（double buffer，每步只要一次同步）。另外，越界线程要填 0 而不是不管，且所有线程都要走到 <code>__syncthreads()</code>，不能提前 return。</div>
+        <p><strong>warp 内</strong>：32 个 lane 本来就同时执行，可以不用 shared memory 和同步，用 <code>__shfl_up_sync</code> 从编号小 off 的 lane 拿数：</p>
+<pre><code>int x = val;
+for (int off = 1; off &lt; 32; off *= 2) {
+    int y = __shfl_up_sync(0xffffffff, x, off);   // 拿 lane − off 的 x；lane &lt; off 时拿到的是自己的值
+    if (lane &gt;= off) x += y;                      // 所以要判断，不能无条件加
+}</code></pre>
+        <p class="small muted">和 softmax 的区别：softmax 规约要每个 lane 都拿到同一个总和，用 <code>__shfl_xor_sync</code>；scan 要每个 lane 拿到不同的前缀和，用 <code>__shfl_up_sync</code>。</p>
+      </div>
+
+      <div class="blk"><h3>算法 2：Blelloch（加法少，但分两个阶段）</h3>
+        <ul class="plain">
+          <li><strong>up-sweep</strong>：就是一次树形 reduction，沿途把各级的部分和留在数组里（位置 1、3、5、7 存相邻两个的和，位置 3、7 存四个的和，位置 7 存总和）。</li>
+          <li><strong>down-sweep</strong>：把根置 0，从根往下走：每个节点把自己的值交给左孩子，把"自己的值 + 左孩子原来的和"交给右孩子。走到底得到 exclusive scan。</li>
+          <li><strong>代价</strong>：总加法约 2n，和串行同一量级（work-efficient）；但步数是 2·log n，实现也更复杂。</li>
+          <li><strong>GPU 上怎么选</strong>：warp 内 32 个线程本来就同时在算，Hillis-Steele 多做的加法没有额外代价，步数少更快；Blelloch 在数据量大、线程不够用时省加法，教材里出现得多。（没有实测对比。）</li>
+        </ul>
+      </div>
+
+      <div class="blk" id="m15-proof"><h3>为什么对：两种算法的证明</h3>
+        <p>两个证明用同一个思路：找一个<strong>每一步结束后都成立的性质（不变式）</strong>，证明每一步都保持它，最后一步时它正好就是答案。记号：<code>S[a..b]</code> = x[a] + … + x[b]，下标小于 0 的部分截掉。</p>
+        <p><strong>Hillis-Steele</strong>。不变式：offset = d 这一步开始前，<code>buf[i] = S[i−d+1 .. i]</code>，即"以 i 结尾、长度为 d 的一段"的和（不够 d 时从 0 开始）。</p>
+        <ul class="plain">
+          <li>起点 d = 1：buf[i] = x[i]，成立。</li>
+          <li>i ≥ d 时，这一步做 buf[i] + buf[i−d] = S[i−d+1..i] + S[i−2d+1..i−d]，两段首尾相接、不重叠，合起来是长度 2d 的一段。</li>
+          <li>i &lt; d 时 buf[i] 已经是 S[0..i]，前缀算完了，不能再加——所以只有 i ≥ offset 的线程做加法。</li>
+          <li>d ≥ n 时所有位置都是 S[0..i]，即 inclusive scan，共 ⌈log₂n⌉ 步。</li>
+        </ul>
+        <p>证明用的是 <strong>buf[i−d] 这一步之前的值</strong>。如果读到别的线程这一步刚改过的值，长度就不是 d，会重复计数。x = [1, 1, 1, 1] 原地写的一种顺序：offset = 1 时线程 1、2、3 依次读到新值，buf 已经是 [1, 2, 3, 4]；offset = 2 时线程 3 又算 buf[3] + buf[1] = 4 + 2 = 6，x[0]、x[1] 被加了两次。这就是"先读、同步、再写"的原因。</p>
+        <p><strong>Blelloch</strong>（n 是 2 的幂；先得到 exclusive，要 inclusive 再加上 x[i]）。把每个长度 2^k 的块用它的最右端代表，L、R 是左右两半的最右端。</p>
+        <ul class="plain">
+          <li>up-sweep 每层做 <code>a[R] += a[L]</code>。不变式：做完这一层，每个块的最右端存整块的和。最后 a[n−1] 是总和。</li>
+          <li>down-sweep 先把根清零，然后每个块做 <code>t = a[L]; a[L] = a[R]; a[R] += t</code>。不变式：处理某层之前，块的最右端存"这个块前面所有数的和"P，而 a[L] 仍是左半段的和。左半段前面的和就是 P，右半段前面的和是 P + 左半段的和，代码正好这样赋值。块长变成 1 时就是 exclusive scan。</li>
+        </ul>
+<pre><code>[3, 1, 7, 0, 4, 1, 6, 3]
+up-sweep   块长 2：[3, 4, 7, 7, 4, 5, 6, 9]
+           块长 4：[3, 4, 7,11, 4, 5, 6,14]
+           块长 8：[3, 4, 7,11, 4, 5, 6,25]    a7 = 总和
+根清零：           [3, 4, 7,11, 4, 5, 6, 0]
+down-sweep 块长 8：[3, 4, 7, 0, 4, 5, 6,11]
+           块长 4：[3, 0, 7, 4, 4,11, 6,16]
+           块长 2：[0, 3, 4,11,11,15,16,22]    exclusive ✓</code></pre>
+        <p>加法次数：up-sweep 和 down-sweep 各 n − 1 次，共约 2n；Hillis-Steele 是 n·log₂n（n = 1024 时约 1 万次，多 5～10 倍，但只有 10 步）。</p>
+        <div class="note"><strong>两个证明的共同点</strong>：只用到结合律，没用交换律（左右两段的顺序始终不变）。所以把加法换成任何满足结合律的运算，scan 都成立：max、min、乘法、矩阵乘法，online softmax 的 (m, d) 合并、FlashAttention 的分块合并也是这一类，所以它们能分块并行。浮点加法不严格满足结合律，换顺序结果可能差最后一位，这也是测试用 int 的原因。</div>
+      </div>
+
+      <div class="blk" id="m15-s2"><h3>大数组：分三级，或者 decoupled look-back</h3>
+        <p>一个 block 最多 1024 个线程，处理不了整个数组，要把数组分段，每个 block 一段：</p>
+<pre><code>① 每个 block 各自 scan 自己那一段，同时把这一段的总和（block sum）写到 work[blockIdx.x]
+② 对 work[] 再做一次 exclusive scan → 得到每个 block 的"起始偏移"
+   （block 太多、work[] 一个 block 装不下时，② 要递归地再分一层）
+③ 每个 block 把自己那段的每个数都加上这个偏移
+
+例：n = 8，每段 4 个
+  段 0 [3 1 7 0] → [3 4 11 11]，和 11      段 1 [4 1 6 3] → [4 5 11 14]，和 14
+  对 [11, 14] 做 exclusive scan → [0, 11]
+  段 1 每个数加 11 → [15 16 22 25]，拼起来就是完整的前缀和</code></pre>
+        <ul class="plain">
+          <li><strong>代价</strong>：3 个 kernel，数据读 2 遍、写 2 遍（① 读输入、写局部结果，③ 再把局部结果读回来、加偏移后写）。这对应 softmax 里的"读三遍"：带宽算子多读一遍就慢一截。</li>
+          <li><strong>decoupled look-back</strong>（CUB 的做法）：只用一个 kernel。每个 block 算完自己这段的和就公布出去；然后往前看前面的 block：前一个已经公布了"含前面所有的累计前缀"就直接用，只公布了"自己这段的和"就先加上、继续往前看。不用等前面所有 block 全部完成，数据只读一遍、写一遍。这是这个算子里最难的部分（要处理 block 的调度顺序和内存可见性），列为可选。</li>
+        </ul>
+        <p class="small muted">测试长度特意选了 1024、1025（刚好超过一个 block）、4097、100003、5000011（block 和多到需要再分一层）。出错时打印第一个错的位置：比如第一个错在 i = 1024，基本就能确定是 block 之间的衔接（② 或 ③）出了问题。</p>
+      </div>
+
+      <div class="blk" id="m15-s3"><h3>实测：① block 和 ② multi</h3>
+        <p><strong>① block</strong>（一个 block，1024 个线程，shared memory 里 Hillis-Steele）。写 block 版时常见的 6 处错误：</p>
+        <ul class="plain">
+          <li><code>__shared__ float [BLOCK] buf;</code> → <code>__shared__ int buf[BLOCK];</code>（类型是 int，方括号在变量名后）。</li>
+          <li>所有线程都读 <code>X[r]</code>（r 是 block 起点）→ 用全局位置 <code>g = r + i</code> 读，越界补 0。</li>
+          <li>循环写成 <code>n *= 2</code> → <code>offset *= 2</code>，上限用 BLOCK。</li>
+          <li>条件 <code>i &gt; offset</code> → <code>i &gt;= offset</code>（offset = 1 时 i = 1 也要加 buf[0]）。</li>
+          <li><code>__syncthreads()</code> 放在 if 里，i &lt; offset 的线程走不到 → 所有线程都读（不该加的读 0）、同步、再加、再同步。</li>
+          <li><code>bur</code> 拼写；写回也要用 g 并判断边界。</li>
+        </ul>
+        <p>还有两处"只有一个 block 时碰巧没问题"：边界判断用 block 内编号 i 而不是全局位置；循环上限用 n 而不是 BLOCK（offset 超过 BLOCK 后不会再有线程做加法，只是白跑循环和同步）。前者在 scan_local 里改成了全局位置，后者在 scan_local 里改成了 BLOCK（仓库里 scan_block 的上限仍是 n，因为它只处理 n ≤ 1024，结果不受影响）。</p>
+        <p><strong>② multi</strong>（三步、三个 kernel，BLOCK = 1024）：</p>
+<pre><code>inline bool launch_multi(const int* X, int* Y, int n, int* work, cudaStream_t s) {
+    constexpr int BLOCK = 1024;
+    int nb = (n + BLOCK - 1) / BLOCK;          // block 数 = sums 的个数
+    int* sums = work;                          // 这一层的 sums 放在 work 开头
+    scan_local&lt;BLOCK&gt;&lt;&lt;&lt;nb, BLOCK, 0, s&gt;&gt;&gt;(X, Y, n, sums);   // ① 局部 scan + 写段和
+    if (nb == 1) return true;                  // 只有一段，已经是答案
+    launch_multi(sums, sums, nb, work + nb, s);              // ② 对 sums 原地 scan（递归）
+    add_offset&lt;BLOCK&gt;&lt;&lt;&lt;nb, BLOCK, 0, s&gt;&gt;&gt;(Y, n, sums);     // ③ 第 b 段加 sums[b − 1]
+    return true;
+}</code></pre>
+        <ul class="plain">
+          <li><strong>为什么拆成 3 个 kernel</strong>：③ 要等所有 block 的 ① 都做完。同一个 kernel 里 block 之间不能互相等：<code>__syncthreads()</code> 只管一个 block；64M 时有 6 万多个 block，Orin 一次只放得下几百个，先上去的 block 等后面的、后面的又等前面的让位置，会死锁。同一个 stream 里前一个 kernel 全部结束后一个才开始，kernel 之间就是全局同步点。</li>
+          <li><strong>递归</strong>：n = 2²⁶ 时第一层 65536 个段和，一个 block 处理不了，再调一次 launch_multi：第二层 64 个，一个 block 就够。测试长度 5000011 就是为了走到两层。</li>
+          <li><strong>work</strong>：bench 预先分配的 n + 4096 个 int 当草稿纸；第一层 sums 用 <code>work[0..nb)</code>，下一层接在 <code>work + nb</code>。不在 launch 里 cudaMalloc，因为它慢（几十 µs 到几 ms，还会让 GPU 等），计时会变成测 cudaMalloc；CUB 的临时空间、cuBLAS / TensorRT 的 workspace 也是调用者分配、库只用。内容不会自动清零，multi 先写后读不受影响，look-back 的标志位要在 launch 里先 <code>cudaMemsetAsync</code>。</li>
+          <li><strong>原地 scan 和 <code>__restrict__</code></strong>：递归时 X 和 Y 都是 sums。每个位置由同一个线程先读进 shared、同步后才写回，所以原地没问题；但 <code>__restrict__</code> 承诺两个指针不重叠，这里正好违反，所以 scan_local 的 X、Y 不能加。</li>
+          <li>其他易错点：<code>threadIdx</code> 少 <code>.x</code>、<code>sums</code> 拼成 <code>sum</code>、X / Y 的 <code>__restrict__</code>、<code>launch_block</code> 还是 <code>return false</code>（函数末尾漏 return 时返回值是随机的，bench 可能跳过、也可能去检查没跑过的结果）。</li>
+        </ul>
+        <div class="tablewrap"><table>
+          <thead><tr><th>n</th><th class="num">copy</th><th class="num">multi</th><th class="num">CUB</th></tr></thead>
+          <tbody>
+            <tr><td>1M</td><td class="num">165</td><td class="num">30.0（18%）</td><td class="num win">138（84%）</td></tr>
+            <tr><td>16M</td><td class="num">193</td><td class="num">31.7（16%）</td><td class="num win">159（82%）</td></tr>
+            <tr><td>64M</td><td class="num">188</td><td class="num">22.0（12%）</td><td class="num win">159（84%）</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">Orin，GB/s，锁频 1300 MHz。所有正确性长度（1、31、32、33、1000、1024、1025、4097、100003、5000011）block、multi 都 PASS。不锁频时 GPU 可能只跑 306 MHz，计时前要先锁频。</p>
+        <p><strong>为什么只有 12～18%</strong>：按读写份数，multi 是 ① 读 X 写 Y、③ 读 Y 写 Y，共 4n 次访问，copy 是 2n，预计约 copy 的 50%。实测远低于这个，说明瓶颈不在显存带宽而在 scan_local 本身。推测的三个原因（<strong>没有用 ncu 验证</strong>）：</p>
+        <ol class="plain">
+          <li>同步太多：1024 个线程做 10 轮，每轮 2 次 <code>__syncthreads()</code>，共 20 次，每次都要等 32 个 warp 到齐。</li>
+          <li>每个 SM 只能放 1 个 block（32 个 warp，上限 48 个，放不下第二个），同步时没有别的 block 的 warp 可以切换上来，延迟藏不住——和 GEMM 里占用率低是同一类问题。</li>
+          <li>每个线程只处理 1 个数，却要做约 10 次 shared 读写，Hillis-Steele 的 n·log n 次加法在这里体现出来。</li>
+        </ol>
+        <p>64M 比 16M 更慢（12% 对 16%），可能和多一层递归有关，没有查。CUB 到 84% 是因为 look-back 只读一遍写一遍、每个线程处理很多个数（先在寄存器里串行累加）、warp 内用 shuffle 基本不用 <code>__syncthreads()</code>。</p>
+      </div>
+
+      <div class="blk" id="m15-s4"><h3>③ warp 版：设计和实测</h3>
+        <p>目标是修好 scan_local 自己慢的问题。三步结构不变，显存仍是 4n 次访问，上限还是 copy 的约 50%；剩下一半留给 ④ look-back。参数：BLOCK = 256 个线程，每线程 ITEMS = 4 个数，每个 block 负责 1024 个数。block 内部 5 步（下面的例子假设一个 warp 只有 4 个 lane）：</p>
+<pre><code>第 0 步  每个线程用 int4 读连续 4 个数
+         lane 0 [3,1,7,0]   lane 1 [4,1,6,3]   lane 2 [2,5,1,1]   lane 3 [0,2,2,4]
+第 1 步  线程内串行求前缀（寄存器里，不用同步）
+         [3,4,11,11]        [4,5,11,14]        [2,7,8,9]          [0,2,4,8]
+         每个线程的总和 v[3]：11, 14, 9, 8
+第 2 步  warp 内对总和做 inclusive scan（__shfl_up_sync）
+         incl = [11, 25, 34, 42]，excl = incl − v[3] = [0, 11, 25, 34]
+第 3 步  lane 31 把 warp 总和写进 warp_sums[warp]，同步；warp 0 对 warp_sums 再 scan，同步
+第 4 步  偏移 = excl + warp_sums[warp − 1]（warp &gt; 0），加到 4 个数上，int4 写回
+         lane 2：[2,7,8,9] + 25 = [27,32,33,34]
+第 5 步  把整个 block 的总和写进 sums[blockIdx.x]</code></pre>
+        <ul class="plain">
+          <li><strong>为什么每线程的 4 个数必须连续</strong>：scan 依赖顺序（只用结合律、不用交换律），线程 t 的数要整段排在线程 t+1 前面，线程内的串行前缀才有意义，不能像 softmax 那样按 <code>lane + k·32</code> 交错。连续读也不破坏合并访问：每个 lane 用 int4 读 16 字节，一个 warp 正好连续 512 字节。</li>
+          <li><strong>int4</strong>：<code>*reinterpret_cast&lt;const int4*&gt;(X + base)</code> 生成一条 128 位读（<code>LDG.E.128</code>），只能读一个起点开始的连续 4 个 int，地址必须 16 字节对齐，不对齐不是变慢而是直接报 <code>misaligned address</code>。cudaMalloc 至少 256 字节对齐，段起点是 1024 的倍数没问题；递归时 sums 的起点 <code>work + nb</code> 不一定对齐，所以框架里写成 <code>next = work + (nb + 3) / 4 * 4</code>。n 不是 4 的倍数时，最后一个线程逐个读写、越界补 0。</li>
+          <li><strong>incl 和 excl</strong>：shuffle 版 Hillis-Steele 自然得到 inclusive；第 4 步要加的是"排在我前面的线程的总和"，即 excl = incl − 自己的总和。加 incl 会把自己的 4 个数算两次（lane 2 会得到 [36,41,42,43]）。lane 31 的 incl 就是整个 warp 的总和，第 3 步用它。线程 → warp → block → 多个 block，每一层都是"先算自己这部分的总和，再加上前面所有部分的总和"。</li>
+          <li><strong><code>__shfl_up_sync</code> 的判断</strong>：lane &lt; offset 时它原样返回自己的值，所以要 <code>if (lane &gt;= offset) x += y</code>，否则自己加了两次。</li>
+          <li><strong>对比 ②</strong>：每线程 1 个数 → 4 个（int4）；block 内 shared 10 轮 → 寄存器串行 + shuffle；每 block 20 次同步 → 2 次；每 SM 1 个 block → 6 个（256 线程，受 48 个 warp 上限）；总加法 n·log n → 约 n。</li>
+        </ul>
+        <p class="small muted"><code>launch_warp</code> 是三步加递归，③ 复用 <code>add_offset&lt;1024&gt;</code>；<code>warp_scan_incl</code> 和 <code>scan_local_warp</code> 分 6 步完成（见下面的易错点）。函数限定符：<code>__global__</code> 是 kernel（CPU 用 <code>&lt;&lt;&lt;&gt;&gt;&gt;</code> 启动、返回 void）；<code>__device__</code> 是 GPU 上的普通函数，只能由 GPU 代码调用、可以有返回值；<code>__forceinline__</code> 强制展开，避免真正的函数调用（传参、保存寄存器、可能用到 local memory 上的栈）；头文件里的普通函数加 <code>inline</code> 是为了被多个 .cu 包含时不报重复定义。</p>
+        <p><strong>shuffle 版 Hillis-Steele 为什么对</strong>：<code>__shfl_up_sync(0xffffffff, x, off)</code> 让每个 lane 拿"编号比自己小 off 的 lane"当前的 x。它是一条指令，32 个 lane 同时交出、同时拿到，所以拿到的一定是对方这一步加之前的值，shared 版必须的"先读、同步、再写"在这里天然成立，不需要 <code>__syncthreads()</code>。8 个 lane 的例子：</p>
+<pre><code>初始 x：     3   1   7   0   4   1   6   3
+off = 1：    3   4   8   7   4   5   7   9     lane ≥ 1 加上左边第 1 个
+off = 2：    3   4  11  11  12  12  11  14     lane ≥ 2 加上左边第 2 个
+off = 4：    3   4  11  11  15  16  22  25     lane ≥ 4 加上左边第 4 个</code></pre>
+        <p>off 从 16 往 1 倒着走也对：lane i 最后的值是所有 x[i − d] 之和，d 是从 {16, 8, 4, 2, 1} 里挑若干个加起来，而 0～31 的每个数写成二进制只有一种方式，所以每一项正好加一次，和先后顺序无关；d &gt; i 的项被 <code>if (lane &gt;= off)</code> 挡掉。两种顺序只是中间状态不同，习惯上写从 1 往上。</p>
+        <p><strong>shuffle 只在调用者自己的 warp 里交换</strong>：<code>warp_scan_incl</code> 是每个线程各自执行一遍，lane 是调用者在自己 warp 里的编号；lane 0 往前没有 lane，返回自己的值、被 if 挡掉，不会去拿上一个 warp 的 lane 31。所以三层衔接各用各的办法：warp 内 shuffle，warp 之间 shared + <code>__syncthreads()</code>，block 之间多个 kernel 或 look-back。</p>
+        <p><strong>第 3 步的两个细节</strong>：warp 0 对 8 个 warp_sums 做 scan 时，32 个 lane 必须全部执行 shuffle（mask 是 0xffffffff），所以 lane ≥ 8 的读 0 陪着算、最后只有 lane 0～7 写回——和 softmax warp 版越界填 −∞ 是同一个思路。两个 <code>__syncthreads()</code> 都要写在 <code>if (warp == 0)</code> 外面：同步 ① 保证 8 个 warp 都写完 warp_sums，同步 ② 保证 warp 0 写回 scan 结果后别的 warp 才读 <code>warp_sums[warp − 1]</code>。</p>
+        <p><strong>incl、excl 不会改动 v</strong>：<code>warp_scan_incl(int x)</code> 按值传参，传进去的是 v[3] 的副本，shuffle 交换的也是各线程自己的副本 x，v[0..3] 直到第 4 步才被改。第 1 步之后 v[3] 已经是本线程 4 个数的总和，所以 incl 是"包括我在内前面所有线程的总和"，excl = incl − v[3] 不含自己的任何一个数。lane 1 的完整过程（只看 warp 内）：</p>
+<pre><code>                       v[0]  v[1]  v[2]  v[3]   incl   excl
+第 0 步 读入             4     1     6     3
+第 1 步 串行前缀         4     5    11    14
+第 2 步 incl = scan(14)  4     5    11    14     25
+        excl = 25 − 14                                   11
+第 4 步 每个都加 excl    15    16    22    25</code></pre>
+        <p><strong>warp_sums 和 sums</strong>：warp_sums 在 shared memory，8 个元素，衔接一个 block 里的 8 个 warp；sums 在显存（work 的开头），nb 个元素，衔接所有 block，后面的 kernel ② ③ 要读，所以必须在显存。</p>
+        <p><strong>易错</strong>：第 0 步循环里用了逗号（编译不过），而且那个循环把同一个 int4 读了 4 遍，也没处理尾部；第 4 步没处理尾部，会写到 Y 外面（比读越界更危险）；删掉 <code>launch_warp</code> 开头的 <code>return false</code>；加回 <code>static_assert(ITEMS == 4)</code>（代码写死了 v[0]～v[3]）。<code>-Xptxas -v</code>：23 个寄存器、0 spill、shared 32 字节。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>n</th><th class="num">② multi</th><th class="num">③ warp</th><th class="num">CUB</th></tr></thead>
+          <tbody>
+            <tr><td>1M</td><td class="num">29.8（18%）</td><td class="num win">63.0（37%）</td><td class="num">137（81%）</td></tr>
+            <tr><td>16M</td><td class="num">31.6（16%）</td><td class="num win">68.6（36%）</td><td class="num">158（82%）</td></tr>
+            <tr><td>64M</td><td class="num">22.0（12%）</td><td class="num win">51.1（27%）</td><td class="num">159（85%）</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">Orin，锁频 1300 MHz，GB/s，括号是占 copy 的比例，同一次运行。所有正确性长度 PASS。</p>
+        <ol class="plain">
+          <li><strong>改了什么</strong>：scan_local 从"每线程 1 个数、shared 里 10 轮、20 次同步"换成"每线程 4 个连续的数（int4）、寄存器串行前缀、warp shuffle、2 次同步"。</li>
+          <li><strong>为什么快</strong>：② 的瓶颈在 scan_local 自己（同步多、每 SM 只能放 1 个 1024 线程的 block、n·log n 次 shared 读写），③ 把这几项都去掉了。</li>
+          <li><strong>数字</strong>：16M 时 31.6 → 68.6 GB/s（2.2×）。三步结构读写 4n 次，上限约 copy 的 50%，16M 理想约 1.4 ms、实际 1.96 ms，已到上限的约 70%。剩下的差距推测在 ③ <code>add_offset</code>（还是每线程 1 个数、普通 int 读写），<strong>要把三个 kernel 分开计时才能确认</strong>。64M 两个版本都掉到 27% / 12%，copy 没掉；转置 8192²（同为 256 MB）也只有 80%，可能同一原因（猜测 TLB），没查。</li>
+        </ol>
+      </div>
+
+      <div class="blk" id="m15-s5"><h3>④ decoupled look-back 的思路（暂不写）</h3>
+        <p><strong>要解决的问题</strong>：三级方案里 ③ 必须等所有 block 的 ① 做完，block 之间不能在一个 kernel 里互相等，只好拆成 3 个 kernel，Y 写完还要再读一遍、改一遍。如果一个 block 在写出结果之前就能知道"前面所有 block 的总和"，就只需要读一遍、写一遍。</p>
+        <p><strong>想法 1：接力</strong>。block b 等 block b−1 公布"到它为止的前缀和"，加上自己的再公布。这是一条串行链：64M 时 6 万多个 block 依次接力，每一棒都要经过一次显存，加起来比三级方案还慢。</p>
+        <p><strong>想法 2：解耦</strong>。关键是一个 block 自己这段的总和不需要等任何人就能算出来。所以每个 block 公布两种信息：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>状态</th><th>含义</th><th>什么时候能公布</th></tr></thead>
+          <tbody>
+            <tr><td>X</td><td>还没有信息</td><td>初始</td></tr>
+            <tr><td>A（aggregate）</td><td>只有我这段的总和</td><td>段内 reduce 完，很快</td></tr>
+            <tr><td>P（prefix）</td><td>第 0 段到我这段（含）的全部前缀和</td><td>知道前面所有段的总和之后</td></tr>
+          </tbody>
+        </table></div>
+<pre><code>block b：
+1. 算出自己的总和 agg，马上公布 (A, agg)
+2. 从 b−1 往前看：X → 原地等；A → 加到 excl 上、继续往前；P → 加到 excl 上、停
+3. 公布 (P, excl + agg)
+4. 段内每个数加 excl，写出最终结果
+
+例：4 个 block 的段和 10、20、30、40；某时刻 block 0 = (P,10)，block 1 = (A,20)，block 2 = (A,30)
+block 3 往前看：30（A）→ 20（A）→ 10（P，停），excl = 60，公布 (P, 100)</code></pre>
+        <p>block 3 不用等 block 1、2 做完它们的往前看，只要它们算出 A 就行，所以等待链不再贯穿所有 block。</p>
+        <p><strong>4 个实现上的坑</strong>：</p>
+        <ol class="plain">
+          <li><strong>block 启动顺序不保证</strong>：block 3 在等 block 2，而 block 2 还没被调度上来、SM 又被正在等的 block 占满，就会死锁。办法是不用 blockIdx.x 当段号，每个 block 启动后用 <code>atomicAdd(&amp;counter, 1)</code> 领号，号是按实际启动顺序领的，要等的前面的段一定已经在跑或已结束。</li>
+          <li><strong>状态和值必须一起被看到</strong>：先写值再写状态，别的 SM 可能看到状态已是 A、值还是旧的。把状态和值打包成一个 64 位数一次写入。</li>
+          <li><strong>等待时必须真的去读显存</strong>：普通的 <code>while (status == X)</code> 可能被编译器只读一次放进寄存器，或被 L1 缓存住，永远看不到更新。要用 <code>volatile</code> 指针或原子操作读。</li>
+          <li><strong>每次 launch 前清零</strong>：状态数组和计数器都要是 0，所以 launch 里先 <code>cudaMemsetAsync(work, 0, …)</code>。</li>
+        </ol>
+        <p><strong>和 double buffering 不是一回事</strong>：double buffering 在一个 block 内部，让搬下一块和算这一块重叠；look-back 是 block 之间的通信协议，省掉的是一整个 kernel 和一遍读写。更贴切的类比是加法器：接力像逐位进位，look-back 像跳跃进位。一句话：把"自己的部分"和"依赖别人的部分"拆开，自己的部分先公布，依赖别人的部分往前查到第一个已确定的结果就停。CUB 还让一个 warp 同时往前看 32 个 block、再用 shuffle 加起来。</p>
+        <p class="small muted">决定先不写 ④：思路已经讲清，难点在内存可见性和调度细节，调试耗时，而之后的卷积和 attention 用不上它。scan 在 ③ 收尾。</p>
+      </div>
+
+      <div class="blk"><h3>推理里用在哪</h3>
+        <ul class="plain">
+          <li><strong>top-p 采样</strong>：概率从大到小排序后求累计和，找到第一个超过 p 的位置，只在它之前的词里采样。</li>
+          <li><strong>MoE 分发</strong>：先统计每个专家分到几个 token，再做一次 exclusive scan，就得到每个专家在连续缓冲区里的起始位置，每个 token 知道自己该写到哪里。</li>
+          <li><strong>stream compaction / radix sort</strong>：每个元素标 0 / 1（留不留、这一位是 0 还是 1），对标记做 exclusive scan，结果就是它该写到的下标。</li>
+        </ul>
+      </div>
+
+      <div class="blk iv" id="m15-iv"><h3>面试要求</h3>
+        <p>scan 是 reduction 的延伸，常和 reduction、softmax 一起考；三级方案也是"多 block 之间怎么协作"的典型例子。</p>
+        <h4>必须会</h4>
+        <ul class="plain">
+          <li>inclusive 和 exclusive 的定义，能手算一个 8 个数的例子。</li>
+          <li>为什么串行看起来不能并行、为什么又能并行（结合律）。</li>
+          <li>当场手写单 block 的 Hillis-Steele：先读、同步、再写、再同步；越界填 0；说出步数和总加法次数。</li>
+        </ul>
+        <h4>应该会</h4>
+        <ul class="plain">
+          <li>用 <code>__shfl_up_sync</code> 写 warp 内 scan，说清为什么要判断 <code>lane &gt;= off</code>；和 <code>__shfl_xor_sync</code> 规约的区别。</li>
+          <li>大数组的三级方案，用 n = 8、每段 4 个手算一遍；block 和太多时怎么递归；读写了几遍；为什么要拆成几个 kernel（block 之间不能互相等）。</li>
+          <li>block 内"每线程多个数 + warp shuffle + warp 之间经 shared"的三层写法，以及 incl / excl 的用法。</li>
+          <li>Blelloch 的 up-sweep / down-sweep 是什么、和 Hillis-Steele 的取舍（work-efficient vs 步数）。</li>
+          <li>scan 在推理里的用处：top-p、MoE 分发、stream compaction。</li>
+        </ul>
+        <h4>加分</h4>
+        <ul class="plain">
+          <li>decoupled look-back 的思路：每个 block 公布局部和 / 累计前缀，往前查看而不是等全部完成；能说出 4 个实现上的坑（领号防死锁、64 位打包、volatile / 原子读、每次清零）。</li>
+          <li>用不变式证明 scan 正确；说明为什么所有满足结合律的运算（max、矩阵乘法、online softmax 的合并）都能 scan。</li>
+          <li>测试设计：用 int 精确比较、打印第一个错的位置来定位 block 衔接问题、选刚好跨越 block 边界的长度。</li>
+        </ul>
+        <p class="small muted">三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+      </div>
+
+      <div class="selftest"><h3>自测</h3><ul class="plain">
+        <li>[3, 1, 7, 0, 4, 1, 6, 3] 的 inclusive 和 exclusive scan 各是什么？两者什么关系？</li>
+        <li><code>out[i] = out[i-1] + in[i]</code> 为什么看起来没法并行？结合律怎么让它能并行？</li>
+        <li>Hillis-Steele 第 s 步之后位置 i 存的是什么？为什么 log₂n 步就够？总共做了多少次加法？</li>
+        <li>为什么不能写成 <code>buf[t] += buf[t - off]</code>？举一个读到"这一步刚改过的值"的例子。除了加同步还有什么改法？</li>
+        <li><code>__shfl_up_sync</code> 在 lane &lt; off 时返回什么？为什么要判断 <code>lane &gt;= off</code>？scan 为什么用 up 而 softmax 规约用 xor？</li>
+        <li>Blelloch 的两个阶段各做什么？为什么叫 work-efficient？warp 内为什么反而用 Hillis-Steele？</li>
+        <li>三级方案的三步是什么？用 n = 8、每段 4 个算一遍。block 和装不下一个 block 时怎么办？输入输出各读写几遍？</li>
+        <li>第一个错误出现在 i = 1024，最可能是哪一步出了问题？为什么测试长度要包含 1025 和 5000011？</li>
+        <li>decoupled look-back 比三级方案省在哪里？难点是什么？</li>
+        <li>用不变式证明 Hillis-Steele 和 Blelloch 的正确性。证明里哪一步说明了必须"先读、同步、再写"？为什么只用到结合律就够？</li>
+        <li>multi 为什么必须拆成 3 个 kernel，不能在一个 kernel 里让 block 互相等？递归时 sums 放在哪里？为什么 scan_local 的 X、Y 不能加 <code>__restrict__</code>？</li>
+        <li>multi 按读写份数应有 copy 的约 50%，实测只有 12～18%，可能的原因是什么？CUB 为什么能到 84%？</li>
+        <li>warp 版里每个线程的 4 个数为什么必须连续？int4 读的两个条件是什么？excl 怎么从 incl 得到，为什么第 4 步加的是 excl？</li>
+        <li>MoE 分发时为什么要 exclusive 而不是 inclusive scan？top-p 采样里 scan 用在哪一步？</li>
+        <li>shuffle 版 Hillis-Steele 为什么不需要 <code>__syncthreads()</code>？offset 从 16 往 1 倒着走为什么也对？</li>
+        <li>warp 0 对 warp_sums 做 scan 时，为什么 lane ≥ 8 也要参与、读 0？两个 <code>__syncthreads()</code> 各保证什么、为什么不能写进 if？</li>
+        <li><code>warp_scan_incl(v[3])</code> 会改动 v 吗？为什么 4 个 v[k] 都加同一个 excl？warp_sums 和 sums 各放在哪、各衔接什么？</li>
+        <li>③ 比 ② 快 2 倍多的原因是什么？三步结构的上限为什么是 copy 的约 50%？剩下的差距要怎么定位？</li>
+        <li>decoupled look-back 的 X / A / P 各是什么？为什么不用 blockIdx.x 当段号？为什么状态和值要打包成 64 位？它和 double buffering 有什么区别？</li>
+      </ul>
+      <h3>面试高频问题</h3><ul class="plain">
+        <li>写一个并行前缀和（单 block），然后扩展到任意长度。</li>
+        <li>Hillis-Steele 和 Blelloch 有什么区别？</li>
+        <li>scan 和 reduction 的关系是什么？</li>
+      </ul></div>
+    </article>

@@ -1,0 +1,311 @@
+<article class="mod" id="m14" hidden>
+      <div class="eyebrow">模块 14</div>
+      <h2>核心算子：Softmax，从三遍读到 online softmax</h2>
+      <p class="why"><strong>主线</strong>：softmax 把一行分数变成概率（lm_head 后的采样、attention 的权重），计算很少，是带宽问题；每行要先做两次规约（最大值、求和）。优化沿两个方向：<strong>分工</strong>（一行交给 1 个线程 / 1 个 block / 1 个 warp）和<strong>算法</strong>（读 3 遍 / 2 遍 / 1 遍）。最后按行长 n 分档派发。online softmax 是 FlashAttention 的核心。</p>
+
+      <div class="blk"><h3>结果总览</h3>
+        <p>Orin，锁频，FP32；GB/s 按读 X 一遍 + 写 Y 一遍计算，括号是占 copy 的比例。全部和 CPU double 比，误差 &lt; 1e-6。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>rows × n</th><th class="num">① naive</th><th class="num">② block</th><th class="num">③ online</th><th class="num">④ warp</th></tr></thead>
+          <tbody>
+            <tr><td>65536 × 128</td><td class="num">13.3（8%）</td><td class="num">34.1（19%）</td><td class="num">35.4（20%）</td><td class="num win">190.2（108%）</td></tr>
+            <tr><td>16384 × 1024</td><td class="num">11.3（6%）</td><td class="num">167.8（94%）</td><td class="num">165.5（92%）</td><td class="num win">189.4（106%）</td></tr>
+            <tr><td>4096 × 4096</td><td class="num">19.8（11%）</td><td class="num win">189.9（106%）</td><td class="num">179.1（100%）</td><td class="num">n &gt; 1024 不适用</td></tr>
+            <tr><td>512 × 32000</td><td class="num">6.3（4%）</td><td class="num">87.2（49%）</td><td class="num win">113.4（63%）</td><td class="num">不适用</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li>前三组模拟 attention（一行 = 一个 token 对所有 token 的分数），最后一组模拟 512 个请求对 32000 词表采样。</li>
+          <li>超过 100% 是因为 copy 本身只到约 178 GB/s；190 约是 DRAM 上限 204.8 的 93%。</li>
+          <li>下面的原因按读写份数和缓存大小估算，没有用 ncu 验证。</li>
+        </ul>
+        <div class="tablewrap"><table>
+          <thead><tr><th>版本</th><th>分工</th><th>读 X 几遍</th><th>每元素 exp</th><th>同步</th><th>适合</th></tr></thead>
+          <tbody>
+            <tr><td>① naive</td><td>1 线程 1 行</td><td>3</td><td>2</td><td>无</td><td>都不适合</td></tr>
+            <tr><td>② block</td><td>1 block 1 行</td><td>3（后两遍可能命中缓存）</td><td>2</td><td>16 次</td><td>中等 n（1024～4096）</td></tr>
+            <tr><td>③ online</td><td>1 block 1 行</td><td>2</td><td>3</td><td>有</td><td>很长的 n（32000）</td></tr>
+            <tr><td>④ warp</td><td>1 warp 1 行</td><td>1</td><td>1</td><td>无（shuffle）</td><td>n ≤ 1024</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+
+      <div class="blk"><h3>公式、减最大值、两个坑</h3>
+<pre><code>y_j = e^(x_j − m) / Σᵢ e^(xᵢ − m)，m = 这一行的最大值
+x = [102, 101, 100] → 减 102 → [0, −1, −2] → y = [0.665, 0.245, 0.090]，和 [2, 1, 0] 一样</code></pre>
+        <ul class="plain">
+          <li><strong>为什么减最大值</strong>：e^x 在 x &gt; 88.7 时溢出成 inf。减完最大的是 0，其余 ≤ 0，分母至少是 1；分子分母同乘 e^(−m)，结果不变。</li>
+          <li><strong>每行各算各的</strong>：不同行完全独立，随便分给线程；一行内部要规约，需要线程合作。</li>
+          <li><strong>坑 1</strong>：最大值从 <code>-INFINITY</code> 开始，不能从 0（全负的行会得到 0 / 0）。</li>
+          <li><strong>坑 2</strong>：分不到数的线程，求最大值填 −∞、求和填 0。</li>
+          <li><code>expf</code> 精确；<code>__expf</code> 走 SFU（<code>MUFU.EX2</code>）更快，减完最大值后输入在误差小的区间；<code>exp2f</code> 用于已乘好 log₂e 时。softmax 卡在带宽，换快速版收益不确定（没测）。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>① naive：一个线程一行（copy 的 4～11%）</h3>
+<pre><code>int r = blockIdx.x * blockDim.x + threadIdx.x;   // 全局行号
+if (r &gt;= rows) return;
+size_t base = size_t(r) * n;
+float m = -INFINITY;  for (i…) m = fmaxf(m, X[base+i]);          // 第 1 遍
+float d = 0.f;        for (i…) d += expf(X[base+i] - m);         // 第 2 遍
+                      for (i…) Y[base+i] = expf(X[base+i] - m) / d;   // 第 3 遍</code></pre>
+        <ul class="plain">
+          <li><strong>为什么慢</strong>：一个 warp 的 32 个线程同一时刻读 32 个不同的行，地址相隔 n 个 float，每个数占一箱。</li>
+          <li>512 × 32000 最慢（4%）：只有 512 个线程在干活。</li>
+        </ul>
+        <p><strong>动画 · 三种分工下一个 warp 同一时刻读的地址</strong>：</p>
+<p class="sr-only">动画：softmax 三种分工下，同一时刻一个 warp 读的是哪些地址。naive 一个线程一行，地址分散在不同行；block 和 warp 版相邻线程读同一行的相邻元素。</p>
+<div class="anim" id="anim-sm-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+<button id="anim-sm-m0">① 1 线程 1 行</button><button id="anim-sm-m1">② 1 block 1 行</button><button id="anim-sm-m2">④ 1 warp 1 行</button>
+<label style="font-size:14px;color:var(--muted);margin-left:8px">循环第 k 次</label><input type="range" min="0" max="3" value="0" id="anim-sm-k" style="width:100px"><span id="anim-sm-ko" style="font-family:var(--f-mono)">0</span>
+</div>
+<svg id="anim-sm-sv" viewBox="0 0 680 250" width="100%" role="img" aria-label="softmax 分工和访问地址"></svg>
+<div id="anim-sm-res" style="font-size:14px;margin-top:4px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-sm-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');const R=8,C=32,CW=19,RH=20,X0=40,Y0=34,W=8;let mode=0,k=0;
+const COL=['#378ADD','#1D9E75','#D85A30','#7F77DD','#D4537E','#BA7517','#639922','#888780'];
+function el(t,a,x){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(x!==undefined)e.textContent=x;sv.appendChild(e);return e}
+function addr(t){if(mode===0)return [t,k];if(mode===1)return [0,t+k*W];return [0,t+k*W]}
+function draw(){sv.innerHTML='';const hit={},boxes=new Set();
+ for(let t=0;t<W;t++){const [r,c]=addr(t);hit[r+','+c]=t;boxes.add(r+','+Math.floor(c/8))}
+ el('text',{x:X0,y:18,fill:'var(--muted)','font-size':12},'X：8 行 × 32 列（缩小版）；一个 warp 画成 8 个线程（颜色），虚线框 = 一箱（8 个 float = 32 字节）');
+ for(let r=0;r<R;r++){el('text',{x:X0-6,y:Y0+r*RH+14,'text-anchor':'end','font-size':10,fill:'var(--muted)'},'行'+r);
+  for(let c=0;c<C;c++){const t=hit[r+','+c];el('rect',{x:X0+c*CW+1,y:Y0+r*RH+1,width:CW-2,height:RH-2,rx:2,fill:t===undefined?'transparent':COL[t],stroke:'var(--line)','stroke-width':0.5,opacity:t===undefined?1:0.9})}
+  for(let c=0;c<C;c+=8)el('rect',{x:X0+c*CW,y:Y0+r*RH,width:8*CW,height:RH,fill:'none',stroke:'var(--muted)','stroke-width':0.5,'stroke-dasharray':'2 2'})}
+ const owner=mode===0?'行 0～7 各交给一个线程（同一个 warp）':mode===1?'整个 block 负责第 0 行（只画出第一个 warp）':'一个 warp 负责第 0 行，其余 warp 各负责下面的行';
+ el('text',{x:X0,y:Y0+R*RH+18,fill:'var(--muted)','font-size':12},owner);
+ const n=boxes.size;
+ const note=mode===0?'同一时刻 8 个线程读 8 个不同的行，地址相隔 n 个 float → 搬 '+n+' 箱，每箱只用 1 个数。实测只有 copy 的 4～11%。':
+  mode===1?'相邻线程读相邻元素（i = r + k·BLOCK）→ 搬 '+n+' 箱，全是有用数据。但一行很短（n = 128）时一半线程闲着，还要 16 次 __syncthreads()。':
+  '和 block 版一样连续（i = lane + k·32）→ 搬 '+n+' 箱；整行读进寄存器 v[k]，只读一遍，规约用 shuffle，不需要同步。';
+ $('res').innerHTML='这一步一个 warp 搬了 <strong style="color:'+(n>1?'var(--amber)':'var(--good)')+'">'+n+'</strong> 箱。'+note;
+ ['m0','m1','m2'].forEach((id,q)=>$(id).style.borderColor=q===mode?'var(--accent)':'')}
+['m0','m1','m2'].forEach((id,q)=>$(id).onclick=()=>{mode=q;draw()});
+$('k').oninput=()=>{k=+$('k').value;$('ko').textContent=k;draw()};
+draw();
+})();
+</script>
+      </div>
+
+      <div class="blk"><h3>② block：一个 block 一行</h3>
+<pre><code>template &lt;int BLOCK&gt;   // launch: softmax_block&lt;256&gt;&lt;&lt;&lt;rows, 256&gt;&gt;&gt;
+int b = blockIdx.x, r = threadIdx.x;  size_t base = size_t(b) * n;
+__shared__ float mb[BLOCK], sumb[BLOCK];
+float m = -INFINITY;
+for (int i = r; i &lt; n; i += BLOCK) m = fmaxf(m, X[base + i]);   // 相邻线程读相邻元素
+mb[r] = m;  __syncthreads();
+for (int off = BLOCK/2; off &gt; 0; off /= 2) {
+    if (r &lt; off) mb[r] = fmaxf(mb[r], mb[r + off]);
+    __syncthreads();                       // 放在 if 外面
+}
+float row_max = mb[0];                      // 所有线程都拿到结果
+// 同样再规约一次求 row_sum，最后 Y[base+i] = expf(X[base+i] - row_max) / row_sum</code></pre>
+        <ul class="plain">
+          <li><strong>n = 1024、4096 接近 copy</strong>：一行 4～16 KB，第 1 遍读完还在 L1 / L2，后两遍几乎不回 DRAM。</li>
+          <li><strong>n = 32000 只有 49%</strong>：一行 125 KB 放不进缓存，读 3 写 1 = 4 份数据，copy 是 2 份，约 50%。→ ③ 解决。</li>
+          <li><strong>n = 128 只有 19%</strong>：256 个线程一半闲着，两次规约 16 次同步只处理 128 个数。→ ④ 解决。</li>
+        </ul>
+        <div class="note"><strong>易错</strong>：① 循环从 <code>i = r</code> 开始，检查的就是实际读的位置；写成 <code>i = 0</code> 读 <code>r + i</code> 会读到下一行；② 规约条件是 <code>if (r &lt; off)</code>，干活的线程多了会越界和数据竞争；③ <code>__syncthreads()</code> 必须所有线程都执行到，不能被 <code>continue</code> 或提前 return 跳过。</div>
+      </div>
+
+      <div class="blk"><h3>③ online softmax：最大值和分母一遍求出（n = 32000：49% → 63%）</h3>
+<pre><code>读到新数 x：  m_new = max(m, x)
+              d     = d × e^(m − m_new) + e^(x − m_new)
+              m     = m_new
+两组合并：    m = max(m₁, m₂)
+              d = d₁ × e^(m₁ − m) + d₂ × e^(m₂ − m)</code></pre>
+        <ul class="plain">
+          <li><strong>思路</strong>：先用"目前的最大值"算分母，遇到更大的数时把之前的 d 整体乘 e^(m − m_new) 修正。</li>
+          <li><strong>并行</strong>：每个线程各算一组 (m, d)，规约时用合并公式代替加法。总共读 2 遍：一遍求 (m, d)，一遍写 y。</li>
+          <li><strong>结果</strong>：n = 32000 读 2 写 1 = 3 份，约 copy 的 2/3，实测 63%；n = 1024、4096 本来就命中缓存，反而略慢（每个数多算一次 exp）。</li>
+          <li><strong>更大的意义</strong>：(m, d) 能随时合并，一行就能拆给多个 block 各算一段再合并（Flash-Decoding：decode 时行少、KV cache 很长）；FlashAttention 一块一块地算，不用存整行分数。</li>
+        </ul>
+        <p><strong>动画 · online softmax 逐个读入</strong>：看 m 变大时 d 怎么被修正，最后和三遍算法对照。</p>
+<p class="sr-only">动画：online softmax 一边读一边更新目前的最大值 m 和分母 d，遇到更大的数时把之前的 d 乘一个系数修正；最后和三遍算法的结果对照。</p>
+<div class="anim" id="anim-so-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+<button id="anim-so-p0">[2, 1, 3]</button><button id="anim-so-p1">[1, 4, 2, 6, 3, 5]</button><button id="anim-so-p2">[−3, −1, −2, −5]</button>
+<span style="flex:1"></span><button id="anim-so-play">播放</button><button id="anim-so-next">下一步</button><button id="anim-so-reset">重来</button>
+</div>
+<svg id="anim-so-sv" viewBox="0 0 680 120" width="100%" role="img" aria-label="online softmax 逐个读入"></svg>
+<div class="tablewrap" style="margin-top:6px"><table id="anim-so-tb"><thead><tr><th>读入 x</th><th class="num">m_new = max(m, x)</th><th class="num">修正系数 e^(m − m_new)</th><th class="num">d = d × 系数 + e^(x − m_new)</th></tr></thead><tbody></tbody></table></div>
+<div id="anim-so-res" style="font-size:14px;margin-top:6px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-so-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');const P=[[2,1,3],[1,4,2,6,3,5],[-3,-1,-2,-5]];let x=P[0],st=-1,tm=null;
+function el(t,a,v){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(v!==undefined)e.textContent=v;sv.appendChild(e);return e}
+const f=v=>(Math.abs(v)<1e-9?'0':v.toFixed(3));
+function draw(){sv.innerHTML='';const CW=70,X0=20;
+ el('text',{x:X0,y:16,fill:'var(--muted)','font-size':12},'一行数据，从左往右只读一遍（第 1 遍求 m 和 d；第 2 遍再读一次写 y）');
+ x.forEach((v,i)=>{const on=i===st,past=i<st;el('rect',{x:X0+i*CW,y:28,width:CW-8,height:40,rx:6,fill:on?'var(--accent)':(past?'var(--accent-soft)':'var(--panel)'),stroke:'var(--line)'});
+  el('text',{x:X0+i*CW+(CW-8)/2,y:53,'text-anchor':'middle','font-size':15,'font-weight':600,fill:on?'var(--bg)':'var(--ink)'},v)});
+ let m=-Infinity,d=0;const rows=[];
+ for(let i=0;i<=st;i++){const v=x[i],mn=Math.max(m,v),s=m===-Infinity?0:Math.exp(m-mn),nd=d*s+Math.exp(v-mn);rows.push([v,mn,m===-Infinity?'—（d 原来是 0）':f(s)+(mn>m?'  ← 最大值变了，旧的 d 要缩小':''),f(nd)]);m=mn;d=nd}
+ const tb=$('tb').querySelector('tbody');tb.innerHTML='';rows.forEach((r,i)=>{const tr=document.createElement('tr');r.forEach((c,j)=>{const td=document.createElement('td');if(j)td.className='num';td.textContent=c;if(i===rows.length-1)td.style.fontWeight='600';tr.appendChild(td)});tb.appendChild(tr)});
+ el('text',{x:X0,y:96,fill:'var(--ink)','font-size':13},st<0?'起点：m = −∞，d = 0':'现在：m = '+m+'，d = '+f(d));
+ if(st===x.length-1){const M=Math.max(...x),D=x.reduce((a,v)=>a+Math.exp(v-M),0);
+  $('res').innerHTML='<span style="color:var(--good)">三遍算法直接算：最大值 '+M+'，Σ e^(x − '+M+') = '+f(D)+'，和 online 的 d 一样。</span> 所以 y_j = e^(x_j − m) / d，再读一遍就能写出来：总共读 2 遍，而不是 3 遍。'}
+ else $('res').innerHTML='<span style="color:var(--muted)">关键：d 里每一项都是以旧的 m 为基准算的。最大值变大时，每一项都要乘同一个 e^(m − m_new)，所以整体乘一次就行；新来的数直接按新基准算 e^(x − m_new)。</span>'}
+function stop(){clearInterval(tm);tm=null}
+['p0','p1','p2'].forEach((id,i)=>$(id).onclick=()=>{stop();x=P[i];st=-1;draw()});
+$('next').onclick=()=>{stop();st=st>=x.length-1?-1:st+1;draw()};
+$('reset').onclick=()=>{stop();st=-1;draw()};
+$('play').onclick=()=>{stop();st=-1;draw();tm=setInterval(()=>{st++;draw();if(st>=x.length-1)stop()},1100)};
+draw();
+})();
+</script>
+        <div class="note"><strong>易错：两个空线程合并会得到 NaN</strong>。n 小于线程数时有线程是 (−∞, 0)，两个空线程合并时 −∞ − (−∞) = NaN，一路传上去整行都是 NaN。合并前判断 m_new 是 −∞ 就跳过；只有一边空没问题（e^(−∞) = 0）。</div>
+      </div>
+
+      <div class="blk" id="m14-s4"><h3>④ warp 版：一个 warp 一行，整行放进寄存器（n = 128：20% → 108%）</h3>
+<pre><code>template &lt;int PER_LANE&gt;   // = ceil(n / 32)；n ≤ 1024 → PER_LANE 1/2/4/8/16/32
+int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+int row  = blockIdx.x * (blockDim.x / 32) + warp;    // 一个 block 4 个 warp = 4 行
+if (row &gt;= rows) return;                              // 整个 warp 一起退出，shuffle 仍安全
+float v[PER_LANE];
+#pragma unroll
+for (int k = 0; k &lt; PER_LANE; ++k) {
+    int i = lane + k * 32;                            // 交错分配：固定 k 时 32 个线程读连续 128 字节
+    v[k] = (i &lt; n) ? X[base + i] : -INFINITY;
+}
+float m = warp_max(max of v[k]);                      // __shfl_xor_sync，5 步
+float d = 0.f;  for (k…) { v[k] = expf(v[k] - m); d += v[k]; }   // exp 结果存回 v[k]
+d = warp_sum(d);  float inv = 1.f / d;
+for (k…) if (lane + k*32 &lt; n) Y[base + lane + k*32] = v[k] * inv;</code></pre>
+        <ul class="plain">
+          <li><strong>为什么快</strong>：只读 X 一遍；不用 shared、不用 <code>__syncthreads()</code>，规约只有 10 次 shuffle。</li>
+          <li><strong>PER_LANE 必须是模板参数</strong>：<code>v[]</code> 的大小和下标在编译时确定，循环才能展开、<code>v[k]</code> 才在寄存器里；否则掉进 local memory。<code>-Xptxas -v</code>：PER_LANE = 32 用 48 个寄存器、0 spill。</li>
+          <li><strong>不用 online</strong>：数据已经在寄存器里，再遍历不花显存带宽；两遍算法每个元素只算 1 次 exp，online 要 2 次。<strong>放不进寄存器用 online，放得进用两遍。</strong></li>
+          <li><strong>一个 block 放 4 个 warp</strong>：每 SM 最多 16 个 block，1 个 warp 一个 block 时占用率最多 16 / 48 = 33%。</li>
+        </ul>
+        <p><strong>动画 · warp 内规约：xor vs down</strong>（8 个 lane 演示）：</p>
+<p class="sr-only">动画：用 8 个 lane 演示 warp 内规约。__shfl_xor_sync 每步按 lane 号异或两两交换，3 步后每个 lane 都拿到最大值；__shfl_down_sync 只有 lane 0 拿到结果。</p>
+<div class="anim" id="anim-sx-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+<button id="anim-sx-x">__shfl_xor_sync</button><button id="anim-sx-d">__shfl_down_sync</button>
+<span style="flex:1"></span><button id="anim-sx-play">播放</button><button id="anim-sx-next">下一步</button><button id="anim-sx-reset">重来</button>
+</div>
+<svg id="anim-sx-sv" viewBox="0 0 680 260" width="100%" role="img" aria-label="warp shuffle 规约"></svg>
+<div id="anim-sx-res" style="font-size:14px;margin-top:4px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-sx-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');const V0=[3,1,4,1,5,9,2,6],OFF=[4,2,1];let xor=true,st=0,tm=null;
+function el(t,a,v){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(v!==undefined)e.textContent=v;sv.appendChild(e);return e}
+function states(){const S=[V0.slice()];let v=V0.slice();for(const o of OFF){const nv=v.map((x,i)=>{const src=xor?(i^o):(i+o);return src<8?Math.max(x,v[src]):x});S.push(nv);v=nv}return S}
+function draw(){sv.innerHTML='';const S=states(),X0=70,CW=70,RY=[40,100,160,220];
+ for(let s=0;s<=Math.min(st,3);s++){el('text',{x:4,y:RY[s]+5,fill:'var(--muted)','font-size':11},s===0?'初始':'off='+OFF[s-1]);
+  S[s].forEach((v,i)=>{const fin=s===3&&(xor||i===0);el('rect',{x:X0+i*CW,y:RY[s]-14,width:CW-14,height:26,rx:6,fill:fin?'var(--good-soft)':'var(--panel)',stroke:fin?'var(--good)':'var(--line)'});
+   el('text',{x:X0+i*CW+(CW-14)/2,y:RY[s]+4,'text-anchor':'middle','font-size':14,'font-weight':600,fill:'var(--ink)'},v)});
+  if(s>0){const o=OFF[s-1];for(let i=0;i<8;i++){const src=xor?(i^o):(i+o);if(src>=8)continue;
+   el('line',{x1:X0+src*CW+(CW-14)/2,y1:RY[s-1]+12,x2:X0+i*CW+(CW-14)/2,y2:RY[s]-14,stroke:s===st?'var(--accent)':'var(--line)','stroke-width':s===st?1.6:1})}}}
+ for(let i=0;i<8;i++)el('text',{x:X0+i*CW+(CW-14)/2,y:18,'text-anchor':'middle','font-size':11,fill:'var(--muted)'},'lane '+i);
+ const o=st>0&&st<=3?OFF[st-1]:null;
+ let msg=st===0?'每个 lane 手里一个数，求 8 个数的最大值（真实 warp 是 32 个 lane，5 步：16、8、4、2、1）。':
+  xor?'off = '+o+'：lane i 拿 lane (i ^ '+o+') 的值，两两互换，然后取 max。'+(st===3?'<br><span style="color:var(--good)">3 步后 8 个 lane 都是 9：每个 lane 都能直接用最大值，softmax 正需要这样。</span>':''):
+  'off = '+o+'：lane i 拿 lane (i + '+o+') 的值，单向往下传；超出范围的 lane 保持原值。'+(st===3?'<br><span style="color:var(--amber)">3 步后只有 lane 0 是 9，其余 lane 不对，还要 __shfl_sync(mask, x, 0) 广播一次。</span>':'');
+ $('res').innerHTML=msg;$('x').style.borderColor=xor?'var(--accent)':'';$('d').style.borderColor=xor?'':'var(--accent)'}
+function stop(){clearInterval(tm);tm=null}
+$('x').onclick=()=>{stop();xor=true;st=0;draw()};$('d').onclick=()=>{stop();xor=false;st=0;draw()};
+$('next').onclick=()=>{stop();st=st>=3?0:st+1;draw()};$('reset').onclick=()=>{stop();st=0;draw()};
+$('play').onclick=()=>{stop();st=0;draw();tm=setInterval(()=>{st++;draw();if(st>=3)stop()},1200)};
+draw();
+})();
+</script>
+        <ul class="plain">
+          <li><code>__shfl_xor_sync(mask, var, laneMask)</code>：异或的是 <strong>lane 号</strong>，两两互换，所有 lane 都拿到结果（butterfly）。</li>
+          <li><code>__shfl_down_sync</code>：单向往下传，只有 lane 0 对，还要再广播一次。softmax 每个 lane 都要用 max 和 sum，所以用 xor。</li>
+          <li>mask 里的 lane 必须都执行到 shuffle，所以前面不能有部分线程 return。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>按 n 分档</h3>
+        <ul class="plain">
+          <li><strong>n ≤ 1024</strong>：warp 版（整行进寄存器，读 1 遍）。</li>
+          <li><strong>中等 n</strong>（几千）：block 版（后两遍命中缓存）。</li>
+          <li><strong>很长 n</strong>（词表 32000）：online 版（读 2 遍）；行很少时再把一行拆给多个 block（Flash-Decoding，没做）。</li>
+        </ul>
+        <p>和 RMSNorm 按 n 分档、n ≤ 256 一个 warp 一行是同一个思路，cuDNN、PyTorch 也这样按形状派发。</p>
+      </div>
+
+      <div class="blk"><h3>reduction 写对的前提</h3>
+        <div class="tablewrap"><table>
+          <thead><tr><th>写法</th><th>隐含前提</th><th>不满足时</th></tr></thead>
+          <tbody>
+            <tr><td>stride 从 blockDim/2 减半</td><td>blockDim 是 2 的幂</td><td>有元素被漏掉</td></tr>
+            <tr><td>读输入不判断边界</td><td>n 等于线程总数</td><td>越界读</td></tr>
+            <tr><td>直接写 <code>out[0]</code></td><td>只有 1 个 block</td><td>多个 block 互相覆盖（要 atomicAdd 或第二个 kernel）</td></tr>
+            <tr><td><code>__shfl_down_sync(0xffffffff, …)</code></td><td>blockDim 是 32 的倍数</td><td>最后一个 warp 不满时结果未定义</td></tr>
+            <tr><td>测试用 <code>!=</code> 精确比较</td><td>输入是小整数</td><td>浮点加法顺序不同就有微小误差</td></tr>
+          </tbody>
+        </table></div>
+        <p>更快的写法：warp 之间合并时，各 warp 的部分和写进 shared，再让 warp 0 读进来做一次 shuffle，只要 1 次同步。</p>
+      </div>
+
+      <div class="blk"><h3>对应源码</h3>
+        <ul class="plain">
+          <li><a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/f213f82413427dc65ecf0c98d120ac8f399413d7/src/softmax/kernels.cuh#L31">kernels.cuh:31 softmax_naive</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/f213f82413427dc65ecf0c98d120ac8f399413d7/src/softmax/kernels.cuh#L57">:57 softmax_block</a> · <a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/f213f82413427dc65ecf0c98d120ac8f399413d7/src/softmax/kernels.cuh#L102">:102 softmax_online</a></li>
+          <li><a class="src" href="https://github.com/hhhhaa19/ai_infra/blob/f213f82413427dc65ecf0c98d120ac8f399413d7/src/softmax/softmax_bench.cu#L48">softmax_bench.cu:48 run_shape</a></li>
+        </ul>
+      </div>
+
+      <div class="blk iv" id="m14-iv"><h3>面试要求</h3>
+        <p>softmax（含 online softmax）是手写 CUDA 题里的高频题，也是理解 FlashAttention 的前提。</p>
+        <h4>必须会</h4>
+        <ul class="plain">
+          <li>公式；为什么要减最大值、为什么结果不变、为什么减完就安全（88.7 的溢出边界）。</li>
+          <li>当场手写 block 版：两次规约、结果广播给所有线程、循环从 <code>i = r</code> 开始、规约条件 <code>r &lt; offset</code>、<code>__syncthreads()</code> 放在 if 外面；最大值初值 −INFINITY、越界填 −∞ / 0。</li>
+          <li>online softmax 的更新公式和两组合并公式，能用 [2, 1, 3] 手算一遍；为什么只读两遍。</li>
+          <li>为什么 naive 慢（warp 内地址不连续）。</li>
+        </ul>
+        <h4>应该会</h4>
+        <ul class="plain">
+          <li>用数字讲：512 × 32000 上 block 49% → online 63%，按读写份数（4 份 → 3 份）解释；n = 1024、4096 为什么三遍也接近 copy（缓存）；n = 128 为什么换算法没用。</li>
+          <li>空线程合并 −∞ − (−∞) = NaN 的坑和改法。</li>
+          <li>分工和算法两个方向；warp 版为什么适合短行（只读一遍、xor shuffle、不用同步），n = 128 上 20% → 108% 的数字；为什么 warp 版用两遍算法而不是 online（数据在寄存器里，少算一半 exp）。</li>
+          <li>按 n 分档：n ≤ 1024 warp、中等 block、很长 online；PER_LANE 模板参数和寄存器上限。</li>
+          <li><code>expf</code> / <code>__expf</code> / <code>exp2f</code> 的区别。</li>
+          <li>reduction 的几个隐含前提（2 的幂、32 的倍数、单 block、精确比较）。</li>
+        </ul>
+        <h4>加分</h4>
+        <ul class="plain">
+          <li>FlashAttention 怎么用 online softmax 分块、不存整行分数；Flash-Decoding 把一行拆给多个 block。</li>
+          <li>和前后算子融合（scale、mask、softmax 合成一个 kernel）。</li>
+        </ul>
+        <p class="small muted">三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+      </div>
+
+      <div class="selftest"><h3>自测</h3><ul class="plain">
+        <li>x = [102, 101, 100] 直接算会怎样？减最大值后是多少？为什么和 [2, 1, 0] 结果一样？</li>
+        <li>"一行"在采样和 attention 里各是什么？为什么不同行可以随便分给不同线程？</li>
+        <li>最大值为什么不能从 0 开始？越界线程求最大值和求和时各填什么？</li>
+        <li>naive 为什么只有 copy 的 4～11%？512 × 32000 为什么最慢？</li>
+        <li>block 版循环写成 <code>for (i = 0; i &lt; n; i += BLOCK) X[base + r + i]</code> 有什么问题？用 n = 300 举例。</li>
+        <li>规约写成 <code>if (r + offset &gt; BLOCK) continue;</code> 错在哪两处？什么叫数据竞争？为什么 naive 能 return、block 版不能？</li>
+        <li>block 版读了三遍，为什么 n = 4096 还能超过 copy？n = 32000 为什么只有约 50%？n = 128 为什么只有 19%？</li>
+        <li>online 的更新公式是什么？用 [2, 1, 3] 算一遍。为什么后一项不乘 d？</li>
+        <li>两组 (m, d) 怎么合并？两个空线程合并为什么会出 NaN？怎么改？只有一边空时为什么没问题？</li>
+        <li>online 在 n = 1024、4096 上为什么没变快甚至略慢？</li>
+        <li>online 还是一个 block 一行吗？它改的是分工还是算法？它让什么新的分工成为可能，Flash-Decoding 为什么需要它？</li>
+        <li>warp 版怎么分工？为什么只读一遍、不需要同步？<code>__shfl_xor_sync</code> 和 <code>__shfl_down_sync</code> 有什么区别？</li>
+        <li><code>row = blockIdx.x * 4 + warp</code> 里的 4 是什么？为什么一个 block 放 4 个 warp 而不是 1 个？</li>
+        <li><code>PER_LANE</code> 为什么必须是模板参数？元素为什么按 <code>lane + k*32</code> 交错分配？从全局内存读进寄存器有没有 bank conflict？</li>
+        <li><code>__shfl_xor_sync(0xffffffff, x, 16)</code> 里异或的是什么？用 [3 1 4 1 5 9 2 6] 走一遍 8 lane 的 butterfly。width 参数什么时候要传？</li>
+        <li>warp 版为什么不用 online？两遍算法每个元素算几次 exp？row_max 初值写 0 会怎样？</li>
+        <li>warp 版 190 GB/s 为什么能"超过 copy"？这说明了什么、没说明什么？</li>
+        <li><code>expf</code>、<code>__expf</code>、<code>exp2f</code> 各适合什么时候？为什么 softmax 用 <code>__expf</code> 误差通常够？</li>
+        <li>你写的 reduction 在什么尺寸下会出错？举三个隐含前提。</li>
+      </ul>
+      <h3>面试高频问题</h3><ul class="plain">
+        <li>手写一个 softmax kernel，要求数值稳定。</li>
+        <li>什么是 online softmax？和 FlashAttention 什么关系？</li>
+        <li>行很长 / 行很短时分别怎么优化？</li>
+      </ul></div>
+    </article>

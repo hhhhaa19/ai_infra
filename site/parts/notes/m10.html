@@ -1,0 +1,496 @@
+<article class="mod" id="m10" hidden>
+      <div class="eyebrow">模块 10</div>
+      <h2>策略模型上机：ACT 部署到 Orin</h2>
+      <p class="why"><strong>主线</strong>：把公开的 ACT 策略模型（LeRobot <code>act_aloha_sim_transfer_cube_human</code>）从 PyTorch 部署到 Orin 的 TensorRT。每一步只看三件事：<strong>做了什么、为什么、结果是多少</strong>。数字都是实测，误差目前只用了随机输入。</p>
+
+      <div class="blk" id="act"><h3>结果总览</h3>
+        <div class="tablewrap"><table>
+          <thead><tr><th>步骤</th><th>在哪</th><th>结果</th></tr></thead>
+          <tbody>
+            <tr><td>① PyTorch 参考输出</td><td>Quest（CPU）</td><td>4 组固定输入 + 输出存成 <code>io_samples.pt</code></td></tr>
+            <tr><td>② 导出 ONNX（归一化放进图里）</td><td>Quest</td><td>131.4 MiB；ONNX Runtime vs PyTorch rel L2 ≈ 1e-7</td></tr>
+            <tr><td>③ TensorRT FP32</td><td>Orin（锁频 1300 MHz）</td><td>中位 <strong>17.04 ms</strong>，CUDA Graph 12.52 ms；误差 ≈ 1e-7</td></tr>
+            <tr><td>④ TensorRT FP16</td><td>Orin</td><td>中位 <strong class="num">5.56 ms</strong>（3.1×），CUDA Graph <strong>3.70 ms</strong>；rel L2 4.5e-4～1.1e-3，最大 2.2e-3 rad</td></tr>
+            <tr><td>⑤ 图清理、INT8、真实数据、仿真闭环</td><td>—</td><td>还没做</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li><strong>为什么 Quest 导出、Orin 只跑 TensorRT</strong>：LeRobot 要 Python ≥ 3.12、torch ≥ 2.7；Orin 是 JetPack 5（torch 2.1），容器换不掉底层的驱动和 JetPack。Orin 部署本来也只需要 ONNX + TensorRT。代价是没有 Orin 上的 PyTorch 基线。</li>
+        </ul>
+<pre><code>Quest（或 Mac / 其他 x86 机器）：LeRobot 加载 ACT → 保存输入和 PyTorch 输出 → 导出 ONNX
+                 ↓ 拷贝 ONNX 和输入输出样例
+Orin：TensorRT FP32 / FP16 / INT8 → C++ 推理 → 和 PyTorch 输出比误差、测延迟</code></pre>
+      </div>
+
+      <div class="blk"><h3>模型长什么样</h3>
+        <ul class="plain">
+          <li>模仿学习模型：输入相机图像 + 14 维关节状态，一次输出接下来 100 步动作（action chunking，一次预测一段，减少误差累积和抖动）。</li>
+          <li>约 5170 万参数；推理时潜变量 z = 0，不需要 VAE encoder。</li>
+          <li>对部署来说就是一个标准网络：一次前向出动作，没有扩散去噪循环，也没有 LLM。</li>
+        </ul>
+        <p><strong>动画 · ACT 一次前向的数据流</strong>：逐步看张量形状怎么变、每段在 TensorRT 里花多少时间。</p>
+<p class="sr-only">动画：ACT 一次前向的数据流，从原始图像和状态经过归一化、ResNet-18、302 个 token、Transformer encoder 和 decoder，到反归一化后的 100×14 动作，每一步显示张量形状和在 TensorRT FP16 里的耗时。</p>
+<div class="anim" id="anim-af-root">
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+<button id="anim-af-play">播放全部</button>
+<button id="anim-af-prev">上一步</button>
+<button id="anim-af-next">下一步</button>
+</div>
+<svg id="anim-af-sv" viewBox="0 0 680 300" width="100%" role="img" aria-label="ACT 前向数据流"></svg>
+<div id="anim-af-res" style="font-size:14px;margin-top:6px;line-height:1.7;min-height:5em"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-af-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');
+const S=[
+{x:10,y:30,w:120,t:'原始输入',sh:'图像 1×3×480×640\n状态 1×14',d:'相机图像和 14 维关节状态直接喂给 engine，部署程序不用自己做归一化。',on:'onnx'},
+{x:150,y:30,w:110,t:'输入归一化',sh:'(x − 均值)\n/ 标准差',d:'均值、标准差是训练数据上统计好的常量，作为 buffer 导出进 ONNX。必须和训练时完全一致，否则模型看到的输入范围不对。',on:'onnx'},
+{x:280,y:30,w:120,t:'ResNet-18',sh:'1×3×480×640\n→ 512×15×20',d:'21 个卷积（BatchNorm 已折进卷积）。计算受限，FP16 下每层约 0.07 ms（FP32 约 0.3～0.6 ms），用上了 Tensor Core。',on:'onnx'},
+{x:420,y:30,w:120,t:'拼 token',sh:'300 图像 token\n+ 状态 + z = 302',d:'特征图拉平成 300 个 token；状态和潜变量各投影成 1 个 token（推理时 z = 0，不需要 VAE encoder）；加上位置编码（图像是二维正弦编码，现场用 CumSum / Sin / Cos 算）。',on:'onnx'},
+{x:560,y:30,w:110,t:'encoder ×4',sh:'302×512\n注意力 + 前馈',d:'4 层 Transformer encoder（8 头，post-norm，LayerNorm 被拆成 9 个基础节点）。和 decoder 一起被 TensorRT 包进 1 个 Myelin 节点：FP16 2.57 ms，FP32 6.45 ms。',on:'onnx'},
+{x:420,y:170,w:120,t:'decoder ×1',sh:'100 个动作查询\n交叉注意力',d:'100 个动作查询先做自注意力，再做交叉注意力去读 encoder 输出的 302 个 token，最后过前馈。',on:'onnx'},
+{x:280,y:170,w:120,t:'action_head',sh:'512 → 14',d:'线性层把每个查询变成 14 维动作，一次给出 100 步（action chunk）。',on:'onnx'},
+{x:150,y:170,w:110,t:'动作反归一化',sh:'× 标准差 + 均值',d:'把归一化空间的动作还原成真实关节角（弧度）。同样放进了 ONNX。',on:'onnx'},
+{x:10,y:170,w:120,t:'输出动作',sh:'1×100×14',d:'一次推理给 100 步动作。chunk_size = n_action_steps = 100、不开时间集成时，执行完 100 步才再推理一次。',on:'onnx'}];
+let cur=-1,tm=null;
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function draw(){sv.innerHTML='';
+el('rect',{x:4,y:14,width:672,height:270,rx:10,fill:'none',stroke:'var(--line)','stroke-dasharray':'5 4'});
+el('text',{x:14,y:278,fill:'var(--muted)','font-size':11},'虚线框内全部导出进同一个 ONNX → 同一个 TensorRT engine');
+const mid=(s)=>[s.x+s.w/2,s.y+40];
+for(let i=0;i<S.length-1;i++){const a=S[i],b=S[i+1],st={stroke:i<cur?'var(--accent)':'var(--line)','stroke-width':i<cur?2.5:1.5,fill:'none'};
+ if(a.y===b.y){let x1,x2;if(b.x>a.x){x1=a.x+a.w;x2=b.x}else{x1=a.x;x2=b.x+b.w}el('line',Object.assign({x1,y1:a.y+40,x2,y2:a.y+40},st))}
+ else{const ax=a.x+a.w/2,bx=b.x+b.w/2;el('polyline',Object.assign({points:ax+','+(a.y+80)+' '+ax+',140 '+bx+',140 '+bx+','+b.y},st))}}
+S.forEach((s,i)=>{const on=i===cur,past=i<cur;
+ el('rect',{x:s.x,y:s.y,width:s.w,height:80,rx:8,fill:on?'var(--accent-soft)':(past?'var(--code-bg)':'var(--panel)'),stroke:on?'var(--accent)':'var(--line)','stroke-width':on?2.5:1});
+ el('text',{x:s.x+s.w/2,y:s.y+22,'text-anchor':'middle','font-size':13,'font-weight':600,fill:on?'var(--accent)':'var(--ink)'},s.t);
+ s.sh.split('\n').forEach((ln,k)=>el('text',{x:s.x+s.w/2,y:s.y+44+k*15,'text-anchor':'middle','font-size':11,fill:'var(--muted)'},ln))});
+// encoder → decoder connector (vertical on right then left)
+$('res').innerHTML=cur<0?'点"下一步"或"播放全部"，沿着一次前向走一遍。<span style="color:var(--muted)">FP16 engine 整个前向中位 5.56 ms（CUDA Graph 下 3.70 ms）。</span>':'<strong>'+(cur+1)+'. '+S[cur].t+'</strong>：'+S[cur].d}
+function stop(){clearInterval(tm);tm=null}
+$('next').onclick=()=>{stop();cur=cur>=S.length-1?-1:cur+1;draw()};
+$('prev').onclick=()=>{stop();cur=cur<=-1?S.length-1:cur-1;draw()};
+$('play').onclick=()=>{stop();cur=-1;draw();tm=setInterval(()=>{cur++;draw();if(cur>=S.length-1)stop()},1600)};
+draw();
+})();
+</script>
+        <div class="tablewrap"><table>
+          <thead><tr><th>算子（ONNX，opset 16）</th><th>在哪</th><th>瓶颈</th><th>部署要点</th></tr></thead>
+          <tbody>
+            <tr><td>Conv 21、Relu 22</td><td>ResNet-18</td><td>计算受限</td><td>Conv + BN + ReLU 合成一层；FP16 / INT8 Tensor Core 收益最大</td></tr>
+            <tr><td>MatMul 41、Gemm 8</td><td>注意力投影、前馈</td><td>M = 302 时接近计算受限</td><td>FP16 用 Tensor Core；INT8 要注意激活离群值</td></tr>
+            <tr><td>Softmax 6</td><td>注意力</td><td>访存受限</td><td>最大值和求和用 FP32</td></tr>
+            <tr><td>ReduceMean / Pow / Sqrt …</td><td>拆开的 12 个 LayerNorm</td><td>访存受限</td><td>FP16 下方差可能溢出，要查误差</td></tr>
+            <tr><td>Squeeze 602、Unsqueeze 610</td><td>导出副作用</td><td>不做计算</td><td>层数变多，发射开销变大</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+
+      <div class="blk"><h3>① 定边界：归一化放进 ONNX</h3>
+        <ul class="plain">
+          <li><strong>做了什么</strong>：包一层 <code>ActForExport</code>，只取 <code>policy.model</code>，把图像、状态、动作的 6 个均值 / 标准差用 <code>register_buffer</code> 登记；forward 里先归一化 → ACT → 取动作 → 反归一化。</li>
+          <li><strong>为什么</strong>：部署程序只喂原始数据，不会漏步骤或用错参数；训练和部署的预处理必须完全一致。</li>
+          <li><strong>坑</strong>：新版 LeRobot 加载这个旧 checkpoint 时不会自动用归一化参数，要自己从 <code>model.safetensors</code> 取出来。</li>
+          <li>buffer 和 parameter 都会导出（buffer 作为常量），但 buffer 训练时不更新，正适合放统计量。</li>
+          <li>不需要 TORCH_LIBRARY 注册：里面全是 PyTorch 已有算子，直接翻译成标准 ONNX 节点。只有换成自己的 CUDA kernel 时才要注册和写 plugin。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>② 导出 + 两层验收</h3>
+<pre><code>输入：image [1,3,480,640]（[0,1]）、state [1,14]      输出：action [1,100,14]（已反归一化）
+ONNX 131.4 MiB（官方 checkpoint 约 207 MB：VAE encoder 推理用不到所以没导出；BatchNorm 被常量折叠进卷积，只剩 21 个 Conv）
+ONNX Runtime vs PyTorch：最大绝对误差 2.4e-7～3.6e-7，rel L2 8e-8～1e-7（FP32 数值误差范围内）
+在 Quest 登录节点 CPU 上跑完约 156 秒，没有提交 Slurm 作业</code></pre>
+        <ul class="plain">
+          <li><strong>先用 ONNX Runtime 对答案</strong>：它只当"导出验收器"。ORT 和 PyTorch 一致，之后 TensorRT 再出误差，就能确定问题在 TensorRT 的优化或精度，而不是导出。</li>
+          <li>两层检查：PyTorch vs ONNX Runtime 查导出；PyTorch vs TensorRT 查部署。</li>
+          <li>engine 绑定 GPU 型号和 TensorRT 版本，Quest 上建的不能拿到 Orin 用，所以 engine 必须在 Orin 上建。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>③ 建 engine：opset 17 → 16，看 TensorRT 怎么融合</h3>
+        <ul class="plain">
+          <li><strong>问题</strong>：opset 17 把 LayerNorm 导出成 1 个 <code>LayerNormalization</code> 节点，Orin 的 TensorRT 8.5 不认识。</li>
+          <li><strong>改法</strong>：只改 <code>OPSET = 16</code>，LayerNorm 被拆成 9 个基础节点；重新导出后 ORT 误差仍约 1e-7。</li>
+        </ul>
+<pre><code>opset 17：LayerNorm → 1 个 LayerNormalization（共 12 个）            节点总数 2825
+opset 16：LayerNorm → ReduceMean → Sub → Pow → ReduceMean → Add → Sqrt → Div → Mul → Add（9 个）
+          LayerNormalization 0 个，ReduceMean 24、Pow 12、Sqrt 12      节点总数 2945
+重新导出后 ONNX Runtime 误差仍约 1e-7</code></pre>
+        <p><strong>动画 · ONNX 节点 → TensorRT 层</strong>：选一种结构，点右边按钮看融合前后。</p>
+<p class="sr-only">动画：同一段计算在 ONNX 图里是很多个节点，进 TensorRT 后被融合成少数几层；分别看卷积 + BatchNorm + ReLU、拆开的 LayerNorm、导出带来的 Squeeze / Unsqueeze。</p>
+<div class="anim" id="anim-fu-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+<button id="anim-fu-c0">卷积块</button>
+<button id="anim-fu-c1">LayerNorm</button>
+<button id="anim-fu-c2">Squeeze / Unsqueeze</button>
+<span style="flex:1"></span>
+<button id="anim-fu-tog">看 TensorRT 融合后 →</button>
+</div>
+<svg id="anim-fu-sv" viewBox="0 0 680 200" width="100%" role="img" aria-label="ONNX 节点到 TensorRT 层的融合"></svg>
+<div id="anim-fu-res" style="font-size:14px;margin-top:6px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-fu-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');
+const C=[
+{n:['Conv','Mul','Add','Relu'],f:'conv1 + bn1 + relu（1 层）',a:'ONNX 里卷积后面跟着 Mul + Add（BatchNorm 折叠后的样子）和 Relu。',b:'TensorRT 把它们合成 1 层：卷积算完直接在寄存器里乘、加、取 max，结果只写回显存一次。ResNet-18 的每个卷积块都这样合并。'},
+{n:['ReduceMean','Sub','Pow','ReduceMean','Add','Sqrt','Div','Mul','Add'],f:'Myelin 节点内部（看不到单独的层）',a:'opset 16 没有 LayerNormalization，一个 LayerNorm 被拆成 9 个基础节点；12 个 LayerNorm 共约 100 个节点。（opset 17 是 1 个节点，但 TensorRT 8.5 不认识。）',b:'逐层 profile 里看不到这些节点单独出现，推测已在 Transformer 那个 Myelin 节点里融合（按层名推断，没用 nsys 确认）。和 RMSNorm 被拆成 7 个节点、再由 TensorRT 融合是同一件事。'},
+{n:['Unsqueeze','Squeeze','Unsqueeze','Concat','Squeeze','Unsqueeze','Squeeze','Unsqueeze'],f:'大部分被消掉，消不掉的多一次 kernel / 拷贝',a:'ACT.forward 有 2428 个节点，其中 Squeeze / Unsqueeze 共 1206 个，来自 LeRobot 代码把张量拆成列表再拼接，不是算法需要的计算。',b:'TensorRT 能消掉大部分，但层数仍多（FP16 651 层），每层都要发射。证据：CUDA Graph 收益很大；逐层 profile 加起来 13.5 ms 远大于正常的 5.56 ms。下一步是改写导出代码，直接 reshape / permute / cat。'}];
+let c=0,fused=false;
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function draw(){sv.innerHTML='';const k=C[c],n=k.n.length,W=Math.min(76,(660-(n-1)*8)/n),X0=(680-(n*W+(n-1)*8))/2;
+el('text',{x:10,y:20,fill:'var(--muted)','font-size':12},fused?'TensorRT engine 里的层':'ONNX 图里的节点（'+n+' 个）');
+if(!fused){k.n.forEach((t,i)=>{const x=X0+i*(W+8);
+  el('rect',{x,y:60,width:W,height:44,rx:6,fill:t.match(/queeze/)?'var(--amber-soft)':'var(--accent-soft)',stroke:'var(--line)'});
+  el('text',{x:x+W/2,y:87,'text-anchor':'middle','font-size':W<60?9:11,fill:'var(--ink)'},t);
+  if(i<n-1)el('line',{x1:x+W,y1:82,x2:x+W+8,y2:82,stroke:'var(--muted)','stroke-width':1.5})});
+ el('text',{x:340,y:140,'text-anchor':'middle','font-size':12,fill:'var(--muted)'},'每个节点各读一次、写一次显存（如果不融合）')}
+else{el('rect',{x:170,y:50,width:340,height:64,rx:10,fill:'var(--good-soft)',stroke:'var(--good)','stroke-width':2});
+ el('text',{x:340,y:88,'text-anchor':'middle','font-size':14,'font-weight':600,fill:'var(--ink)'},k.f);
+ el('text',{x:340,y:140,'text-anchor':'middle','font-size':12,fill:'var(--muted)'},'全图：2945 个 ONNX 节点 → 约 650 层（FP32 647、FP16 651）')}
+$('res').innerHTML=fused?k.b:k.a;
+$('tog').textContent=fused?'← 看 ONNX 节点':'看 TensorRT 融合后 →';
+['c0','c1','c2'].forEach((id,i)=>{$(id).style.borderColor=i===c?'var(--accent)':'';$(id).style.color=i===c?'var(--accent)':''})}
+$('c0').onclick=()=>{c=0;fused=false;draw()};$('c1').onclick=()=>{c=1;fused=false;draw()};$('c2').onclick=()=>{c=2;fused=false;draw()};
+$('tog').onclick=()=>{fused=!fused;draw()};
+draw();
+})();
+</script>
+      </div>
+
+      <div class="blk"><h3>④ FP16：17.04 → 5.56 ms</h3>
+        <ul class="plain">
+          <li><strong>做了什么</strong>：同一个 FP32 ONNX，<code>trtexec --fp16 --noTF32</code>。精度在建 engine 时决定，导出时不用改。</li>
+          <li><strong>不要导出 FP16 ONNX</strong>：TensorRT 能按层选精度，敏感层留 FP32；直接导出 FP16 会强制所有层 FP16。</li>
+          <li><strong>为什么快 3 倍</strong>：卷积和矩阵乘用上了 Tensor Core。</li>
+        </ul>
+<pre><code>FP32：647 层；Transformer 部分被包成 1 个 Myelin 节点 6.45 ms；ResNet 卷积每层约 0.3～0.6 ms
+FP16：651 层；同一个 Myelin 节点 2.57 ms；卷积大多约 0.07 ms（用上了 Tensor Core）
+卷积后面的 Mul + Add（BatchNorm 折叠后的样子）和 ReLU 已和卷积合成一层，如 conv1/Conv + bn1/Mul + bn1/Add + …
+拆开的 LayerNorm 节点没有单独出现 → 推测已经在 Myelin 节点里被融合（根据层名推断，没用 nsys 确认）</code></pre>
+        <div class="tablewrap"><table>
+          <thead><tr><th>精度</th><th class="num">中位</th><th class="num">P99</th><th class="num">CUDA Graph</th><th class="num">engine</th><th class="num">最大误差</th><th class="num">rel L2</th></tr></thead>
+          <tbody>
+            <tr><td>FP32（--noTF32）</td><td class="num">17.04 ms</td><td class="num">17.11 ms</td><td class="num">12.52 ms</td><td class="num">161 MB</td><td class="num">≤ 4.5e-7</td><td class="num">≈ 1e-7</td></tr>
+            <tr><td>FP16</td><td class="num win">5.56 ms</td><td class="num">5.80 ms</td><td class="num win">3.70 ms</td><td class="num">68 MB</td><td class="num">≤ 2.2e-3</td><td class="num">4.5e-4～1.1e-3</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li>P99 和中位只差 0.1～0.2 ms，很稳定。</li>
+          <li>FP16 最大误差 2.2e-3 rad ≈ 0.13°（动作是关节角）。</li>
+        </ul>
+        <div class="note">误差是 4 组<strong>随机噪声输入</strong>算的，只说明 engine 没把数算错；真实画面下动作对不对，要靠数据集回放和仿真闭环。随机输入也不能用来做 INT8 校准。</div>
+      </div>
+
+      <div class="blk"><h3>⑤ CUDA Graph：发射开销有多大</h3>
+        <ul class="plain">
+          <li>FP32 17.04 → 12.52 ms，FP16 5.56 → 3.70 ms：CPU 逐个发射 kernel 的开销不小。</li>
+          <li>原因是层太多：导出带来 1206 个 Squeeze / Unsqueeze；逐层 profile 加起来 13.5 ms，远大于正常的 5.56 ms（每层都有额外开销）。</li>
+        </ul>
+        <p><strong>动画 · 有没有 CUDA Graph 的时间线（示意）</strong></p>
+<p class="sr-only">示意动画：不用 CUDA Graph 时 CPU 要逐个发射几百个 kernel，GPU 在 kernel 之间等 CPU；用 CUDA Graph 后一次发射整张图，GPU 连续执行。</p>
+<div class="anim" id="anim-cg-root">
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+<button id="anim-cg-play">播放</button>
+<button id="anim-cg-reset">重来</button>
+<span style="font-size:13px;color:var(--muted)">示意图：只画 12 个 kernel，长度不按实际比例</span>
+</div>
+<svg id="anim-cg-sv" viewBox="0 0 680 250" width="100%" role="img" aria-label="CUDA Graph 前后时间线"></svg>
+<div id="anim-cg-res" style="font-size:14px;margin-top:4px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-cg-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');
+const N=12,LA=4,K=[3,1,4,1,2,1,5,1,1,3,1,2],X0=110,U=10;
+let tnow=0,tm=null;
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function bar(x,y,d,c,t){if(x>=tnow)return;const w=Math.min(d,tnow-x);el('rect',{x:X0+x*U,y,width:Math.max(w*U-1,0),height:16,rx:2,fill:c,stroke:'var(--line)','stroke-width':0.5});if(t&&w===d&&d*U>16)el('text',{x:X0+(x+d/2)*U,y:y+12,'text-anchor':'middle','font-size':9,fill:'var(--ink)'},t)}
+function draw(){sv.innerHTML='';
+el('text',{x:4,y:16,fill:'var(--muted)','font-size':12},'上：CPU 发射；下：GPU 执行');
+// no graph
+el('text',{x:4,y:52,fill:'var(--ink)','font-size':12,'font-weight':500},'不用 Graph');el('text',{x:4,y:66,fill:'var(--muted)','font-size':10},'CPU');el('text',{x:4,y:90,fill:'var(--muted)','font-size':10},'GPU');
+let c=0,g=0;for(let i=0;i<N;i++){bar(c,54,LA,'var(--accent)','发');const s=Math.max(c+LA,g);bar(s,78,K[i],'var(--good-soft)','k'+i);if(s>g&&g>0&&s<=tnow)el('rect',{x:X0+g*U,y:78,width:(s-g)*U,height:16,fill:'var(--amber-soft)',opacity:0.6});g=s+K[i];c+=LA}
+const TA=g;
+el('text',{x:4,y:152,fill:'var(--ink)','font-size':12,'font-weight':500},'CUDA Graph');el('text',{x:4,y:166,fill:'var(--muted)','font-size':10},'CPU');el('text',{x:4,y:190,fill:'var(--muted)','font-size':10},'GPU');
+bar(0,154,LA,'var(--accent)','发整张图');let s2=LA;for(let i=0;i<N;i++){bar(s2,178,K[i],'var(--good-soft)','k'+i);s2+=K[i]}
+const TB=s2;
+el('line',{x1:X0+tnow*U,y1:40,x2:X0+tnow*U,y2:200,stroke:'var(--muted)','stroke-dasharray':'3 3'});
+if(tnow>=TA){el('text',{x:X0+TA*U+6,y:90,'font-size':11,fill:'var(--muted)'},'用时 '+TA+' 格');el('text',{x:X0,y:112,'font-size':11,fill:'var(--amber)'},'黄色 = GPU 在等 CPU 发下一个 kernel')}if(tnow>=TB){el('text',{x:X0+TB*U+6,y:190,'font-size':11,fill:'var(--muted)'},'用时 '+TB+' 格')}
+el('text',{x:4,y:232,fill:'var(--muted)','font-size':11},'kernel 越多、越小，CPU 发射越跟不上 GPU，空等越多');
+$('res').innerHTML='<strong>为什么 ACT 收益大</strong>：engine 有约 650 层，很多层很小，CPU 逐个发射 kernel 的时间比 GPU 算它还长，GPU 在 kernel 之间空等。CUDA Graph 把整个前向录成一张图，一次发射。实测：FP32 17.04 → 12.52 ms，FP16 5.56 → 3.70 ms。<br><span style="color:var(--muted)">这说明发射开销不小，和导出带来的节点太多有关；图清理之后这个差距应该会变小。</span>'}
+function stop(){clearInterval(tm);tm=null}
+$('reset').onclick=()=>{stop();tnow=0;draw()};
+$('play').onclick=()=>{stop();tnow=0;draw();tm=setInterval(()=>{tnow+=1;draw();if(tnow>=56)stop()},90)};
+tnow=56;draw();
+})();
+</script>
+      </div>
+
+      <div class="blk"><h3>下一步优化（按顺序）</h3>
+        <div class="tablewrap"><table>
+          <thead><tr><th>步</th><th>做什么</th><th>为什么</th></tr></thead>
+          <tbody>
+            <tr><td>图清理</td><td>改写导出代码，直接 reshape / permute / cat，去掉多余 Squeeze / Unsqueeze；位置编码预先算成常量</td><td>不改数学结果，减少层数和发射开销</td></tr>
+            <tr><td>真实数据误差</td><td>数据集里几十帧真实观测，比 PyTorch 和 FP32 / FP16 engine</td><td>替换随机输入的结果</td></tr>
+            <tr><td>INT8 PTQ</td><td>几百帧真实数据做校准；掉点时逐层定位，敏感层回退 FP16</td><td>可能继续降延迟</td></tr>
+            <tr><td>仿真闭环</td><td>gym-aloha，每种精度跑多回合，报成功率和置信区间</td><td>确认任务没变差</td></tr>
+          </tbody>
+        </table></div>
+        <div class="note good"><strong>现在不给 LayerNorm 写 plugin</strong>：它不是瓶颈，而且已经在 Myelin 里融合；plugin 是黑盒，会把 Myelin 切开、打断融合（RMSNorm plugin 时切成了 17 段）。只有 TensorRT 不支持、或某个算子在 profile 里明显很慢时才写。</div>
+      </div>
+
+      <div class="blk" id="act-trt"><h3>怎么判断部署效果：三层指标</h3>
+        <div class="tablewrap"><table>
+          <thead><tr><th>层次</th><th>测什么</th><th>证明什么</th></tr></thead>
+          <tbody>
+            <tr><td>系统指标</td><td>延迟均值 / P95 / 最大值，各阶段时间，engine 大小、显存、功耗</td><td>跑得够不够快、够不够稳</td></tr>
+            <tr><td>离线动作误差</td><td>同一帧真实输入下，原模型和 engine 的动作误差（按关节）</td><td>部署没改变模型行为</td></tr>
+            <tr><td>仿真闭环成功率</td><td>每种精度多回合，报次数和置信区间</td><td>任务没有变差</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain">
+          <li><strong>延迟预算</strong>：控制频率决定上限。15 Hz → 每次 66.7 ms，扣掉相机、预处理、通信（假设 30 ms），模型只剩约 36 ms。要看 P95 和最大值，不能只看平均。</li>
+          <li><strong>成功率要带次数和区间</strong>：19/20 和 18/20 的 95% 区间大幅重叠，20 次分不出谁好。</li>
+          <li><strong>误差小 ≠ 任务一定成功</strong>：闭环里误差会累积，所以要三层都看。</li>
+        </ul>
+      </div>
+
+      <div class="blk" id="m10-job"><h3>部署工程师在流水线里做什么</h3>
+        <p>流水线：定任务 → 采数据 → 训练 → 仿真验证 → <strong>模型部署</strong> → 系统集成 → 真机测试 → 迭代。部署这一环负责让模型在真实硬件上跑得够快、够准、够稳。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>工作</th><th>内容</th><th>ACT 里对应</th></tr></thead>
+          <tbody>
+            <tr><td>导出和转换</td><td>PyTorch → ONNX → TensorRT，处理不支持的算子、版本不兼容</td><td>opset 17 → 16</td></tr>
+            <tr><td>性能分析</td><td>逐层 profile、nsys 找时间花在哪</td><td>Myelin 2.57 ms、层太多</td></tr>
+            <tr><td>量化</td><td>FP16 / INT8；难点是掉点后定位哪层、怎么修</td><td>FP16 已做，INT8 待做</td></tr>
+            <tr><td>精度验证</td><td>离线误差、仿真、实机</td><td>两层验收 + 三层指标</td></tr>
+            <tr><td>工程整合</td><td>C++ 推理程序、前后处理上 GPU、接 ROS 2、延迟抖动</td><td>CUDA Graph</td></tr>
+            <tr><td>自定义算子</td><td>TensorRT 不支持或很慢时写 kernel / plugin</td><td>RMSNorm plugin</td></tr>
+          </tbody>
+        </table></div>
+        <div class="tablewrap"><table>
+          <thead><tr><th>改动</th><th>公式变了吗</th><th>要重训吗</th></tr></thead>
+          <tbody>
+            <tr><td>换 kernel 实现、融合、ONNX → TensorRT</td><td>没变</td><td>不用，比输出误差</td></tr>
+            <tr><td>FP16</td><td>有舍入</td><td>通常不用，比误差 + 任务测试</td></tr>
+            <tr><td>INT8 PTQ</td><td>近似</td><td>不用，要校准数据</td></tr>
+            <tr><td>QAT</td><td>近似</td><td>要微调（PTQ 不够时）</td></tr>
+            <tr><td>换激活 / norm、剪枝、改结构</td><td>变了</td><td>要重训或微调</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">掉点时的顺序：FP16 → INT8 PTQ → 敏感层回退 FP16 → QAT → 换小模型 / 蒸馏，把训练成本放到最后。</p>
+      </div>
+
+      <div class="blk"><h3>真机效果差：分层排查</h3>
+<pre><code>排查梯子：从最简单的环境开始，哪一步开始变差，问题就大概率在新加的那一层
+1. 桌面 GPU + PyTorch + 数据集          第 1 步就不好        → 模型或数据
+2. Orin + TensorRT + 同一批数据         1 好、2 差           → 导出或量化
+3. Orin + 录制的真机数据回放            2 好、3 差           → 真实数据和预处理
+4. 仿真闭环
+5. 真机，不执行动作，只输出预测
+6. 真机低速运行                         3 好、6 差           → 延迟、控制或动力学
+7. 真机正常运行                         6 好、7 差           → 速度相关的动力学或控制频率</code></pre>
+        <ul class="plain">
+          <li><strong>记录一切</strong>：原始图像、预处理后的张量、状态、模型输出、实际动作和时间戳，失败后能回放。</li>
+          <li><strong>回放对比</strong>：同一份真机日志在 PyTorch 和 Orin 上各跑一遍，动作近似相同就说明部署层大概率没问题。</li>
+          <li>sim-to-real 里和部署最相关的是<strong>延迟对齐</strong>：把实测的端到端延迟及其波动告诉训练端，在仿真里加进去。</li>
+        </ul>
+      </div>
+
+      <div class="blk"><h3>推理程序怎么分层</h3>
+<pre><code>应用和任务
+  ↓
+机器人接口层：相机、状态、动作        ← ROS 2 消息和节点隔离；URDF 和配置文件描述关节、相机位置
+  ↓
+推理接口层：输入张量 → 输出动作        ← C++ 里统一的 infer(input) → action
+  ↓
+后端：TensorRT / llama.cpp / ONNX Runtime
+  ↓
+硬件：Orin / Thor / x86 GPU            ← Docker 或固定 JetPack、CUDA 版本；保留 ONNX，到目标机器重建 engine</code></pre>
+        <p>不要写死模型形状和路径：模型 / plugin 路径、输入输出名称和形状、图像尺寸和归一化参数、控制频率、关节顺序放进配置文件，换模型或换机器人时只改配置。</p>
+      </div>
+
+      <div class="blk" id="m10-smolvla"><h3>下一个模型：SmolVLA</h3>
+        <p><strong>为什么换</strong>：ACT 做到 FP16 engine 跑通、和 PyTorch 对上误差就停了（INT8 和仿真闭环都没做）。ACT 一次前向就出结果，部署上没有难点；SmolVLA 是"VLM 主干 + 动作生成头"的结构（π0、GR00T 也是这一类），约 4.5 亿参数，Orin 能跑，LeRobot 原生支持。更重要的是它的一次推理和 LLM 推理几乎一样：</p>
+<pre><code>前缀：VLM 跑一遍（类似 prefill），得到 KV cache
+  ↓
+去噪循环 × 10：action expert 每次读同一份前缀 KV cache（类似 decode 循环）</code></pre>
+        <div class="tablewrap"><table>
+          <thead><tr><th></th><th>ACT</th><th>SmolVLA</th></tr></thead>
+          <tbody>
+            <tr><td>大小</td><td>约 8000 万</td><td>约 4.5 亿</td></tr>
+            <tr><td>视觉</td><td>每个相机一个 ResNet-18</td><td>预训练 VLM 里的 SigLIP</td></tr>
+            <tr><td>听指令</td><td>不能，一个模型一个任务</td><td>能，靠语言指令换任务</td></tr>
+            <tr><td>生成动作</td><td>一次前向输出 100 步</td><td>flow matching，从噪声开始去噪 10 次，输出 50 步</td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>⓪ 可行性检查（Quest CPU）</strong>：加载 <code>lerobot/smolvla_base</code>，随机输入跑一次，记下结构和形状。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>部分</th><th class="num">参数</th><th>结构</th></tr></thead>
+          <tbody>
+            <tr><td>视觉编码器（SigLIP）</td><td class="num">86M</td><td>12 层 ViT，512×512 输入，16×16 patch → 每张图 1024 个</td></tr>
+            <tr><td>connector</td><td class="num">12M</td><td>pixel shuffle 把相邻 4×4 个 patch 拼成一个（1024 → 64），线性层投影到 960</td></tr>
+            <tr><td>VLM 语言层</td><td class="num">205M</td><td>16 层 Llama（原模型 32 层留一半），hidden 960，15 个 Q 头 / 5 个 KV 头（GQA），head_dim 64</td></tr>
+            <tr><td>lm_head</td><td class="num">47M</td><td>不生成文字，推理用不上</td></tr>
+            <tr><td>action expert</td><td class="num">98M</td><td>16 层，hidden 720；每隔一层是交叉注意力，读 VLM 的 KV</td></tr>
+          </tbody>
+        </table></div>
+<pre><code>① 3 张图 ──SigLIP + connector──▶ 3 × [64, 960]
+② 前缀 = 192 个图像 token + 48 个文本 token（总是补齐到 48）+ 1 个状态 token = 241 个
+   ──VLM 16 层──▶ KV cache：16 层，每层 K、V 都是 [1, 5, 241, 64]
+③ 去噪 × 10：噪声动作 x [1, 50, 32] ──action expert──▶ 速度 v [1, 50, 32]，x = x + dt·v
+④ 输出 50 步动作 [1, 50, 32]（只有前 6 维对应 6 个关节）</code></pre>
+        <ol class="plain">
+          <li><strong>形状全部静态</strong>：相机数固定、文本补齐到 48，前缀永远是 241 个 token。TensorRT 处理静态形状最简单。</li>
+          <li><strong>计算量主要在视觉</strong>（粗估）：视觉约 530 GFLOP（约 75%），VLM 前缀约 76，expert 每步约 10、10 步约 100。所以优化的重点是视觉编码器，不是去噪循环。CPU 一次 6.7 s，只作参考。</li>
+          <li><strong>能省的重复计算</strong>：expert 的交叉注意力层每一步都把 VLM 的 KV 重新过一遍自己的 k_proj / v_proj，而 KV 在 10 步里不变，算一次就够（原代码没做）。</li>
+        </ol>
+        <p><strong>拆成 3 个 engine</strong>（带循环的图不好导出成一个 ONNX，循环放 C++）：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>engine</th><th>输入</th><th>输出</th><th>次数</th></tr></thead>
+          <tbody>
+            <tr><td>A 视觉</td><td>[3, 3, 512, 512]</td><td>[3, 64, 960]</td><td>1</td></tr>
+            <tr><td>B 前缀</td><td>241 个 token 的嵌入、掩码、位置</td><td>16 层 K、V</td><td>1</td></tr>
+            <tr><td>C 单步去噪</td><td>x_t、时间步、16 层 K、V</td><td>速度 v</td><td>10</td></tr>
+          </tbody>
+        </table></div>
+        <p>风险：原代码的 KV cache 是 Python 对象 <code>DynamicCache</code>（还带追加再裁剪），要写包装层换成纯张量；自定义二维注意力掩码导出后要验证；FP16 精度要逐块对比；opset 要按 TensorRT 8.5 选。后续步骤：② Orin 上先 FP32 再 FP16，逐块和 PyTorch 参考输出对比 → ③ C++ 串起来（预处理 kernel、KV 常驻显存、Euler 更新 kernel、循环在 C++）→ ④ 固定输入和噪声做端到端对比 → ⑤ nsys 找瓶颈，依次试提前算交叉注意力 K/V、CUDA Graph、视觉 INT8、减少去噪步数、异步推理 → ⑥ 延迟 / 离线动作误差 / 仿真成功率三层评估（<code>smolvla_base</code> 没有在具体任务上微调，到这一步要找 LIBERO 微调权重或自己微调）。</p>
+        <p><strong>① 引擎 A 的导出</strong>：<code>src/vla/export_vision.py</code>把 ×2−1 → SigLIP → post_layernorm → connector → ×√960 包成一个模型，resize 和补边留在外面；PyTorch 跑两组随机图把输入输出存成 <code>vision_io.pt</code>，以后 onnxruntime 和 TensorRT 都拿它对答案。PyTorch 在这里只做两件事：导出需要它实际跑一遍来记录计算图（tracing），以及留下标准答案；部署到 Orin 后不需要 PyTorch。三次 CPU 作业：</p>
+        <ol class="plain">
+          <li><strong>tracing 时报 IndexError</strong>：SigLIP 每层前要生成 attention mask，要用到 patch 总数 1024；导出时这个数被换成"会记账的张量"，transformers 误以为是旧版本的调用方式（传一串位置编号），去取第一个元素就越界。这是库的兼容 bug，只在导出时触发。我们的图都是满图，mask 全是"可以"，于是不调用 <code>embed_image</code>，手动依次调用 embeddings → encoder（不传 mask）→ post_layernorm → connector，和原版的最大差值 0。</li>
+          <li><strong>onnxruntime 加载失败</strong>：SmolVLM 为了支持任意尺寸的图，位置编号的算法是"相对坐标 → 查落在哪个格子 → 按条件写回"，导出后变成 NonZero、ScatterND 这类"按数据决定往哪写"的节点，ScatterND 的输入类型前后不一致（float 和 int64）；就算能加载，TensorRT 对这类节点的支持也差。满图时编号就是 0～1023，改成直接加整张位置编码表 [1024, 768]。</li>
+          <li><strong>通过</strong>：与原版差值 0；ONNX 374.9 MiB、855 个节点，NonZero / ScatterND 消失；onnxruntime 与 PyTorch rel_l2 1.46e-6 / 1.34e-6（max_abs_err 3.66e-3 / 1.83e-3，输出范围约 [−2420, 1121]）。</li>
+        </ol>
+        <div class="tablewrap"><table>
+          <thead><tr><th>ONNX 节点</th><th class="num">数量</th><th>对应 ViT 的哪部分</th></tr></thead>
+          <tbody>
+            <tr><td>Conv</td><td class="num">1</td><td>patch embed（16×16、stride 16，就是 conv bench 里的 siglip_patch）</td></tr>
+            <tr><td>Softmax</td><td class="num">12</td><td>12 层 attention</td></tr>
+            <tr><td>MatMul</td><td class="num">97</td><td>每层 Q、K、V、O 四个投影 + QKᵀ、PV + MLP 两个 = 8，× 12 = 96，再加 connector 1 个</td></tr>
+            <tr><td>ReduceMean</td><td class="num">50</td><td>25 个 LayerNorm（每层 2 个 × 12 + 最后 1 个），每个拆出均值和方差两次</td></tr>
+            <tr><td>Pow / Sqrt / Div</td><td class="num">各 25</td><td>同样是那 25 个 LayerNorm（opset 16 没有 LayerNorm 节点）</td></tr>
+            <tr><td>Tanh</td><td class="num">12</td><td>GELU 的 tanh 近似，每层 MLP 一个</td></tr>
+          </tbody>
+        </table></div>
+        <p>ViT 本身：图切成 16×16 的块，每块 16×16×3 = 768 个数乘一个矩阵变成 768 维向量（这正是 K = 768 的 16×16 stride 16 卷积），加上可学的位置编码；每层 LayerNorm → attention（12 个头、每头 64 维，[1024, 1024] 的分数表每行 softmax）→ 残差 → LayerNorm → MLP（768 → 3072 → 768，GELU）→ 残差。每层约 4.8 G（四个投影）+ 3.2 G（QKᵀ 和 PV）+ 9.7 G（MLP）FLOP，12 层约 200 GFLOP 一张图，几乎全是矩阵乘，所以 Orin 上快不快主要看能不能用上 FP16 Tensor Core。Orin 上的结果见下面 ②。</p>
+        <p><strong>② 引擎 A 在 Orin 上编 TensorRT</strong>：ONNX 和参考数据经本机 ssh 管道从 Quest 拷到 Orin（用 md5 核对），<code>trtexec --onnx=… --noTF32</code> 编 FP32（<code>--noTF32</code> 保证矩阵乘真用 FP32 而不是 TF32，和 PyTorch 比才公平），再编 FP16；检查脚本 <code>src/vla/check_vision_trt.py</code> 仿照 ACT 的 <code>check_trt.py</code>，喂 2 组参考输入，比 rel_l2、max_abs、cos。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>引擎</th><th class="num">延迟（普通 / CUDA Graph）</th><th class="num">rel_l2</th><th class="num">cos</th></tr></thead>
+          <tbody>
+            <tr><td>FP32（<code>--noTF32</code>）</td><td class="num">226.5 / 224.7 ms</td><td class="num">2.0e-6</td><td class="num">1.000000</td></tr>
+            <tr><td>FP16 全部层</td><td class="num">49.0 / 48.0 ms</td><td class="num"><strong>0.26（算错）</strong></td><td class="num">0.966</td></tr>
+            <tr><td>FP16 + LayerNorm 留 FP32</td><td class="num win">49.5 / 48.3 ms</td><td class="num">8.5e-3</td><td class="num">0.99996</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">Orin，TensorRT 8.5，一次处理 3 张 512×512 的图。</p>
+        <ol class="plain">
+          <li><strong>FP16 为什么算错</strong>：opset 16 没有 LayerNorm 节点，导出时拆成"减均值 → 平方（Pow）→ 求平均 → 开方 → 相除"。平方那一步只要某个值偏离均值超过 256，结果就超过 FP16 最大值 65504 变成 inf，于是部分 token 错得面目全非（最差的 rel_l2 超过 1）。输出范围本来就有约 [−2420, 1121]，中间激活值很大。</li>
+          <li><strong>怎么修</strong>：这些节点名字有统一规律，用 trtexec 的 <code>--layerPrecisions</code> 把 225 个 LayerNorm 相关节点指定为 FP32，加 <code>--precisionConstraints=obey</code> 让 TensorRT 必须遵守，其余仍是 FP16。延迟几乎不变，因为大头是矩阵乘，矩阵乘仍走 FP16 Tensor Core。这串层名目前是手工生成的，还没做成可复用的构建脚本。</li>
+          <li><strong>FP32 速度合理吗</strong>：3 张图约 650 GFLOP，226 ms 约 2.9 TFLOPS，约 1300 MHz 下 FP32 峰值的 55%（估算）。FP16 快约 4.6 倍。</li>
+          <li><strong>8.5e-3 够不够</strong>：对 FP16 的 ViT 常见，但最终要等整条管线输出动作后在动作上看。</li>
+        </ol>
+        <p><strong>③ 引擎 B（VLM 前缀 → KV cache）的导出脚本已写好、还没跑</strong>（<code>src/vla/export_prefix.py</code>）。输入 <code>img_emb [3,64,960]</code>（直接接引擎 A 输出）、<code>lang_tokens [1,48]</code>（int32）、<code>lang_mask [1,48]</code>、<code>state [1,32]</code>；输出 <code>k_cache</code>、<code>v_cache</code> 各 [16, 5, 241, 64]。attention mask 和位置编号只依赖 <code>lang_mask</code>，放在图里算，原版的 cumsum 改成乘一个上三角全 1 矩阵（TensorRT 一定支持矩阵乘）。和原版的两处不同（导出后会逐层对比）：RoPE 原版用下标赋值写结果，导出会变成 ScatterND，改成 cat，数学上一样；补齐的 token 让它至少能看自己，否则这一整行 softmax 在 FP16 下是 NaN，并通过 V 传给所有 token，真 token 的 K、V 不受影响。提前记下的 FP16 风险：RoPE 的角度最大约 240 弧度，FP16 在 240 附近的精度只有 0.125，所以编 FP16 时 RoPE 也要留在 FP32（<strong>待验证</strong>）。</p>
+        <p><strong>④ 引擎 A 的算子按计算量拆开（讲解）</strong>：855 个节点里真正做计算的只有 5 类，其余 Reshape / Transpose / Constant 只是挪数据、摆形状。一张图的路径：像素 [0,1] → [−1,1] → Conv patch embed（[3,512,512] → [1024,768]，约 1.2 GFLOP，本质是每块 768 个像素乘 [768,768] 的矩阵）→ 加位置编码 → 12 层 transformer（约 213 GFLOP）→ post LayerNorm → pixel shuffle（4×4 块拼成一个 token，1024 → 64 个 token、每个 12288 维，只挪数据）→ connector MatMul 12288 → 960（约 1.5 GFLOP）→ 乘 √960。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>每张图约 215 GFLOP</th><th class="num">计算量</th><th class="num">占比</th></tr></thead>
+          <tbody>
+            <tr><td>线性层 q / k / v / o / fc1 / fc2（每层 1024 × 7.08M × 2 ≈ 14.5 GFLOP × 12）</td><td class="num">≈ 174 GFLOP</td><td class="num">≈ 81%</td></tr>
+            <tr><td>注意力 QKᵀ、PV（每层 2 × 1024² × 768 × 2 ≈ 3.2 GFLOP × 12）</td><td class="num">≈ 39 GFLOP</td><td class="num">≈ 18%</td></tr>
+            <tr><td>LayerNorm、Softmax、GELU、Add</td><td class="num">很小</td><td class="num">&lt; 1%</td></tr>
+          </tbody>
+        </table></div>
+        <ol class="plain">
+          <li><strong>时间在 MatMul，但小算子的时间占比会高于 1%</strong>：它们受带宽限制，时间花在读写显存而不是计算上，具体多少要逐层 profile，<strong>还没测</strong>。</li>
+          <li><strong>Tensor Core 只用到三成左右</strong>：FP32 226 ms ≈ 2.9 TFLOPS（CUDA core）；FP16 49 ms ≈ 13 TFLOPS，按 64 个 Tensor Core、1300 MHz 估的 FP16 峰值约 42 TFLOPS（<strong>没查文档核实</strong>），还有优化空间。</li>
+          <li><strong>精度问题只出在 LayerNorm</strong>：ViT 残差流里有少数"离群通道"值到几百，|x − 均值| &gt; 256 时平方超过 65504。另外两个看起来危险的算子没事：Softmax 在 TensorRT 里先减每行最大值；GELU（tanh 近似）里的 x³ 在 |x| &gt; 40 时会变成 inf，但 tanh(±inf) = ±1，正数原样输出、负数输出 0，结果仍正确。</li>
+          <li><strong>引擎 B 为什么还要再跑一次导出</strong>：上次的脚本虽然加载了整个模型，但只 trace 了 SigLIP + connector，16 层 Llama 从没导出过；参考答案（原版 RoPE 和 mask 下的 K / V cache，存成 <code>prefix_io.pt</code>）也要在加载模型的那次运行里算。可以把引擎 C（去噪一步）的导出写进同一个脚本，一次 srun 都导出（还没定）。到了引擎 B，同样几类算子的变化是：LayerNorm 换成 RMSNorm、多了 RoPE、注意力变成 15 个 Q 头配 5 个 KV 头（GQA）。</li>
+        </ol>
+        <p><strong>⑤ A、B、C 全部在 Orin 上跑通</strong>。先解决一个导出前的问题：checkpoint 里 VLM 文本部分和动作专家存成 <strong>bf16</strong>，transformers 按 config 的 <code>torch_dtype: bfloat16</code> 把这两部分建成 bf16（视觉部分是 FP32，所以 A 当初没事）。onnxruntime CPU 版没有 bf16 矩阵乘，TensorRT 8.5 不支持 bf16，所以导出前整体 <code>.float()</code>：bf16 的 8 位指数和 FP32 相同、尾数是 FP32 的前 7 位，转成 FP32 只是在尾数后面补 0，值完全不变。</p>
+        <p>怎么判断 FP16 误差"够小"：同一个模型用原生 bf16 算一遍、用 FP32 算一遍，两者的动作差距就是模型在自己训练精度下本来就有的误差，叫<strong>噪声底线</strong>。TensorRT FP16 的端到端误差只要不超过它，就说明 FP16 没有带来超出模型本身的精度损失。这比凭经验定一个 1e-2 之类的阈值更有依据，因为阈值随模型和输出范围变（动作范围约 ±1.7）。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>引擎</th><th class="num">FP32</th><th class="num">FP16 方案</th><th>留 FP32 的部分</th><th class="num">FP16 单引擎误差（rel_l2）</th></tr></thead>
+          <tbody>
+            <tr><td>A 视觉（SigLIP + connector）</td><td class="num">224.7 ms</td><td class="num">48.3 ms</td><td>LayerNorm</td><td class="num">8.5e-3</td></tr>
+            <tr><td>B 前缀（16 层 Llama → KV cache）</td><td class="num">29.2 ms</td><td class="num">8.6 ms</td><td>RMSNorm、RoPE</td><td class="num">k 1.8e-3，v 2e-3</td></tr>
+            <tr><td>C 去噪一步（动作专家）</td><td class="num">8.2 ms</td><td class="num">3.78 ms</td><td>无</td><td class="num">2.3e-3</td></tr>
+            <tr><td class="sub">每次观测 A + B + C×10</td><td class="num sub">≈ 336 ms</td><td class="num sub">≈ 95 ms</td><td class="sub"></td><td class="sub"></td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">Orin，GPU 锁 1300 MHz，延迟为 CUDA Graph 下的中位数。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>端到端动作（B → C×10，和 PyTorch FP32 比）</th><th class="num">rel_l2（样本 1 / 2）</th><th class="num">max_abs</th></tr></thead>
+          <tbody>
+            <tr><td>TensorRT FP32</td><td class="num">4e-6</td><td class="num">—</td></tr>
+            <tr><td>TensorRT FP16 方案</td><td class="num win">3.9e-3 / 4.9e-3</td><td class="num">7e-3</td></tr>
+            <tr><td>噪声底线：PyTorch 原生 bf16</td><td class="num">6.2e-3 / 9.6e-3</td><td class="num">≈ 1e-2</td></tr>
+            <tr><td>只把 RMSNorm 留 FP32（RoPE 仍 FP16）</td><td class="num">样本 2：1.26e-2</td><td class="num">—</td></tr>
+          </tbody>
+        </table></div>
+        <ol class="plain">
+          <li><strong>B 直接全 FP16 为什么错（rel_l2 0.97）</strong>：和 A 的 LayerNorm 是同一个问题。RMSNorm 要先算 x² 的平均，Llama 的隐藏层里有很大的值，平方后超过 FP16 最大值 65504 变成 inf，整行归一化就坏了。RMSNorm 留 FP32 后单引擎误差降到 4e-3。</li>
+          <li><strong>只修 RMSNorm 还不够</strong>：第二个样本的端到端误差 1.26e-2，超过噪声底线，而且是 K 的误差偏大。RoPE 用位置 × 频率得到旋转角度，最大约 240 弧度，FP16 在 240 附近相邻两个数相差 0.125，角度误差这么大时 cos / sin 就不准了。RoPE 也留 FP32 后 K 的误差减半，端到端降到底线以下。</li>
+          <li><strong>怎么确认是 RoPE</strong>：RoPE 只作用于 Q、K，V 不经过它。改完之后 K 的误差变了、V 的没变，正好对上；如果是别的层的问题，V 也应该跟着变。</li>
+          <li><strong>代价</strong>：两步共 594 个节点留 FP32，延迟只多约 0.2 ms。这些都是逐元素或规约的小算子，时间在矩阵乘上，矩阵乘仍走 FP16 Tensor Core（和 A 的情况相同）。</li>
+          <li><strong>下一步看哪</strong>（<strong>没做逐层 profile</strong>）：C 跑 10 步共约 38 ms，是最大的一块；每步约 10 GFLOP 却要 3.78 ms，只有约 2.6 TFLOPS，大概率卡在 kernel 启动和小矩阵乘上。可做的：把 10 步整个录成一个 CUDA Graph；cross-attn 层的 K/V 投影只依赖 B 的输出、10 步里都一样，可以挪进 B 只算一次。A 的 48 ms 排第二。</li>
+        </ol>
+        <p class="small muted">还没做：选 FP32 节点的脚本是临时的，还没做成可复用的构建脚本。</p>
+      </div>
+
+      <div class="blk iv" id="m10-iv"><h3>面试要求</h3>
+        <p>这是部署线的核心项目，追问会最深。</p>
+        <h4>必须会</h4>
+        <ul class="plain">
+          <li>讲清楚 ACT 部署的完整故事：模型结构（ResNet-18 图像主干 + Transformer encoder 4 层 / decoder 1 层，输出 100×14 的动作块）→ 导出（归一化放进 ONNX、opset 16）→ TensorRT FP32 / FP16（17.0 → 5.56 ms，CUDA Graph 3.70 ms）→ 误差（rel L2 ≤ 1.1e-3，最大 2.2e-3 rad；目前只有随机输入）。</li>
+          <li>三层评估：系统指标（延迟、P95 / P99、功耗）、离线动作误差（数据集回放）、闭环仿真成功率（带置信区间）；为什么离线误差小不代表闭环一定成功（误差累积）。</li>
+          <li>部署工作日常做什么：导出转换、性能分析、量化、精度验证、工程整合、少量自定义算子、迁移和回归。</li>
+          <li>延迟预算：控制频率决定推理时间上限（例如 30 Hz → 推理要远小于 33 ms）。</li>
+        </ul>
+        <h4>应该会</h4>
+        <ul class="plain">
+          <li>INT8 PTQ：校准集怎么选、校准方法、掉点时怎么逐层定位、敏感层回退 FP16；PTQ 不够时才考虑 QAT。</li>
+          <li>为什么换实现（公式不变）不需要重训，换结构 / 剪枝 / 蒸馏需要。</li>
+          <li>sim-to-real 的差距来源和对齐办法；真机失败时分层排查（感知 → 推理 → 控制 → 执行）。</li>
+          <li>端侧特有的问题：内存小、功耗限制、JetPack 版本锁死、多模型共享一块 GPU。</li>
+        </ul>
+        <h4>加分</h4>
+        <ul class="plain">
+          <li>Action chunking、temporal ensembling 和推理频率的关系。</li>
+          <li>VLA 部署（见端侧 VLA 论文模块）、ROS 2 接入、异步推理。</li>
+          <li>硬件不统一时的软件分层（接口层 + 配置）。</li>
+        </ul>
+        <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+      </div>
+
+      <div class="selftest"><h3>自测</h3><ul class="plain">
+        <li>一个策略模型上线要经过哪几个阶段？部署工程师负责哪一段，交付什么？</li>
+        <li>为什么 LeRobot 在 Quest 上导出、Orin 只跑 TensorRT？代价是什么？</li>
+        <li>19/20 和 18/20 能说明 INT8 比 FP16 好吗？为什么？</li>
+        <li>ACT 接下来按什么顺序优化？INT8 校准为什么不能用随机输入？</li>
+        <li>把 F.silu 换成手写 kernel、把 ReLU 换成 silu、做 INT8 PTQ，哪些要重训？为什么误差小也要做任务测试？</li>
+        <li>按排查梯子，第 2 步好、第 3 步差，先怀疑什么？回放对比怎么做？</li>
+        <li>15 Hz 控制时模型最多能用多久？为什么要看 P95 而不是平均延迟？</li>
+        <li>为什么推理程序要把形状、路径、归一化参数放进配置文件？</li>
+        <li><code>act_aloha_sim_transfer_cube_human</code> 的输入输出是什么？推理时为什么不需要 VAE encoder？部署时哪些预处理必须和 LeRobot 一致？</li>
+        <li>部署后 INT8 掉点，按什么顺序处理？校准和微调有什么区别？换小模型、剪枝、蒸馏各改什么、要不要训练？</li>
+        <li>不上真机怎么量化部署效果？三层各测什么、证明什么？为什么 Quest 上的仿真成功率不能完全代表 Orin engine？</li>
+        <li>为什么把归一化写进 ONNX？<code>ActForExport</code> 为什么不用 TORCH_LIBRARY 注册？buffer 和 parameter 有什么区别？</li>
+        <li>Orin 上第一次建 engine 为什么失败？改 opset 后 LayerNorm 变成了哪些节点？FP16 要在导出时改吗？</li>
+        <li>为什么先用 ONNX Runtime 检查、再用 TensorRT 检查？两层检查分别排除什么问题？</li>
+        <li>ACT 的 CUDA Graph 收益为什么这么大？为什么现在不建议给 LayerNorm 写 plugin？什么情况下才值得写？</li>
+        <li>FP16 最大误差 2.2e-3 弧度能说明部署没问题吗？还缺哪两层验证？</li>
+        <li>生产中部署工作主要做哪几类事？既然很少从零手写 GEMM，为什么还要学它？</li>
+        <li>SmolVLA 的一次推理为什么像 LLM 的 prefill + decode？为什么拆成 3 个 engine、循环放在 C++ 里？哪一块计算量最大？</li>
+        <li>导出 SigLIP 时遇到的两个问题各是什么原因？为什么"不传 mask""直接加整张位置编码表"不改变结果？怎么证明？</li>
+        <li>855 个 ONNX 节点里 97 个 MatMul、50 个 ReduceMean、12 个 Tanh 分别从哪来？</li>
+      </ul>
+      <h3>面试高频问题</h3><ul class="plain">
+        <li>介绍一下你的部署项目：难点是什么？怎么优化的？最后效果用什么指标说明？</li>
+        <li>FP16 / INT8 量化后精度怎么验证？掉点了怎么办？</li>
+        <li>端侧和云端部署有什么不同？</li>
+        <li>为什么不直接在 Orin 上跑 PyTorch？</li>
+      </ul></div>
+    </article>

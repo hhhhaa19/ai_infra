@@ -1,0 +1,193 @@
+<article class="mod" id="m6" hidden>
+      <div class="eyebrow">模块 6</div>
+      <h2>性能测量：基线、对照与轮次波动</h2>
+      <p class="why"><strong>这一模块讲什么</strong>：结果正确后，怎样测量性能、定位瓶颈。先定义测的是什么，再排除干扰，然后看实验结果，最后总结成规则。</p>
+
+      <div class="blk"><h3>第一步：先想清楚测的是哪段时间</h3>
+        <p>性能数字要先说清楚测的是什么。<code>enqueueV3</code> 只是把任务提交给 GPU，CPU 很快就返回，所以不能只计 CPU 调用耗时。我们用 CUDA event：在 stream 上放两个事件，测它们之间的区间，也就是 GPU 这一段。这段时间可能包含提交不足造成的空隙。</p>
+        <p>测 kernel 时有两种方式。<strong>single</strong> 用事件包住一次 kernel 并等待；<strong>batch</strong> 包住连续 N 次同流 launch，再除以 N。batch 是均摊值，它的 P95 不是单次的 P95，所以两者不能直接比。nearest-rank P95 的取法是：200 个样本排序后取第 190 个（索引 189）。</p>
+      </div>
+
+      <div class="blk"><h3>第二步：排除干扰</h3>
+        <p>只测一次的数字不可靠，所以要多层重复，每一层防一种干扰：每个样本连续 N 次前向再除以 N，减少计时点误差；30 个样本取中位数，防止偶发打断；3 轮交替顺序，防止先测的吃亏；3 个独立进程，防止整次运行偏快或偏慢。保留全部轮次，报告稳定区间和异常，不只挑最快值。</p>
+        <p>还要分清几种状态。重复用同一份输入会享受硬件缓存，构建、启动、稳态耗时要分开报告。Timing Cache 是构建 engine 时的实现计时信息，不是推理结果缓存。</p>
+      </div>
+
+      <div class="blk"><h3>第三步：看工具时别误读</h3>
+        <p>GPU-Util 和 occupancy 都不等于有效算力效率。时间线上 <code>cudaStreamSynchronize</code> 的长条表示 CPU 在等 GPU；GPU 上的空档也可能是 GPU 在等 CPU。</p>
+        <p>nsys 的数据要分开看：kernel 执行时间由 GPU 记录，可信，可以用来算占比；整层墙钟时间被每次发射的拦截开销拉长，不能用来报加速比。所以 nsys 用来找瓶颈，计时用 CUDA event。</p>
+        <p>下面按时间顺序看实际结果：先是 ResNet-50 部署基线，再到 CUDA benchmark、shared / warp 归约和 RMSNorm。</p>
+      </div>
+
+      <div class="blk"><h3>ResNet-50 推理（A100-PCIE-40GB，Batch=1）</h3>
+        <div class="tablewrap"><table>
+          <thead><tr><th>实验</th><th>结果（Median，ms）</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>首次推理段基线</td><td class="num">1.75923</td><td>Mean 1.98321，P95 2.43917，200 次，输入已在 GPU</td></tr>
+            <tr><td>pageable vs pinned 同步拷贝，三轮</td><td class="num">1.959/1.837；1.962/1.848；1.956/1.846</td><td>pinned 中位数低约 5.6～6.2%</td></tr>
+            <tr><td>pinned 同步 vs 单流异步，三轮</td><td class="num">1.843/1.830；1.835/1.831；1.836/1.826</td><td>差异小，不能推断通用加速；第一轮同步 P95 3.143</td></tr>
+          </tbody>
+        </table></div></div>
+
+      <div class="blk"><h3>CUDA benchmark 与预热</h3>
+        <p>百万元素 128 线程首轮 single Mean 18.78 μs、batch 14.35 μs，后两轮约 11 μs、8.58 μs。预热对照（72 组 PASS）：原预热 18.60 / 14.42，加长预热 10.96 / 8.40，再加长 10.98 / 8.45，最后恢复原预热 11.11 / 8.57 μs。支持"初始状态影响测量"，但顺序和残留热状态没有独立控制。</p></div>
+
+      <div class="blk"><h3>shared vs warp 规约（A100，四轮中位数，μs）</h3>
+        <div class="tablewrap"><table>
+          <thead><tr><th class="num">N</th><th>模式</th><th class="num">shared</th><th class="num">warp</th><th class="num">下降</th></tr></thead>
+          <tbody>
+            <tr><td class="num">250</td><td>batch</td><td class="num">2.959</td><td class="num">2.683</td><td class="num">9.34%</td></tr>
+            <tr><td class="num">256</td><td>batch</td><td class="num">2.954</td><td class="num">2.683</td><td class="num">9.19%</td></tr>
+            <tr><td class="num">1000003</td><td>single</td><td class="num">18.432</td><td class="num">15.616</td><td class="num">15.28%</td></tr>
+            <tr><td class="num">1000003</td><td>batch</td><td class="num">16.527</td><td class="num">13.394</td><td class="num win">18.96%</td></tr>
+            <tr><td class="num">16000003</td><td>single</td><td class="num">134.144</td><td class="num">102.400</td><td class="num">23.66%</td></tr>
+            <tr><td class="num">16000003</td><td>batch</td><td class="num">131.092</td><td class="num">99.471</td><td class="num win">24.12%</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">小数组 single 两版都约 5.12 μs。大数组包含 3 个 kernel 阶段。机制假设：shared 读写减少、block 屏障从 9 次减为 4 次；未用 ncu 证实。</p></div>
+
+      <div class="blk"><h3>RMSNorm 测量记录</h3>
+        <div class="tablewrap"><table>
+          <thead><tr><th>A100 可变行宽</th><th class="num">128 线程</th><th class="num">256</th><th class="num">512</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">1 × 4096</td><td class="num">13.414</td><td class="num">8.294</td><td class="num">5.816</td></tr>
+            <tr><td class="mono">128 × 1003</td><td class="num">6.410</td><td class="num">5.100</td><td class="num">4.649</td></tr>
+            <tr><td class="mono">4096 × 256</td><td class="num">7.690</td><td class="num">10.220</td><td class="num">17.941</td></tr>
+            <tr><td class="mono">4096 × 4096</td><td class="num">173.507</td><td class="num">129.454</td><td class="num">122.266</td></tr>
+          </tbody>
+        </table></div>
+        <div class="tablewrap"><table>
+          <thead><tr><th>A100 128×4096 CUB vs own</th><th class="num">own</th><th class="num">cub</th><th class="num">降低</th></tr></thead>
+          <tbody>
+            <tr><td>128 线程</td><td class="num">15.606</td><td class="num">10.015</td><td class="num">35.8%</td></tr>
+            <tr><td>256 线程</td><td class="num">9.708</td><td class="num">7.107</td><td class="num">26.8%</td></tr>
+            <tr><td>512 线程</td><td class="num">6.963</td><td class="num">5.898</td><td class="num">15.3%</td></tr>
+          </tbody>
+        </table></div>
+        <div class="tablewrap"><table>
+          <thead><tr><th>Orin ncu，4096×4096 / 128 线程</th><th class="num">own</th><th class="num">CUB</th></tr></thead>
+          <tbody>
+            <tr><td>kernel 时长</td><td class="num">2.39 ms</td><td class="num">1.24 ms</td></tr>
+            <tr><td>Eligible Warps / Scheduler</td><td class="num">0.50</td><td class="num">0.34</td></tr>
+            <tr><td>No Eligible</td><td class="num">65.52%</td><td class="num">73.42%</td></tr>
+            <tr><td>long_scoreboard 占比</td><td class="num">84.4%</td><td class="num">84.7%</td></tr>
+            <tr><td>Memory Throughput 汇总</td><td class="num">45.79%</td><td class="num">85.91%</td></tr>
+            <tr><td>寄存器 / 线程</td><td class="num">16</td><td class="num">40</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small">CUB 的 eligible 和发射率都更低却更快，推翻了"CUB 让更多 warp 就绪"的猜测；后来用 own_t 证实主因是编译期特化后指令少、读请求并行多。long_scoreboard 是等 L1/TEX 路径的数据依赖，不等于一定在等 DRAM。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>Orin 三方对照（μs）</th><th class="num">own</th><th class="num">own_t</th><th class="num">CUB</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">1, 4096, 128</td><td class="num">14.04</td><td class="num">9.34</td><td class="num">9.28</td></tr>
+            <tr><td class="mono">128, 4096, 128</td><td class="num">38.42</td><td class="num">29.59</td><td class="num">29.56</td></tr>
+            <tr><td class="mono">128, 4096, 256</td><td class="num">31.72</td><td class="num">23.77</td><td class="num">23.71</td></tr>
+            <tr><td class="mono">4096, 4096, 128</td><td class="num">1099.5</td><td class="num">765.8</td><td class="num">765.7</td></tr>
+            <tr><td class="mono">4096, 4096, 512</td><td class="num">915.4</td><td class="num">696.8</td><td class="num">696.9</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small">之后的 own_reg、padding、L2 扫描、PyTorch 单算子和 decoder layer 结果见 <a href="#data">RMSNorm 专题 · 实测数据</a>。</p></div>
+
+      <div class="blk"><h3>四层工具怎么配合</h3>
+        <p>前面实验用到的工具分别回答不同的问题。一般顺序是：先用 CUDA event 确认差距有多大，再用 nsys 找瓶颈在哪；问题在 kernel 内部时用 ncu 看原因，最后看 SASS 确认编译器到底生成了什么，改完再用 CUDA event 验证。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>工具</th><th>回答什么</th><th>典型用法</th><th>不能用来做什么</th></tr></thead>
+          <tbody>
+            <tr><td>CUDA event</td><td>这一段实际要多久</td><td>比较快慢，算优化百分比</td><td>解释为什么慢</td></tr>
+            <tr><td>nsys</td><td>时间花在哪，CPU 和 GPU 谁在等谁</td><td>看时间线、每个 kernel 的时间、算占比</td><td>报整层加速比</td></tr>
+            <tr><td>ncu</td><td>kernel 内部为什么慢</td><td>看带宽、stall、cache、活跃线程</td><td>测实际耗时（默认冷缓存、基础频率，kernel replay 还会打乱 L2）</td></tr>
+            <tr><td>SASS（机器码）</td><td>编译器到底生成了什么</td><td>数 <code>LDG</code>，确认 <code>LDG.E.128</code>、循环有没有展开</td><td>知道运行时发生了什么</td></tr>
+          </tbody>
+        </table></div>
+        <p>为什么 nsys 不能报整层时间？它要记录每次 CUDA 调用，CPU 每发一个 kernel 都多了拦截开销。kernel 的执行时间由 GPU 记录，不受影响；但 decode 时 GPU 本来就在等 CPU，CPU 一变慢，整层时间就被拉长。所以 nsys 下 decode b1 / b8 是 −23% / −20%，CUDA event 下是 −10% / −2%：kernel 少了 10 个，每个 kernel 在 nsys 下省得更多，收益就被放大了。</p>
+        <p>CUDA event 在 stream 上放两个时间点，测的是中间这一整段，不只是 kernel 的执行时间。GPU 在等 CPU 发下一个 kernel 时，空等也算进去。这正是整层测速要的，因为用户感受到的就是这段时间；只想要单个 kernel 自身的时间，就看 nsys 的 kernel 时间。</p>
+<pre><code>【例一：own 为什么比 CUB 慢】
+CUDA event：发现 own 慢
+ncu：       CUB 的 eligible 更低却更快，推翻"更多 warp 就绪"的猜测
+SASS：      own 3 条 LDG，CUB 39～105 条，定位到循环展开
+改成 own_t：再用 CUDA event 确认追平 CUB
+
+【例二：decode 的问题】
+CUDA event：整层有多快
+nsys：      wall 远大于 kernel 合计 → GPU 在等 CPU，问题不在 kernel 内部</code></pre>
+        <p>PyTorch 自己还有一层工具。它们不替代上面四个，而是多了"PyTorch 视角"：nsys 告诉你 GPU 上跑了什么，<code>torch.profiler</code> 告诉你这是哪一行 PyTorch 操作产生的。所谓"看 GPU kernel"，就是知道一次 forward 实际启动了哪些 kernel、各跑了多久、grid 和 block 多大，"少 10 个 kernel 省约 141 μs"就是这样数出来的。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>工具</th><th>回答什么</th><th>我们用过吗</th></tr></thead>
+          <tbody>
+            <tr><td><code>torch.profiler</code></td><td>每个 PyTorch 操作调了哪些 kernel，kernel 的 GPU 时间和 grid / block</td><td>Quest 上用过；Orin 抓不到 GPU kernel</td></tr>
+            <tr><td><code>torch.cuda.Event</code></td><td>一段 GPU 时间，也就是 CUDA event</td><td>一直在用</td></tr>
+            <tr><td><code>torch._dynamo.explain</code></td><td>图有几段、有没有 graph break、原因是什么</td><td>用来查 graph break</td></tr>
+            <tr><td><code>TORCH_LOGS</code></td><td>打印 compile 各阶段的图和生成的代码</td><td>讲过，用法见模块 8</td></tr>
+            <tr><td><code>inductor_cache</code></td><td>生成的 Triton 源码、<code>.ptx</code>、<code>.cubin</code></td><td>读过，发现融合 kernel 不写 h</td></tr>
+            <tr><td><code>torch.cuda.memory_allocated</code> 等</td><td>PyTorch 申请了多少显存</td><td>还没用过</td></tr>
+          </tbody>
+        </table></div>
+<pre><code>from torch.profiler import profile, ProfilerActivity
+with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    layer(x)
+print(prof.key_averages().table(sort_by="cuda_time_total"))
+
+PyTorch 里 kernel 从哪来       → torch.profiler
+torch.compile 有没有切断图      → torch._dynamo.explain
+compile 把算子融合成了什么      → TORCH_LOGS=output_code 或 inductor_cache
+PyTorch 里实际要多久            → torch.cuda.Event
+不在 PyTorch 里（如 TensorRT）  → nsys、trtexec --dumpProfile</code></pre>
+        <p><code>torch.profiler</code> 要通过 CUPTI（NVIDIA 的 CUDA 性能分析接口）拿 kernel 记录。NVIDIA 的 Jetson torch 2.1 编译时没带上这部分，所以 Orin 上能看到 <code>aten::mm</code> 这样的 CPU 操作，看不到 GPU 上运行了什么。这是 wheel 的打包问题，不是 GPU 不支持（依据是实测和排查，没有查 wheel 的编译配置）。nsys 是独立工具，不经过 PyTorch，所以能用；kernel 也照常运行，只是 profiler 拿不到记录。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>工具</th><th>Quest</th><th>Orin</th></tr></thead>
+          <tbody>
+            <tr><td><code>torch.profiler</code> 看 GPU kernel</td><td>能</td><td>不能</td></tr>
+            <tr><td><code>torch.cuda.Event</code> 计时</td><td>能</td><td>能</td></tr>
+            <tr><td>nsys</td><td>应该可以，没试过</td><td>能，一直在用</td></tr>
+            <tr><td>ncu</td><td>报过 <code>ERR_NVGPUCTRPERM</code>（权限不够）</td><td>能（有 sudo）</td></tr>
+            <tr><td><code>torch._dynamo.explain</code></td><td>能</td><td>能</td></tr>
+            <tr><td><code>torch.compile</code> 实际运行</td><td>能</td><td>不能，没有 Triton，所以 <code>output_code</code> 和 <code>inductor_cache</code> 也用不了</td></tr>
+            <tr><td>TensorRT + trtexec</td><td>C++ 环境有 TensorRT 10.9</td><td>能，主力平台</td></tr>
+          </tbody>
+        </table></div>
+        <p>所以 Quest 做 compile 对比，用 profiler 数 kernel、CUDA event 计时；Orin 做开发和 TensorRT，用 nsys + NVTX 把 kernel 归到模块、CUDA event 计时、ncu 看 kernel 内部。</p>
+      </div>
+
+      <div class="blk"><h3>最后：从这些实验里总结的规则</h3>
+        <p>每次实验都按这个顺序做。先保证正确，再测性能：用 float64 做参考，输出先写 NaN，再逐元素比对，这样漏写和算错都能发现。测量时 Orin 要锁频，并记录开始和结束频率；比较要在同一次运行内进行，关键结论再用 3 个独立进程确认。</p>
+        <p>结果出来后算有效带宽和峰值比。超过峰值说明数据还在 L2（Orin 约 3.5 MiB），这类形状要单独列出来。解释时要记住工具条件不同：bench 是热缓存、最高频率；ncu 默认冷缓存、基础频率，kernel replay 还会打乱 L2；nsys 会放大发射开销。最后，静态指令条数不是动态执行次数，加载指令少也不代表读的字节少。</p>
+      </div>
+      <div class="blk iv" id="m6-iv"><h3>面试要求</h3>
+        <p>这是区分"做过"和"跑过"的关键模块，面试官很喜欢追问"你怎么测的"。</p>
+        <h4>必须会</h4>
+        <ul class="plain">
+          <li>先想清楚测的是哪段时间：GPU kernel 时间、含拷贝的请求时间、端到端时间，不能混在一起比。</li>
+          <li>排除干扰：锁频、预热、多次取中位数、多进程重跑看波动；Jetson 上 <code>jetson_clocks</code>。</li>
+          <li>四层工具的分工：CUDA event（量多久）→ nsys（时间花在哪）→ ncu（kernel 内部瓶颈）→ SASS（编译器生成了什么）。</li>
+          <li>至少一次"工具误导"的例子：nsys 会放大 CPU 启动开销（报告的 −20% 实际是 −10%），用不带工具的计时纠正。</li>
+        </ul>
+        <h4>应该会</h4>
+        <ul class="plain">
+          <li>ncu 的关键指标：吞吐率（SM / 内存占峰值百分比）、占用率、warp stall 原因（long / short scoreboard、barrier、math pipe throttle）、bank conflict、sector / request。GEMM 里完整用过一遍，见<a href="#m11-s16">模块 11"为什么变慢"</a>。</li>
+          <li>Roofline：计算强度、拐点，判断访存密集还是计算密集。</li>
+          <li>L2 缓存对测量的影响（数据量小于 L2 时测得偏快；Orin 可用 L2 约 3.5 MiB）。</li>
+        </ul>
+        <h4>加分</h4>
+        <ul class="plain">
+          <li>用 SASS 验证编译器行为（循环有没有展开、有没有生成 <code>LDS.128</code> / <code>LDG.128</code>）。</li>
+          <li>统计意义：波动多大时结论才可信、要报几次运行。</li>
+        </ul>
+        <p class="small muted">高频问题并在下面的自测里。三档的含义见<a href="#notes-interview">复习笔记顶部说明</a>。</p>
+      </div>
+
+      <div class="selftest"><h3>自测</h3><ul class="plain">
+        <li>为什么不能只计 enqueueV3 的 CPU 调用耗时？batch 的 P95 为什么不能和 single 的 P95 比？</li>
+        <li>为什么第一轮慢不能直接归因于 block 大小？下一次实验要记录哪些状态？</li>
+        <li>为什么 CUB 的 Eligible 更低、No Eligible 更高，却仍更快？long_scoreboard 84% 能否当成 84% 时间停工？</li>
+        <li>有效带宽超过 DRAM 理论值说明什么？为什么未解问题可以留档而不阻止进入下一阶段？</li>
+        <li>CUDA event、nsys、ncu、SASS 各回答什么问题？nsys 的 kernel 时间可信吗，什么数字不可信，为什么？</li>
+        <li>CUDA event 测的是 kernel 的执行时间吗？GPU 空等 CPU 算不算进去？</li>
+        <li>Orin 上 <code>torch.profiler</code> 抓不到 GPU kernel 是什么原因？kernel 还在运行吗？哪些 PyTorch 工具在 Orin 上还能用？</li>
+      </ul>
+      <h3>面试高频问题</h3><ul class="plain">
+        <li>你怎么测 kernel 的时间？为什么用中位数？为什么要预热？</li>
+        <li>怎么判断一个 kernel 是计算瓶颈还是访存瓶颈？</li>
+        <li>nsys 和 ncu 分别用来干什么？</li>
+        <li>有没有遇到工具测得不准的情况？</li>
+      </ul></div>
+    </article>
