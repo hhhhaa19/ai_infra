@@ -111,7 +111,8 @@ __global__ void softmax_online(const float* __restrict__ X, float* __restrict__ 
     float d = 0.0f;
     for (int i = r; i < n; i += BLOCK) {
         float cur = X[base + i];
-        float m_new = fmaxf(m, cur);     // cur 是实数，所以 m_new 也是实数
+        float m_new = fmaxf(m, cur);
+        if (m_new == -INFINITY) continue; // causal 遮掉的位置是 -inf：m 和 cur 都是 -inf 时 -inf - (-inf) = NaN，跳过（和合并时的判断一样）
         d = d * expf(m - m_new) + expf(cur - m_new);
         m = m_new;
     }

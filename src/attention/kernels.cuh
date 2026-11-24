@@ -42,13 +42,36 @@ struct AttnShape {
 template <int TILE>
 __global__ void gemm_nt(const float* __restrict__ A, const float* __restrict__ Bt, float* __restrict__ C,
                         int M, int N, int K, float scale, bool causal) {
-    // TODO
+    int j = threadIdx.x + TILE * blockIdx.x;     // S 的列 = K 矩阵（Bt）的第几行
+    int i = threadIdx.y + TILE * blockIdx.y;     // S 的行 = Q（A）的第几行
+    // 越界线程不能提前 return：它们也要帮忙搬数据、也要走到 __syncthreads()
+    int lanei = threadIdx.y;
+    int lanej = threadIdx.x;
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE + 1];         // +1：读 Bs[lanej][m] 时相邻 lanej 相隔 17 个 float，落在不同 bank
+    float sum = 0.0f;
+    for (int k = 0; k < K; k += TILE) {
+        As[lanei][lanej] = (i < M && k + lanej < K) ? A[i * K + k + lanej] : 0.0f;
+        int row = blockIdx.x * TILE + lanei;     // Bs 第 lanei 行放 Bt 第 blockj·TILE + lanei 行（S 的列方向 → blockIdx.x）
+        int col = k + lanej;
+        Bs[lanei][lanej] = (row < N && col < K) ? Bt[row * K + col] : 0.0f;
+        __syncthreads();                         // 搬完才能算
+        #pragma unroll
+        for (int m = 0; m < TILE; m++) {
+            sum += As[lanei][m] * Bs[lanej][m];  // q_i · k_j：k_j 是 lanej 那个线程搬进来的行
+        }
+        __syncthreads();                         // 算完才能搬下一块
+    }
+    if (i < M && j < N) C[i * N + j] = (causal && j > i) ? -INFINITY : sum * scale;
 }
 
 inline bool launch_gemm_nt(const float* A, const float* Bt, float* C, int M, int N, int K,
                            float scale, bool causal, cudaStream_t s) {
-    // TODO：和 launch_tiled 一样，TILE = 16
-    return false;
+    constexpr int TILE = 16;
+    dim3 block(TILE, TILE);
+    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    gemm_nt<TILE><<<grid, block, 0, s>>>(A, Bt, C, M, N, K, scale, causal);
+    return true;
 }
 
 // S 的工作区：只增不减，第一次用到多大就申请多大（和卷积的 im2col_workspace 一样）
@@ -73,7 +96,22 @@ inline bool launch_attn_naive(const float* Q, const float* K, const float* V, fl
     //     ① launch_gemm_nt(Qh, Kh, S, N, N, d, scale, causal, s)
     //     ② softmax：N ≤ 1024 用 launch_warp，否则 launch_online
     //     ③ launch_reg(S, Vh, Oh, N, d, N, s)
-    return false;
+    const int N = sh.N, d = sh.d;
+    float* S = attn_workspace(size_t(N) * N);
+    const size_t blk = size_t(N) * d;            // 一个头占 N×d 个 float
+    for (int b = 0; b < sh.B; ++b) {
+        for (int h = 0; h < sh.Hq; ++h) {
+            int kv = h / sh.group();             // GQA：每 group 个 Q 头共用一组 K/V
+            const float* Qh = Q + (size_t(b) * sh.Hq + h) * blk;
+            const float* Kh = K + (size_t(b) * sh.Hkv + kv) * blk;
+            const float* Vh = V + (size_t(b) * sh.Hkv + kv) * blk;
+            float* Oh = O + (size_t(b) * sh.Hq + h) * blk;
+            launch_gemm_nt(Qh, Kh, S, N, N, d, sh.scale(), sh.causal, s);   // ① S = scale·Q·Kᵀ
+            if (!launch_warp(S, S, N, N, s)) launch_online(S, S, N, N, s);  // ② 每行 softmax，原地
+            launch_reg(S, Vh, Oh, N, d, N, s);                              // ③ O = P·V
+        }
+    }
+    return true;
 }
 
 // ───────────── 第 2 版：FlashAttention v1（11-26 再写）─────────────
