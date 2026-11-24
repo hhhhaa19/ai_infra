@@ -152,6 +152,62 @@ PyTorch 里实际要多久            → torch.cuda.Event
         </table></div>
         <p>所以 Quest 做 compile 对比，用 profiler 数 kernel、CUDA event 计时；Orin 做开发和 TensorRT，用 nsys + NVTX 把 kernel 归到模块、CUDA event 计时、ncu 看 kernel 内部。</p>
         </section>
+        <section class="sub" id="m6-metric"><h4 class="subt">两类算子的衡量标准</h4>
+        <p><strong>先分类</strong>：算子分两类，衡量方法不同。GEMM、卷积受计算限制，看 GFLOPS；RMSNorm、reduction、transpose、softmax、scan 受带宽限制，看 GB/s。分类靠运算强度（arithmetic intensity），单位是 FLOP / Byte：总运算量 ÷ 最少必须搬的字节数。</p>
+        <p>拿它和硬件自己的比值比。Orin 的算力 5.3 TFLOPS（2048 核 × 每次 FMA 2 FLOP × 1.3 GHz），显存带宽 204.8 GB/s，相除约 <strong>26 FLOP/B</strong>。比 26 大很多就受计算限制，小很多就受带宽限制，接近 26 两边都要顾。这就是 roofline 的判断方法，详细推导见<a href="#m16-s1">模块 16</a>。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>算子（FP32）</th><th>运算量</th><th>最少搬多少字节</th><th class="num">FLOP / B</th><th>看什么</th></tr></thead>
+          <tbody>
+            <tr><td>GEMM 4096³</td><td>2·4096³ ≈ 1374 亿</td><td>读 A、B + 写 C = 3·4096²·4 ≈ 2 亿</td><td class="num">≈ 683</td><td>GFLOPS</td></tr>
+            <tr><td>softmax</td><td>每个数约 5 次</td><td>每个数读 4 B + 写 4 B</td><td class="num">≈ 0.6</td><td>GB/s</td></tr>
+            <tr><td>transpose</td><td>0</td><td>每个数读 4 B + 写 4 B</td><td class="num">0</td><td>GB/s</td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>GFLOPS 是换了单位的速度</strong>：总运算量由问题决定，和实现无关；用时才随实现变。4096³ 的 GEMM，naive 约 0.34 s（408 GFLOPS），double buffering 约 0.047 s（2895 GFLOPS）。</p>
+        <p>用 GFLOPS 而不是秒，好处是能和两个参照比：硬件峰值 5.3 TFLOPS（naive 8%，double buffering 55%），以及 cuBLAS（double buffering 是 cuBLAS 的 85%）。</p>
+        <p><strong>GB/s 的分子只算一遍</strong>：GB/s = 算子最少必须搬的字节数 ÷ 用时。softmax 是读 4n + 写 4n 字节，哪怕 kernel 实际读了三遍，分子也只算一遍，所以多读的浪费会直接体现成 GB/s 变低。参照也有两个：理论带宽 204.8 GB/s 是物理上限；copy kernel（只读一遍、写一遍、什么都不算）是实际能跑到的上限。</p>
+        <p><strong>超过 copy 的 100% 是什么意思</strong>：softmax warp 版 190 GB/s，是理论带宽的 93%、当时 copy 的 108%。这不是突破了物理上限，而是那个 copy 本身没写到最好；copy 加 <code>__restrict__</code> 以后到了 188 GB/s（见<a href="#m12-s5">模块 12 ⑤</a>）。所以 copy 也要先写到最快，才能当天花板。</p>
+        <p><strong>单位</strong>：G 是 10⁹，T 是 10¹²，2895 GFLOPS = 2.895 TFLOPS。反过来可以求时间：1.374 × 10¹¹ ÷ 2.895 × 10¹² ≈ 47 ms。内存大小常按 1024 算（GiB = 2³⁰ ≈ 1.074 × 10⁹），带宽一般按 10⁹ 算，两者差约 7%；bench 里的 GB/s 都按 10⁹ 算。</p>
+        </section>
+        <section class="sub" id="m6-prof"><h4 class="subt">从整体到单个 kernel</h4>
+        <p><strong>实际工作里先看整体</strong>：先找到最慢的地方，再优化单个算子。按 Amdahl 定律，一个算子只占总时间的 5%，把它优化到 0，整体也最多快 5%。工具按层次分三层：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>层次</th><th>回答的问题</th><th>工具</th><th>用过的地方</th></tr></thead>
+          <tbody>
+            <tr><td>① 端到端</td><td>一次推理总共多久</td><td>CUDA event、<code>torch.cuda.Event</code></td><td>SmolVLA 每次观测的总耗时</td></tr>
+            <tr><td>② 时间线</td><td>时间花在哪些算子上，GPU 有没有空闲</td><td><code>torch.profiler</code>、nsys、<code>trtexec --dumpProfile</code></td><td>RMSNorm eager 6 个 kernel；SmolVLA 去噪 10 步是大头</td></tr>
+            <tr><td>③ 单个 kernel</td><td>这个 kernel 为什么慢</td><td>ncu（再往下是 SASS）</td><td>GEMM 的 stall、卷积的整数指令</td></tr>
+          </tbody>
+        </table></div>
+        <p>第 ② 层看两样东西。一是哪几个 kernel 占的时间最多，只优化前几名。二是 kernel 之间的空隙：GPU 在等 CPU 发下一个 kernel、等同步、等拷贝。空隙多时改 kernel 没用，要减少发射次数：融合（RMSNorm 那次 torch.compile 把 6 个 kernel 融成 1 个），或 CUDA Graph（把一串 kernel 录下来一次发出去）。</p>
+        <p><strong>torch.profiler 和 nsys 是同一层</strong>，回答的都是"时间花在哪、中间有没有空隙"，区别在视野：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th></th><th><code>torch.profiler</code></th><th>nsys</th></tr></thead>
+          <tbody>
+            <tr><td>能看到什么</td><td>PyTorch 算子（<code>aten::linear</code>、<code>aten::softmax</code>）→ 对应的 CUDA kernel</td><td>整个进程：CPU 线程、CUDA API 调用、所有 kernel、拷贝、同步</td></tr>
+            <tr><td>名字</td><td>直接是 PyTorch 算子名，好对应到模型代码</td><td>只有 kernel 名，加 NVTX 标记后可以框出范围</td></tr>
+            <tr><td>适用范围</td><td>只在 PyTorch 里</td><td>任何程序：PyTorch、TensorRT、C++ bench</td></tr>
+            <tr><td>擅长</td><td>模型里哪个算子最慢（框架视角）</td><td>GPU 空闲在等什么（系统视角）</td></tr>
+          </tbody>
+        </table></div>
+        <p>模型还在 PyTorch 里时先用 <code>torch.profiler</code>；变成 TensorRT engine 加 C++ 循环后用 nsys 看整体，再用 <code>trtexec --dumpProfile</code> 看 engine 内部每一层（融合后的层和 PyTorch 算子对不上，要看它自己的表）。两者也能一起用：在 PyTorch 里用 <code>torch.cuda.nvtx.range_push("...")</code> 打标记，再用 nsys 跑。</p>
+        <p><strong>profiler 表里的几列</strong>：新版 PyTorch 叫 Device time，旧版叫 CUDA time，意思一样。</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>列</th><th>意思</th></tr></thead>
+          <tbody>
+            <tr><td>Self CPU / CPU total</td><td>CPU 花在这个算子上的时间：Python 调用、检查参数、发射 kernel</td></tr>
+            <tr><td>Self CUDA / CUDA total</td><td>这个算子发出去的 kernel 在 GPU 上实际运行的时间</td></tr>
+            <tr><td>Self 与 total</td><td>Self 只算算子自己；total 还包括它内部调用的子算子（如 <code>aten::linear</code> 里的 <code>aten::addmm</code>）</td></tr>
+          </tbody>
+        </table></div>
+        <p>为什么分 CPU 和 CUDA 两列：GPU 是异步执行的，CPU 调 <code>torch.matmul</code> 只是把 kernel 放进队列就返回。用这两列判断瓶颈（下面的数字是示意）：CUDA 时间远大于 CPU 时间（如大 GEMM：CPU 10 µs、CUDA 2 ms），GPU 一直在忙，瓶颈在 kernel 本身，去第 ③ 层看 ncu。</p>
+        <p>CPU 时间大于等于 CUDA 时间（如小 batch 的 RMSNorm：CPU 20 µs、CUDA 5 µs），GPU 算完就空着等 CPU 发下一个，是 launch 瓶颈；改 kernel 没用，要用 CUDA Graph 或 torch.compile 融合。RMSNorm eager 的 6 个小 kernel 属于这种；SmolVLA 去噪 10 步、每步很多小 kernel，所以考虑用 CUDA Graph。</p>
+        <div class="note"><strong>易错</strong>：用 Python 的 <code>time.time()</code> 计时又不先 <code>torch.cuda.synchronize()</code>，测到的只是"发出去"花的时间，会严重偏小。bench 用 <code>cudaEventRecord</code> 在 stream 上打点，测的是 GPU 上的实际时间。</div>
+        <p><strong>为什么有了 profiler 还要自己计时</strong>：计时器负责"测有多快"，profiler 负责"解释为什么"。原因有四个。① profiler 会改变它要测的东西：ncu 把 kernel 重放多遍、默认清 cache、锁频，测的是冷 cache 下单独跑的时间；<code>torch.profiler</code> 和 nsys 的记录开销对几微秒的小 kernel 比例不小。</p>
+        <p>② 要测的范围不一定是一个 kernel：im2col 版每张图先跑 im2col 再跑 GEMM，关心的是这一整段，包括中间的空隙；event 正好包住一整段，profiler 给的是各个 kernel，相加还会漏掉空隙。③ 可以自动、批量地比：bench 一次跑完多组形状和版本，取中位数、打印 PASS / FAIL，改一行就能重跑。④ 不需要特殊权限：Orin 上的 ncu 要 sudo，计时代码在哪都能跑。</p>
+        <p>两者要能对得上：ncu 测 <code>conv_igemm_reg</code> 是 531 µs，bench 是 0.530 ms，说明 bench 没测错。对不上时（比如 RMSNorm 的 L2 冷热差别）本身就是一个值得查的信号。</p>
+        <p><strong>完整流程</strong>：端到端计时 → nsys 或 <code>torch.profiler</code> 找出最慢的几个 kernel、看有没有空隙 → 用运算强度判断受计算还是受带宽限制 → ncu 看具体原因 → 决定怎么改：自己写、融合、换库（cuBLAS、cuDNN、TensorRT），或写 TensorRT plugin。面试里"你怎么优化一个模型"答的就是这个流程，手写单个算子只是最后一步里的一种手段。</p>
+        </section>
         <section class="sub"><h4 class="subt">测量规则总结</h4>
         <p>每次实验都按这个顺序做。先保证正确，再测性能：用 float64 做参考，输出先写 NaN，再逐元素比对，这样漏写和算错都能发现。测量时 Orin 要锁频，并记录开始和结束频率；比较要在同一次运行内进行，关键结论再用 3 个独立进程确认。</p>
         <p>结果出来后算有效带宽和峰值比。超过峰值说明数据还在 L2（Orin 约 3.5 MiB），这类形状要单独列出来。解释时要记住工具条件不同：bench 是热缓存、最高频率；ncu 默认冷缓存、基础频率，kernel replay 还会打乱 L2；nsys 会放大发射开销。最后，静态指令条数不是动态执行次数，加载指令少也不代表读的字节少。</p>
@@ -191,6 +247,11 @@ PyTorch 里实际要多久            → torch.cuda.Event
         <li>有效带宽超过 DRAM 理论值说明什么？为什么未解问题可以留档而不阻止进入下一阶段？</li>
         <li>CUDA event、nsys、ncu、SASS 各回答什么问题？nsys 的 kernel 时间可信吗，什么数字不可信，为什么？</li>
         <li>CUDA event 测的是 kernel 的执行时间吗？GPU 空等 CPU 算不算进去？</li>
+        <li>GEMM 4096³、softmax、transpose 的运算强度各是多少？Orin 的分界线 26 FLOP/B 怎么算出来的？各自该看 GFLOPS 还是 GB/s，和什么比？</li>
+        <li>GB/s 的分子为什么只算"最少必须搬的字节"？softmax 做到 copy 的 108% 说明什么？</li>
+        <li><code>torch.profiler</code> 和 nsys 是哪一层的工具？各自擅长什么？TensorRT engine 里每层的时间用什么看？</li>
+        <li>profiler 表里 Self CPU 和 Self CUDA 分别是什么？CPU 时间 ≥ CUDA 时间说明什么，该怎么改？</li>
+        <li>有了 profiler 为什么 bench 还要用 <code>cudaEventRecord</code> 自己计时？说出至少三个原因。</li>
         <li>Orin 上 <code>torch.profiler</code> 抓不到 GPU kernel 是什么原因？kernel 还在运行吗？哪些 PyTorch 工具在 Orin 上还能用？</li>
       </ul>
       <h3>面试高频问题</h3><ul class="plain">

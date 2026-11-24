@@ -73,6 +73,10 @@ __syncthreads();                                      // 跨 warp 合并仍需�
         <p>整个过程是：256 线程 → 8 个 warp 的部分和 → 1 个 block 的结果 → 多个 block 写到 <code>out[blockIdx.x]</code> → 第二个 kernel 合并。比如 1000 个 1、4 个 block × 256 线程，部分和应为 [256, 256, 256, 232]。</p>
         <p>RMSNorm 的一 warp 一行版本用 xor 版。每轮和距离 offset 的线程交换并相加，5 轮后 32 个 lane 都有总和，不用再把结果传给别人：</p>
 <pre><code>for (int offset = 16; offset &gt; 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);</code></pre>
+        <p><strong>要同步几次</strong>：256 线程的 block 求和，用 shared memory 树形规约是 256 → 128 → … → 1，8 轮，每轮一次 <code>__syncthreads()</code>，共 8 次。</p>
+        <p>先 warp 内 shuffle、再合并 8 个 warp 的结果，只要 1 次：每个 warp 自己规约，lane 0 写 <code>partial[warpId]</code>，同步一次，第 0 个 warp 读这 8 个数再 shuffle 一次。像 RMSNorm 这样所有线程都要用总和的，还要把结果写回 shared 再同步一次，共 2 次。</p>
+        <p><strong>为什么 warp 内不用同步</strong>：关键是"同一个 warp"，不是"同一个 SM"。每个线程有自己的寄存器：编译器给变量分配一个寄存器编号（比如 R5），对一个 warp 来说 R5 是 32 个格子并排、每个 lane 一格。</p>
+        <p>同一个 warp 的 32 个 lane 执行同一条指令，shuffle 在这一条指令里直接读别的 lane 那一格，不存在"对方还没写完"。不同 warp 的寄存器互相看不见，只能经 shared memory 交换，再用 <code>__syncthreads()</code> 确认写完。</p>
         </section>
         <section class="sub"><h4 class="subt">归约用于 RMSNorm</h4>
         <p>RMSNorm 对每行做一次：先算这一行平方的平均值，得到缩放系数，再乘回每个元素和权重。它不减均值，权重 w 各行共享。</p>
@@ -133,6 +137,7 @@ rowOffset = blockIdx.x * (stride &gt; 0 ? stride : n);   // rmsNormReg 的 strid
       <div class="selftest"><h3>自测</h3><ul class="plain">
         <li>engine、context、stream 各负责什么？为什么按名字就能绑定？地址绑定为什么不等于拷贝？</li>
         <li>n=100 可以用 128 线程，为什么不能直接按 n/2 归约？为什么 <code>threadIdx.x &lt; blockDim.x</code> 防不住越界？</li>
+        <li>256 线程的 block 求和：树形规约要几次 <code>__syncthreads()</code>？先 warp shuffle 再合并要几次？RMSNorm 为什么是 2 次？</li>
         <li>64 线程的 block 分几个 warp？线程 35 的 lane / warpId？为什么 shuffle 不能从线程 31 取到线程 32？</li>
         <li>同样 <code>&lt;&lt;&lt;4096,128&gt;&gt;&gt;</code> 为什么既能处理 [4096,256] 又能处理 [4096,4096]？</li>
         <li>128 线程 / block、一 warp 一行时，block=1、thread=35 负责哪行哪个 lane？（第 5 行，lane 3）</li>

@@ -175,7 +175,8 @@ __global__ void gemm_tiled(const float* A, const float* B, float* C, int M, int 
         <ul class="plain">
           <li><strong>改了什么</strong>：一个 block 负责 C 的 TILE × TILE 块，沿 K 切成每段 TILE 宽。每段：一起搬 A、B 小块进 shared → <code>__syncthreads()</code> → 各自从 shared 做 TILE 次乘加 → <code>__syncthreads()</code>。</li>
           <li><strong>为什么快</strong>：每个从全局搬进来的数被 TILE 个线程用，全局读取降到 1/TILE（TILE = 16 → 1/16）。</li>
-          <li><strong>为什么只快 1.5 倍</strong>：naive 的很多读取本来就命中 L1 / L2；而且新瓶颈变成 shared 本身：每次乘加仍要读 2 个 shared 数，读和算 1 : 1。</li>
+          <li><strong>为什么只快 1.5 倍</strong>：naive 的很多读取本来就命中 L1 / L2；而且新瓶颈变成 shared 本身：每次乘加 <code>sum += As[i][k] * Bs[k][j]</code> 仍要读 2 个 shared 数，也就是 1 条 FFMA 配 2 条 LDS，真正做运算的指令只占约 1/3，瓶颈变成 shared 读指令的吞吐。</li>
+          <li><strong>tiled 版没有 bank conflict</strong>：一个 warp 是 2 行 × 16 个线程，读 <code>As[i][k]</code> 同一行的 16 个线程同地址广播，读 <code>Bs[k][j]</code> 地址连续。</li>
           <li><strong>两个同步</strong>：没搬完不许算，没算完不许搬下一段。越界线程不能提前 return，要参加搬运（填 0）和同步。</li>
           <li><strong>TILE 加大的上限</strong>：一个线程只算一个 C，TILE = 32 已经 1024 个线程，到 block 上限 → 只能让一个线程算多个 C。</li>
         </ul>
@@ -313,6 +314,7 @@ $('play').onclick=()=>{stop();kk=-1;ph=0;draw();tm=setInterval(()=>{next();if(kk
 draw();
 })();
 </script>
+        <p style="font-size:14px;color:var(--muted)">上图是<strong>一个线程</strong>；bank conflict 要看一个 warp 的 32 个线程同时读，见本章 ⑥ 之后的「bank conflict 小结」。</p>
         </section>
         <section class="sub" id="m11-s14"><h4 class="subt">④ 交错分工消除 bank conflict</h4>
         <ul class="plain">
@@ -803,6 +805,102 @@ tnow=K*(L+W+F);draw();
           </tbody>
         </table></div>
         <div class="note good"><strong>和 RMSNorm 的区别</strong>：RMSNorm 每个数只用一次，是带宽瓶颈（接入 PyTorch 后在 rows=4096、n=8192 的大形状上做到 192 GB/s，即 204.8 GB/s 的 94%；own_reg 在 rows=512、n=4096 是约 153 GB/s），靠合并访存、向量化、展开；GEMM 数据被反复用，是算力瓶颈，靠分块复用。相通的是最后都落到"不让硬件干等"。</div>
+        </section>
+        <section class="sub" id="m11-bk"><h4 class="subt">bank conflict 小结：寄存器分块之后的两次冲突</h4>
+        <p><strong>先换成 warp 的视角</strong>：前面"一个线程的外积"只看一个线程；bank conflict 要看<strong>一个 warp 的 32 个线程同一条指令一起访问</strong>。</p>
+<pre><code>block 16×16，tid = ty*16 + tx；一个 warp = 32 个连续 tid → tx 取 0..15，ty 只取 2 个值
+32 个 bank，第 k 个 float 在 bank k % 32
+同一地址 → 广播（1 轮）；同一 bank 的不同地址 → 排队，几个地址几轮</code></pre>
+        <div class="tablewrap"><table>
+          <thead><tr><th></th><th>① 做了什么</th><th>② 为什么</th><th class="num">③ 数字</th></tr></thead>
+          <tbody>
+            <tr><td><strong>第一次：读 Bs</strong><br>（③ → ④）</td><td>交错：tx 负责 <code>tx, tx+16, tx+32 …</code> 列，<code>Bs[kk][tx + tj*16]</code></td><td>原写法 <code>Bs[kk][tx*8 + tj]</code>：同一时刻 16 个地址隔 8 个 float，tx = 0、4、8、12 落在同一 bank → 只用 4 个 bank，4 路</td><td class="num">1744 → 2091<br>ncu 冲突 8.39M → 1.2K</td></tr>
+            <tr><td><strong>第二次：写 As</strong><br>（⑤ → ⑥）</td><td><code>As[BK][BM+4]</code> 每行 +4；kk 循环加 <code>#pragma unroll</code></td><td>转置后写 <code>As[t%8][t/8]</code>，行宽 128 是 32 的倍数 → bank = t/8，只用 4 个 bank，8 路</td><td class="num">1790 → 2366<br>（cuBLAS 70%）</td></tr>
+          </tbody>
+        </table></div>
+        <p><strong>为什么第一次冲突在 Bs、不在 As</strong>：看下标随 tx 变不变。</p>
+        <ul class="plain">
+          <li><strong>读 As</strong>：<code>a[ti] = As[ty*8+ti][kk]</code> 里没有 tx → 同一排 16 个线程读同一个地址，广播。32 个线程只有 2 个地址（两排 ty），相差 8×8 = 64 个 float，64 % 32 = 0 → 同一个 bank，最多 2 轮。</li>
+          <li><strong>读 Bs</strong>：<code>b[tj] = Bs[kk][tx*8+tj]</code> 随 tx 变 → 16 个不同地址挤在 4 个 bank，每个 bank 4 个 → 4 轮。冲突主要在这里。</li>
+          <li>交错时 As 也一起改成 <code>As[ty + ti*16][kk]</code>：两排 ty 只差 8 个 float → 不同 bank，2 路也没了。</li>
+          <li>第二次冲突在<strong>写</strong>不在读：⑤ 把 As 转置后，读 As 变成和读 Bs 一样的 float4 两段，没有冲突；但从全局搬进 As 时一个 warp 跨 8 行写，8 行起点都在 bank 0。</li>
+        </ul>
+        <p style="font-size:14px;color:var(--muted)">注：下面按标量读写算轮数。③ 里 8 个 b 连续，编译器实际合成了 <code>LDS.128</code>，真实的轮数以 ④ 里 ncu 表为准。</p>
+        <p><strong>动画 · 一个 warp 的 32 个线程 → 32 个 bank</strong>：切换五种访问，红色 = 同一 bank 的不同地址（要排队），绿色 = 无冲突，蓝色 = 多个线程读同一地址（广播）。</p>
+<p class="sr-only">动画：一个 warp 的 32 个线程箭头指向 32 个 bank。五种情形：寄存器版读 As（广播，但两排 ty 同 bank 两轮）、寄存器版读 Bs（4 路冲突）、交错后读 Bs（无冲突）、转置写 As 行宽 128（8 路冲突）、行宽 132（无冲突）。</p>
+<div class="anim" id="anim-bk-root">
+<div id="anim-bk-modes" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px"></div>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px;flex-wrap:wrap">
+<button id="anim-bk-play">按轮播放</button><button id="anim-bk-reset">重来</button>
+<span id="anim-bk-st" style="font-size:14px;color:var(--muted)"></span>
+</div>
+<div id="anim-bk-f" style="font-family:var(--f-mono);font-size:13px;color:var(--muted);margin-bottom:6px"></div>
+<svg id="anim-bk-sv" viewBox="0 0 680 414" width="100%" role="img" aria-label="一个 warp 的线程到 bank 的映射"></svg>
+<div id="anim-bk-res" style="font-size:15px;margin-top:4px;line-height:1.7"></div>
+</div>
+<script>
+(function(){
+const PFX='anim-bk-',$=i=>document.getElementById(PFX+i);
+const ns='http://www.w3.org/2000/svg',sv=$('sv');
+const RED='#D33F3F';
+const M=[
+{n:'③ 读 As',f:'a[0] = As[ty*8][kk]，地址 = ty·64（kk=0）',a:t=>(t>>4)*64,
+ m:'16 个线程读同一地址 → 广播；两排 ty 的地址 0 和 64 都在 bank 0 → 2 轮。冲突小，主因不在这里。'},
+{n:'③ 读 Bs（原写法）',f:'b[0] = Bs[kk][tx*8]，地址 = 8·tx（kk=0，两排 ty 读同样的 16 个）',a:t=>8*(t%16),
+ m:'16 个不同地址隔 8 个 float，只落在 bank 0、8、16、24，每个 bank 4 个地址 → 4 路冲突。'},
+{n:'④ 读 Bs（交错）',f:'b[0] = Bs[kk][tx]，地址 = tx',a:t=>t%16,
+ m:'16 个连续地址落在 16 个不同 bank；两排 ty 读的相同 → 广播。1 轮。'},
+{n:'⑤ 写 As（行宽 128）',f:'As[t%8][t/8] = …，地址 = (t%8)·128 + t/8',a:t=>(t%8)*128+(t>>3),
+ m:'128 % 32 = 0：8 行的起点都在 bank 0，32 个线程只用 bank 0～3，每个 8 个地址 → 8 路冲突。'},
+{n:'⑥ 写 As（行宽 132）',f:'As[t%8][t/8] = …，地址 = (t%8)·132 + t/8',a:t=>(t%8)*132+(t>>3),
+ m:'132 % 32 = 4：每行起点错开 4 个 bank，bank = (4·(t%8) + t/8) % 32 铺满 0～31 → 无冲突。+4 而不是 +1，行起点仍是 4 的倍数，float4 对齐。'}];
+let cur=1,round=-1,tm=null,info;
+const X0=40,CW=(680-X0-4)/32,TY=30,BY=250;
+function el(t,a,txt){const e=document.createElementNS(ns,t);for(const q in a)e.setAttribute(q,a[q]);if(txt!==undefined)e.textContent=txt;sv.appendChild(e);return e}
+function calc(){const addr=[...Array(32).keys()].map(M[cur].a),B={};addr.forEach(a=>{const b=a%32;(B[b]=B[b]||[]);if(!B[b].includes(a))B[b].push(a)});
+ const cnt={};addr.forEach(a=>cnt[a]=(cnt[a]||0)+1);
+ return{addr,B,cnt,rnd:addr.map(a=>B[a%32].indexOf(a)),R:Math.max(...Object.values(B).map(v=>v.length)),used:Object.keys(B).length}}
+function col(t){const a=info.addr[t];if(info.B[a%32].length>1)return RED;if(info.cnt[a]>1)return'var(--accent)';return'var(--good)'}
+function draw(){sv.innerHTML='';const{addr,B,rnd,R}=info;
+ el('text',{x:4,y:TY+15,fill:'var(--muted)','font-size':12},'tid');
+ el('text',{x:4,y:BY+15,fill:'var(--muted)','font-size':12},'bank');
+ el('text',{x:X0,y:TY-10,fill:'var(--muted)','font-size':11},'一个 warp 的 32 个线程（tid 0～15 是第一排 ty，16～31 是第二排）');
+ for(let t=0;t<32;t++){const x=X0+t*CW,c=col(t),act=round>=0&&rnd[t]===round,done=round>=0&&rnd[t]<=round,dim=round>=0&&!done;
+  const bx=X0+(addr[t]%32)*CW+CW/2;
+  el('line',{x1:x+CW/2,y1:TY+22,x2:bx,y2:BY-2,stroke:c,'stroke-width':act?1.8:0.9,opacity:dim?0.12:(round>=0&&!act?0.35:0.75)});
+  el('rect',{x:x+1,y:TY,width:CW-2,height:22,rx:3,fill:done?c:'transparent',stroke:act?c:'var(--line)','stroke-width':act?2:0.6});
+  el('text',{x:x+CW/2,y:TY+15,'text-anchor':'middle','font-size':10,fill:done?'#fff':'var(--ink)'},t)}
+ for(let b=0;b<32;b++){const x=X0+b*CW,L=B[b]||[],bad=L.length>1;
+  el('rect',{x:x+1,y:BY,width:CW-2,height:22,rx:3,fill:L.length?(bad?'rgba(211,63,63,0.15)':'var(--code-bg)'):'transparent',stroke:bad?RED:'var(--line)','stroke-width':bad?1.4:0.5});
+  el('text',{x:x+CW/2,y:BY+15,'text-anchor':'middle','font-size':10,fill:bad?RED:'var(--muted)'},b);
+  L.forEach((a,k)=>{const d=round>=k,c=bad?RED:'var(--good)';
+   el('rect',{x:x+2,y:BY+28+k*14,width:CW-4,height:12,rx:2,fill:d?c:'transparent',stroke:c,'stroke-width':0.8});
+   el('text',{x:x+CW/2,y:BY+37+k*14,'text-anchor':'middle','font-size':a>99?7:9,fill:d?'#fff':c},a)})}
+ el('text',{x:X0,y:BY+28+8*14+12,fill:'var(--muted)','font-size':11},'bank 下面的小方块 = 这个 bank 要送出的不同地址；几个方块就要几轮');
+ const s=$('st');s.textContent=round<0?'共 '+R+' 轮；点"按轮播放"看每轮哪些线程拿到数据':(round<R-1?'第 '+(round+1)+' 轮：每个 bank 只送 1 个地址':'完成，共 '+R+' 轮')}
+function load(i){cur=i;round=-1;clearInterval(tm);tm=null;info=calc();$('f').textContent=M[i].f+'    bank = 地址 % 32';
+ const R=info.R,verdict=R===1?'<span style="color:var(--good)">无冲突，1 轮</span>':'<span style="color:'+RED+'">'+R+' 路冲突，'+R+' 轮</span>';
+ $('res').innerHTML=verdict+'　用到 '+info.used+' / 32 个 bank<br>'+M[i].m;
+ document.querySelectorAll('#anim-bk-modes button').forEach((b,k)=>{b.style.borderColor=k===i?'var(--accent)':'';b.style.color=k===i?'var(--accent)':''});draw()}
+M.forEach((m,i)=>{const b=document.createElement('button');b.textContent=m.n;b.onclick=()=>load(i);$('modes').appendChild(b)});
+$('play').onclick=()=>{clearInterval(tm);round=-1;draw();tm=setInterval(()=>{round++;draw();if(round>=info.R-1){clearInterval(tm);tm=null}},800)};
+$('reset').onclick=()=>load(cur);
+load(1);
+})();
+</script>
+        <p><strong>一个线程负责哪些格子</strong>：寄存器分块后每个线程算 64 个输出，256 个线程互不重叠地铺满 128×128。但从 ⑤ 起，一个线程的 64 个格子不是连在一起的 8×8，而是四个分开的 4×4：行 = <code>(ti/4)*64 + ty*4 + ti%4</code>，列 = <code>(tj/4)*64 + tx*4 + tj%4</code>。</p>
+        <p>把 128×128 切成四个 64×64 象限，每个象限是 16×16 个 4×4 小格，线程 (ty, tx) 在每个象限里各拿第 ty 行第 tx 列那一格。</p>
+        <p>例：线程 (0, 0) 负责行 0～3、64～67 和列 0～3、64～67 交出的 4 块；线程 (0, 1) 的列换成 4～7、68～71。拆这么散是为了让同一个 warp 一起读 shared 时地址连成一片，同时能用 float4。三版的列分工对比：</p>
+        <div class="tablewrap"><table>
+          <thead><tr><th>版本</th><th>线程 tx 负责的列</th><th>每次读</th><th class="num">GFLOPS</th></tr></thead>
+          <tbody>
+            <tr><td>③ 寄存器分块</td><td><code>tx*8</code> ～ <code>tx*8+7</code>，连续 8 列</td><td>1 个 float</td><td class="num">1744（Bs 4 路）</td></tr>
+            <tr><td>④ 标量交错</td><td><code>tx</code>、<code>tx+16</code> … <code>tx+112</code>，各隔 16</td><td>1 个 float</td><td class="num">2091</td></tr>
+            <tr><td>⑤～⑦ float4</td><td><code>tx*4</code> ～ <code>tx*4+3</code> 和 <code>64+tx*4</code> ～ <code>64+tx*4+3</code></td><td>float4</td><td class="num">1790 → 2366 → 2895</td></tr>
+          </tbody>
+        </table></div>
+        <p>后两版思路一样：同一个 warp 的 16 个 tx 每次读的是连在一起的一片。标量版一次读连续 16 个 float，float4 版一次读连续 64 个 float，读指令是标量版的 1/4。</p>
+        <div class="note"><strong>易错</strong>：几路冲突看的是同一个 bank 里有几个<strong>不同的地址</strong>，不是有几个线程。③ 读 As 时 32 个线程都落在 bank 0，但只有地址 0 和 64 两个，所以是 2 路；transpose 的 <code>tile[32][32]</code> 竖着读是 32 个不同地址，才是 32 路。</div>
         </section>
         <section class="sub" id="m11-s19"><h4 class="subt">⑦ double buffering</h4>
         <ul class="plain">
